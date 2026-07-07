@@ -239,15 +239,14 @@ class PasswordUtilityApp:
 
     # ---------- Secure clipboard ----------
     def copy_to_clipboard_secure(self, text, status_label=None):
-        """Copy text to clipboard and schedule an automatic, verified clear
-        30 seconds later (only clears if the clipboard still holds our text)."""
+        """Copy text to clipboard and schedule an automatic clear 30 seconds later."""
         self.root.clipboard_clear()
         self.root.clipboard_append(text)
         self.root.update()
 
         if status_label is not None:
             status_label.config(
-                text="Copied — clipboard clears automatically in 30s.",
+                text="Copied.",
                 fg=self.theme["accent"]
             )
 
@@ -258,20 +257,17 @@ class PasswordUtilityApp:
                 pass
 
         def _clear():
+            should_clear = False
             try:
                 current = self.root.clipboard_get()
+                should_clear = current == text
             except Exception:
-                current = None
-            if current == text:
+                # On Linux/X11 we often can't read the clipboard reliably.
+                # Secure default: clear anyway in case it is still our password.
+                should_clear = True
+
+            if should_clear:
                 self.root.clipboard_clear()
-                if status_label is not None:
-                    try:
-                        status_label.config(
-                            text="Clipboard cleared for security.",
-                            fg=self.theme["text_secondary"]
-                        )
-                    except Exception:
-                        pass
             self._clipboard_clear_job = None
 
         self._clipboard_clear_job = self.root.after(CLIPBOARD_CLEAR_MS, _clear)
@@ -403,7 +399,8 @@ class PasswordUtilityApp:
         self._configure_styles()
 
         self.main_frame.columnconfigure(0, weight=1)
-        self.main_frame.rowconfigure(2, weight=1)
+        # Row 0 = header, 1 = separator, 2 = tabs, 3 = content
+        self.main_frame.rowconfigure(3, weight=1)
 
         # Header
         header = tk.Frame(self.main_frame, bg=self.theme["bg"])
@@ -425,10 +422,6 @@ class PasswordUtilityApp:
         tk.Frame(self.main_frame, bg=self.theme["border"], height=1).grid(row=1, column=0, sticky="ew", padx=18)
 
         # Tabs
-        tab_bar = tk.Frame(self.main_frame, bg=self.theme["bg"])
-        tab_bar.grid(row=2, column=0, sticky="new", padx=18, pady=(10, 0))
-        # placeholder row; actual content below replaces this — see content_frame row=3
-
         tabs_row = tk.Frame(self.main_frame, bg=self.theme["bg"])
         tabs_row.grid(row=2, column=0, sticky="ew", padx=18, pady=(10, 10))
         self.tab_buttons = {}
@@ -449,7 +442,6 @@ class PasswordUtilityApp:
         self.enc_tab_btn.pack(side=tk.LEFT)
         self.tab_buttons["enc"] = self.enc_tab_btn
 
-        self.main_frame.rowconfigure(3, weight=1)
         self.content_frame = tk.Frame(self.main_frame, bg=self.theme["bg"])
         self.content_frame.grid(row=3, column=0, sticky="nsew", padx=18, pady=(0, 14))
         self.content_frame.columnconfigure(0, weight=1)
@@ -457,6 +449,10 @@ class PasswordUtilityApp:
 
         self.build_generator_tab()
         self.build_file_protector_tab()
+
+        # Grid both frames permanently; use lift/lower to switch so geometry is always valid
+        self.gen_frame.grid(row=0, column=0, sticky="nsew")
+        self.enc_frame.grid(row=0, column=0, sticky="nsew")
         self.show_tab(self.active_tab)
         self._paint_tabs()
 
@@ -476,11 +472,11 @@ class PasswordUtilityApp:
 
     def show_tab(self, tab):
         if tab == "gen":
-            self.enc_frame.grid_forget()
-            self.gen_frame.grid(row=0, column=0, sticky="nsew")
+            self.gen_frame.lift()
+            self.enc_frame.lower()
         else:
-            self.gen_frame.grid_forget()
-            self.enc_frame.grid(row=0, column=0, sticky="nsew")
+            self.enc_frame.lift()
+            self.gen_frame.lower()
 
     # ---------- Generator tab (sidebar + main, grid based, no scroll canvas) ----------
     def build_generator_tab(self):
@@ -572,13 +568,6 @@ class PasswordUtilityApp:
         self.warn_label.pack(anchor=tk.W, padx=16, pady=(0, 6))
         self.warn_label.pack_forget()
 
-        tip = tk.Label(
-            sidebar, text="Copying a password auto-clears your clipboard 30s later.",
-            font=(self.font_family, 8), bg=self.theme["surface"], fg=self.theme["text_faint"],
-            wraplength=260, justify=tk.LEFT
-        )
-        tip.pack(anchor=tk.W, padx=16, pady=(4, 14))
-
         # ---- Main column ----
         main_col = tk.Frame(self.gen_frame, bg=self.theme["bg"])
         main_col.grid(row=0, column=1, sticky="nsew")
@@ -639,13 +628,6 @@ class PasswordUtilityApp:
             for i, pwd in enumerate(self.generated_passwords):
                 self.output_text.insert(tk.END, f"#{i+1}: {pwd}\n")
         self.output_text.config(state=tk.DISABLED)
-
-        # Copy status (used by secure-clipboard countdown)
-        self.gen_copy_status = tk.Label(
-            out_card, text="", font=(self.font_family, 8),
-            bg=self.theme["surface"], fg=self.theme["text_secondary"]
-        )
-        self.gen_copy_status.pack(anchor=tk.W, padx=16, pady=(0, 4))
 
         # Action buttons
         act_frame = tk.Frame(out_card, bg=self.theme["surface"])
@@ -844,10 +826,9 @@ class PasswordUtilityApp:
                 self.len_var.set(8)
             elif v > 128:
                 self.len_var.set(128)
+            self.current_values["length"] = self.len_var.get()
         except Exception:
             pass
-        self.current_values["length"] = self.len_var.get()
-        self.update_pool_stats()
 
     def on_cnt_change(self, *args):
         try:
@@ -856,9 +837,9 @@ class PasswordUtilityApp:
                 self.cnt_var.set(1)
             elif v > 10000:
                 self.cnt_var.set(10000)
+            self.current_values["count"] = self.cnt_var.get()
         except Exception:
             pass
-        self.current_values["count"] = self.cnt_var.get()
 
     def on_enc_pwd_change(self):
         self.current_values["enc_pwd"] = self.enc_pwd_var.get()
@@ -948,13 +929,12 @@ class PasswordUtilityApp:
         self.copy_btn.config(state=tk.NORMAL)
         self.save_btn.config(state=tk.NORMAL)
         self.gen_running = False
-        self.gen_copy_status.config(text="")
 
     def copy_all_passwords(self):
         if not self.generated_passwords:
             return
         text = "\n".join(self.generated_passwords)
-        self.copy_to_clipboard_secure(text, status_label=self.gen_copy_status)
+        self.copy_to_clipboard_secure(text)
 
     def save_passwords(self):
         if not self.generated_passwords:
@@ -1148,7 +1128,7 @@ class PasswordUtilityApp:
     def copy_encrypted(self):
         if not self.last_encrypted_b64:
             return
-        self.copy_to_clipboard_secure(self.last_encrypted_b64, status_label=self.enc_status)
+        self.copy_to_clipboard_secure(self.last_encrypted_b64)
 
     def save_encrypted(self):
         if not self.last_encrypted_b64:
