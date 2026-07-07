@@ -1,6 +1,6 @@
 🔑 **Unicode Password Utility**
 
-[![unigen.jpg](https://i.postimg.cc/7hBpcpbs/unigen.jpg)](https://postimg.cc/zHgtH2CK)
+[![unigen.jpg](https://i.postimg.cc/kg0KKsq1/unigen.jpg)](https://postimg.cc/87b7VhFM)
 
 The Unicode Password Utility is a Python 3 script designed for generating cryptographically strong, high-entropy passwords using an extensive Unicode character pool and managing them securely through file encryption.
 
