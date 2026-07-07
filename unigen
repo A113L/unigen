@@ -178,9 +178,6 @@ def generate_password(length, pool):
     return "".join(secrets.choice(pool) for _ in range(length))
 
 
-CLIPBOARD_CLEAR_MS = 30_000  # 30 seconds
-
-
 class PasswordUtilityApp:
     def __init__(self, root):
         self.root = root
@@ -226,7 +223,6 @@ class PasswordUtilityApp:
         self.last_encrypted_b64 = None
         self.last_encrypted_filename = None
         self.last_saved_password_path = None
-        self._clipboard_clear_job = None
 
         # No scrollable canvas — the layout below is built to fit one screen.
         self.root.columnconfigure(0, weight=1)
@@ -237,40 +233,15 @@ class PasswordUtilityApp:
         self.build_ui()
         self.update_pool_stats()
 
-    # ---------- Secure clipboard ----------
-    def copy_to_clipboard_secure(self, text, status_label=None):
-        """Copy text to clipboard and schedule an automatic clear 30 seconds later."""
+    # ---------- Clipboard ----------
+    def copy_to_clipboard(self, text, status_label=None):
+        """Copy text to the system clipboard."""
         self.root.clipboard_clear()
         self.root.clipboard_append(text)
         self.root.update()
 
         if status_label is not None:
-            status_label.config(
-                text="Copied.",
-                fg=self.theme["accent"]
-            )
-
-        if self._clipboard_clear_job is not None:
-            try:
-                self.root.after_cancel(self._clipboard_clear_job)
-            except Exception:
-                pass
-
-        def _clear():
-            should_clear = False
-            try:
-                current = self.root.clipboard_get()
-                should_clear = current == text
-            except Exception:
-                # On Linux/X11 we often can't read the clipboard reliably.
-                # Secure default: clear anyway in case it is still our password.
-                should_clear = True
-
-            if should_clear:
-                self.root.clipboard_clear()
-            self._clipboard_clear_job = None
-
-        self._clipboard_clear_job = self.root.after(CLIPBOARD_CLEAR_MS, _clear)
+            status_label.config(text="Copied.", fg=self.theme["accent"])
 
     # ---------- Theme switch ----------
     def switch_theme(self):
@@ -629,6 +600,13 @@ class PasswordUtilityApp:
                 self.output_text.insert(tk.END, f"#{i+1}: {pwd}\n")
         self.output_text.config(state=tk.DISABLED)
 
+        # Copy status
+        self.gen_copy_status = tk.Label(
+            out_card, text="", font=(self.font_family, 8),
+            bg=self.theme["surface"], fg=self.theme["text_secondary"]
+        )
+        self.gen_copy_status.pack(anchor=tk.W, padx=16, pady=(0, 4))
+
         # Action buttons
         act_frame = tk.Frame(out_card, bg=self.theme["surface"])
         act_frame.pack(fill=tk.X, padx=16, pady=(0, 14))
@@ -934,7 +912,7 @@ class PasswordUtilityApp:
         if not self.generated_passwords:
             return
         text = "\n".join(self.generated_passwords)
-        self.copy_to_clipboard_secure(text)
+        self.copy_to_clipboard(text, status_label=self.gen_copy_status)
 
     def save_passwords(self):
         if not self.generated_passwords:
@@ -1128,7 +1106,7 @@ class PasswordUtilityApp:
     def copy_encrypted(self):
         if not self.last_encrypted_b64:
             return
-        self.copy_to_clipboard_secure(self.last_encrypted_b64)
+        self.copy_to_clipboard(self.last_encrypted_b64, status_label=self.enc_status)
 
     def save_encrypted(self):
         if not self.last_encrypted_b64:
