@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-UNICODE Password Utility - Desktop Edition
-Modern Tkinter app with floating-card UI.
+UNIGEN — Unicode Password Utility (Desktop Edition)
+Modern Tkinter app, sized to fit a single screen without scrolling.
 Compatible with Windows, Linux, and macOS.
 
 Requirements: cryptography (pip install cryptography)
 """
 
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, scrolledtext
+from tkinter import ttk, filedialog, messagebox, scrolledtext, simpledialog
 import secrets
 import math
 import os
@@ -25,6 +25,31 @@ try:
     CRYPTO_AVAILABLE = True
 except ImportError:
     CRYPTO_AVAILABLE = False
+
+
+# ---------- Self-source character set ----------
+def load_self_source_chars():
+    """Read this script's own source file and return its unique, printable,
+    non-whitespace characters. Kept dynamic (rather than hard-coded) so the
+    character set always matches whatever this file actually contains."""
+    try:
+        src_path = os.path.abspath(__file__)
+        with open(src_path, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read()
+    except Exception:
+        return ""
+    seen = set()
+    result = []
+    for ch in content:
+        if ch in ("\n", "\r", "\t", " "):
+            continue
+        if not ch.isprintable():
+            continue
+        if ch not in seen:
+            seen.add(ch)
+            result.append(ch)
+    return "".join(sorted(result))
+
 
 # ---------- Character Sets ----------
 CHAR_SETS = {
@@ -62,61 +87,69 @@ CHAR_SETS = {
         "chars": "─━│┃┄┅┆┇┈┉┊┋┌┍┎┏┐┑┒┓└┕┖┗┘┙┚┛├┝┞┟┠┡┢┣┤┥┦┧┨┩┪┫┬┭┮┯┰┱┲┳┴┵┶┷┸┹┺┻┼┽┾┿╀╁╂╃╄╅╆╇╈╉╊╋╌╍╎╏═║╒╓╔╕╖╗╘╙╚╛╜╝╞╟╠╡╢╣╤╥╦╧╨╩╪╫╬╭╮╯╰╱╲╳╴╵╶╷╸╹╺╻╼╽╾╿",
         "enabled": False,
         "desc": "Geometric & box"
-    }
+    },
 }
+
+# Dynamically add a charset made of every unique character in this file.
+_SELF_CHARS = load_self_source_chars()
+if _SELF_CHARS:
+    CHAR_SETS["Source Code (this file)"] = {
+        "chars": _SELF_CHARS,
+        "enabled": True,
+        "desc": f"{len(_SELF_CHARS):,} unique chars pulled live from this script"
+    }
+
 
 # ---------- Themes ----------
 THEMES = {
     "dark": {
-        "bg": "#0f172a",
-        "card_bg": "#1e293b",
-        "card_border": "#334155",
-        "input_bg": "#334155",
-        "input_fg": "#f1f5f9",
+        "bg": "#0b0d13",
+        "surface": "#12151d",
+        "surface_alt": "#171b26",
+        "border": "#232838",
+        "input_bg": "#1b2130",
+        "input_fg": "#e8ebf2",
         "entry_fg": "#ffffff",
-        "text": "#f1f5f9",
-        "text_secondary": "#94a3b8",
-        "accent": "#6366f1",
-        "accent_hover": "#4f46e5",
-        "success": "#059669",
-        "success_hover": "#047857",
-        "danger": "#dc2626",
-        "danger_hover": "#b91c1c",
-        "warning": "#f97316",
-        "trough": "#334155",
-        "select": "#6366f1",
-        "text_area_bg": "#0f172a",
-        "text_area_fg": "#e2e8f0",
-        "stat_card_bg": "#1e293b",
-        "separator": "#334155",
-        "info_text": "#64748b",
-        "button_bg": "#475569",
+        "text": "#e8ebf2",
+        "text_secondary": "#8b93a5",
+        "text_faint": "#5b6478",
+        "accent": "#f5a623",
+        "accent_hover": "#d88f14",
+        "accent_fg": "#ffffff",
+        "success": "#2dd4bf",
+        "success_hover": "#22b8a5",
+        "danger": "#f0576b",
+        "danger_hover": "#d5405b",
+        "warning": "#f5a623",
+        "trough": "#232838",
+        "select": "#f5a623",
+        "button_bg": "#232838",
+        "button_fg": "#ffffff",
     },
     "light": {
-        "bg": "#f8fafc",
-        "card_bg": "#ffffff",
-        "card_border": "#e2e8f0",
-        "input_bg": "#f1f5f9",
-        "input_fg": "#0f172a",
+        "bg": "#f4f5f7",
+        "surface": "#ffffff",
+        "surface_alt": "#eef0f4",
+        "border": "#dde1e8",
+        "input_bg": "#eef0f4",
+        "input_fg": "#12151d",
         "entry_fg": "#000000",
-        "text": "#0f172a",
-        "text_secondary": "#64748b",
-        "accent": "#4f46e5",
-        "accent_hover": "#4338ca",
-        "success": "#059669",
-        "success_hover": "#047857",
+        "text": "#12151d",
+        "text_secondary": "#5b6478",
+        "text_faint": "#8b93a5",
+        "accent": "#b4740e",
+        "accent_hover": "#96600b",
+        "accent_fg": "#ffffff",
+        "success": "#0d9488",
+        "success_hover": "#0b7a70",
         "danger": "#dc2626",
         "danger_hover": "#b91c1c",
-        "warning": "#ea580c",
-        "trough": "#cbd5e1",
-        "select": "#4f46e5",
-        "text_area_bg": "#ffffff",
-        "text_area_fg": "#0f172a",
-        "stat_card_bg": "#ffffff",
-        "separator": "#e2e8f0",
-        "info_text": "#94a3b8",
-        "button_bg": "#cbd5e1",
-    }
+        "warning": "#b4740e",
+        "trough": "#dde1e8",
+        "select": "#b4740e",
+        "button_bg": "#dde1e8",
+        "button_fg": "#ffffff",
+    },
 }
 
 
@@ -128,15 +161,15 @@ def calculate_entropy(length, pool_size):
 
 def rate_entropy(bits):
     if bits < 40:
-        return "Very Weak", "#ef4444"
+        return "Very weak", "danger"
     elif bits < 60:
-        return "Weak", "#f97316"
+        return "Weak", "danger"
     elif bits < 80:
-        return "Moderate", "#eab308"
-    elif bits < 100:
-        return "Strong", "#60a5fa"
+        return "Moderate", "warning"
+    elif bits < 110:
+        return "Strong", "success"
     else:
-        return "Very Strong", "#34d399"
+        return "Very strong", "success"
 
 
 def generate_password(length, pool):
@@ -145,24 +178,38 @@ def generate_password(length, pool):
     return "".join(secrets.choice(pool) for _ in range(length))
 
 
+CLIPBOARD_CLEAR_MS = 30_000  # 30 seconds
+
+
 class PasswordUtilityApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("UNICODE Password Utility")
-        self.root.geometry("1000x900")
-        self.root.minsize(900, 750)
+        self.root.title("UNIGEN — Unicode Password Utility")
+
+        # Size to fit the current screen without needing to scroll.
+        self.root.update_idletasks()
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+        win_w = max(1000, min(1280, screen_w - 80))
+        win_h = max(680, min(820, screen_h - 100))
+        x = (screen_w - win_w) // 2
+        y = max(0, (screen_h - win_h) // 2 - 20)
+        self.root.geometry(f"{win_w}x{win_h}+{x}+{y}")
+        self.root.minsize(1000, 680)
 
         self.theme_name = "dark"
         self.theme = THEMES["dark"]
         self.root.configure(bg=self.theme["bg"])
 
         self.font_family = "Segoe UI" if sys.platform == "win32" else "Helvetica"
+        self.mono_family = "Consolas" if sys.platform == "win32" else (
+            "Menlo" if sys.platform == "darwin" else "DejaVu Sans Mono"
+        )
         try:
             tk.Label(root, text="", font=(self.font_family, 1)).destroy()
         except Exception:
             self.font_family = "Helvetica"
 
-        # Persistent state across theme rebuilds
         self.current_values = {
             "length": 20,
             "count": 3,
@@ -171,7 +218,7 @@ class PasswordUtilityApp:
             "enc_pwd": "",
             "dec_file": "",
             "dec_pwd": "",
-            "shred_after": False,
+            "shred_after": True,
         }
         self.active_tab = "gen"
         self.generated_passwords = []
@@ -179,75 +226,76 @@ class PasswordUtilityApp:
         self.last_encrypted_b64 = None
         self.last_encrypted_filename = None
         self.last_saved_password_path = None
+        self._clipboard_clear_job = None
 
-        self._build_scrollable_container()
+        # No scrollable canvas — the layout below is built to fit one screen.
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
+        self.main_frame = tk.Frame(self.root, bg=self.theme["bg"])
+        self.main_frame.grid(row=0, column=0, sticky="nsew")
+
         self.build_ui()
         self.update_pool_stats()
 
-    # ---------- Scrollable Canvas ----------
-    def _build_scrollable_container(self):
-        self.main_canvas = tk.Canvas(self.root, bg=self.theme["bg"], highlightthickness=0)
-        self.main_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    # ---------- Secure clipboard ----------
+    def copy_to_clipboard_secure(self, text, status_label=None):
+        """Copy text to clipboard and schedule an automatic, verified clear
+        30 seconds later (only clears if the clipboard still holds our text)."""
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.root.update()
 
-        self.scrollbar = tk.Scrollbar(
-            self.root, orient="vertical", command=self.main_canvas.yview,
-            bg=self.theme["card_border"], activebackground=self.theme["input_bg"],
-            troughcolor=self.theme["trough"], highlightthickness=0
-        )
-        self.scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        self.main_canvas.configure(yscrollcommand=self.scrollbar.set)
+        if status_label is not None:
+            status_label.config(
+                text="Copied — clipboard clears automatically in 30s.",
+                fg=self.theme["accent"]
+            )
 
-        self.main_frame = tk.Frame(self.main_canvas, bg=self.theme["bg"])
-        self.main_canvas_window = self.main_canvas.create_window((0, 0), window=self.main_frame, anchor="nw")
+        if self._clipboard_clear_job is not None:
+            try:
+                self.root.after_cancel(self._clipboard_clear_job)
+            except Exception:
+                pass
 
-        self.main_frame.bind("<Configure>", self.on_frame_configure)
-        self.main_canvas.bind("<Configure>", self.on_canvas_configure)
+        def _clear():
+            try:
+                current = self.root.clipboard_get()
+            except Exception:
+                current = None
+            if current == text:
+                self.root.clipboard_clear()
+                if status_label is not None:
+                    try:
+                        status_label.config(
+                            text="Clipboard cleared for security.",
+                            fg=self.theme["text_secondary"]
+                        )
+                    except Exception:
+                        pass
+            self._clipboard_clear_job = None
 
-        self.main_canvas.bind_all("<MouseWheel>", self.on_mousewheel)
-        self.main_canvas.bind_all("<Button-4>", self.on_mousewheel)
-        self.main_canvas.bind_all("<Button-5>", self.on_mousewheel)
+        self._clipboard_clear_job = self.root.after(CLIPBOARD_CLEAR_MS, _clear)
 
-    def on_frame_configure(self, event=None):
-        self.main_canvas.configure(scrollregion=self.main_canvas.bbox("all"))
-
-    def on_canvas_configure(self, event=None):
-        self.main_canvas.itemconfig(self.main_canvas_window, width=event.width)
-
-    def on_mousewheel(self, event):
-        if isinstance(event.widget, tk.Text):
-            return
-        if event.num == 4 or event.delta > 0:
-            self.main_canvas.yview_scroll(-1, "units")
-        elif event.num == 5 or event.delta < 0:
-            self.main_canvas.yview_scroll(1, "units")
-
-    # ---------- Theme Switch ----------
+    # ---------- Theme switch ----------
     def switch_theme(self):
         new_theme = "light" if self.theme_name == "dark" else "dark"
         self.theme_name = new_theme
         self.theme = THEMES[new_theme]
         self.root.configure(bg=self.theme["bg"])
 
-        # Preserve dynamic text content
-        saved_output = self.output_text.get(1.0, tk.END) if hasattr(self, "output_text") and self.output_text else ""
-        saved_enc_result = self.enc_result_text.get(1.0, tk.END) if hasattr(self, "enc_result_text") and self.enc_result_text else ""
+        saved_output = self.output_text.get(1.0, tk.END) if hasattr(self, "output_text") else ""
+        saved_enc_result = self.enc_result_text.get(1.0, tk.END) if hasattr(self, "enc_result_text") else ""
         saved_enc_status = self.enc_status.cget("text") if hasattr(self, "enc_status") else ""
-        saved_enc_status_fg = self.enc_status.cget("fg") if hasattr(self, "enc_status") else self.theme["text_secondary"]
         saved_dec_status = self.dec_status.cget("text") if hasattr(self, "dec_status") else ""
-        saved_dec_status_fg = self.dec_status.cget("fg") if hasattr(self, "dec_status") else self.theme["text_secondary"]
         saved_shred_status = self.shred_status.cget("text") if hasattr(self, "shred_status") else ""
-        saved_shred_status_fg = self.shred_status.cget("fg") if hasattr(self, "shred_status") else self.theme["text_secondary"]
 
-        # Rebuild
         self.main_frame.destroy()
-        self.main_canvas.destroy()
-        self.scrollbar.destroy()
+        self.main_frame = tk.Frame(self.root, bg=self.theme["bg"])
+        self.main_frame.grid(row=0, column=0, sticky="nsew")
 
-        self._build_scrollable_container()
         self.build_ui()
 
-        # Restore text areas
-        if saved_output and hasattr(self, "output_text"):
+        if saved_output.strip() and hasattr(self, "output_text"):
             self.output_text.config(state=tk.NORMAL)
             self.output_text.delete(1.0, tk.END)
             self.output_text.insert(tk.END, saved_output)
@@ -255,8 +303,9 @@ class PasswordUtilityApp:
             if self.generated_passwords:
                 self.copy_btn.config(state=tk.NORMAL)
                 self.save_btn.config(state=tk.NORMAL)
+                self.encrypt_shred_btn.config(state=tk.NORMAL)
 
-        if saved_enc_result and hasattr(self, "enc_result_text"):
+        if saved_enc_result.strip() and hasattr(self, "enc_result_text"):
             self.enc_result_text.config(state=tk.NORMAL)
             self.enc_result_text.delete(1.0, tk.END)
             self.enc_result_text.insert(tk.END, saved_enc_result)
@@ -266,11 +315,11 @@ class PasswordUtilityApp:
                 self.enc_save_btn.config(state=tk.NORMAL)
 
         if hasattr(self, "enc_status"):
-            self.enc_status.config(text=saved_enc_status, fg=saved_enc_status_fg)
+            self.enc_status.config(text=saved_enc_status)
         if hasattr(self, "dec_status"):
-            self.dec_status.config(text=saved_dec_status, fg=saved_dec_status_fg)
+            self.dec_status.config(text=saved_dec_status)
         if hasattr(self, "shred_status"):
-            self.shred_status.config(text=saved_shred_status, fg=saved_shred_status_fg)
+            self.shred_status.config(text=saved_shred_status)
 
         self.update_pool_stats()
         self.show_tab(self.active_tab)
@@ -278,7 +327,7 @@ class PasswordUtilityApp:
         self.check_dec_ready()
         self.check_shred_ready()
 
-    # ---------- UI Builders ----------
+    # ---------- UI helpers ----------
     def _configure_styles(self):
         style = ttk.Style()
         try:
@@ -286,523 +335,508 @@ class PasswordUtilityApp:
         except tk.TclError:
             pass
         style.configure(
-            "TProgressbar",
-            background=self.theme["accent"],
-            troughcolor=self.theme["trough"],
-            borderwidth=0,
-            lightcolor=self.theme["accent"],
-            darkcolor=self.theme["accent"],
+            "Accent.Horizontal.TProgressbar",
+            background=self.theme["accent"], troughcolor=self.theme["trough"],
+            borderwidth=0, lightcolor=self.theme["accent"], darkcolor=self.theme["accent"],
         )
 
     def _style_scrolledtext(self, widget):
         for child in widget.winfo_children():
             if isinstance(child, tk.Scrollbar):
                 child.configure(
-                    bg=self.theme["card_border"],
-                    activebackground=self.theme["input_bg"],
+                    bg=self.theme["border"], activebackground=self.theme["input_bg"],
                     troughcolor=self.theme["trough"],
                 )
 
-    def create_card(self, parent, title=None, padx=0, pady=0, fill=tk.X, expand=False):
-        card = tk.Frame(
-            parent, bg=self.theme["card_bg"], bd=0,
-            highlightthickness=1, highlightbackground=self.theme["card_border"]
+    def make_button(self, parent, text, kind="neutral", **pack_kwargs):
+        """kind: accent | success | danger | neutral"""
+        palette = {
+            "accent": (self.theme["accent"], self.theme["accent_hover"], "#ffffff"),
+            "success": (self.theme["success"], self.theme["success_hover"], "#ffffff"),
+            "danger": (self.theme["danger"], self.theme["danger_hover"], "#ffffff"),
+            "neutral": (self.theme["button_bg"], self.theme["input_bg"], "#ffffff"),
+        }[kind]
+        bg, hover, fg = palette
+
+        # Ensure neutral buttons in light mode have enough contrast for white text
+        if kind == "neutral" and self.theme_name == "light":
+            bg, hover = "#4b5563", "#374151"
+
+        btn = tk.Button(
+            parent, text=text, font=(self.font_family, 11, "bold"),
+            bd=0, padx=18, pady=9, bg=bg, fg=fg,
+            activebackground=hover, activeforeground=fg,
+            cursor="hand2", relief=tk.FLAT,
         )
-        card.pack(fill=fill, expand=expand, padx=padx, pady=pady)
+
+        def on_enter(_e):
+            if str(btn["state"]) != tk.DISABLED:
+                btn.config(bg=hover)
+
+        def on_leave(_e):
+            if str(btn["state"]) != tk.DISABLED:
+                btn.config(bg=bg)
+
+        btn.bind("<Enter>", on_enter)
+        btn.bind("<Leave>", on_leave)
+        btn._base_bg = bg
+        return btn
+
+    def create_card(self, parent, title=None, subtitle=None):
+        card = tk.Frame(
+            parent, bg=self.theme["surface"], bd=0,
+            highlightthickness=1, highlightbackground=self.theme["border"]
+        )
         if title:
-            tk.Label(card, text=title, font=(self.font_family, 13, "bold"),
-                     bg=self.theme["card_bg"], fg=self.theme["text"]).pack(anchor=tk.W, padx=18, pady=(15, 10))
-            tk.Frame(card, bg=self.theme["separator"], height=2).pack(fill=tk.X, padx=18, pady=(0, 12))
+            head = tk.Frame(card, bg=self.theme["surface"])
+            head.pack(fill=tk.X, padx=16, pady=(13, 8))
+            tk.Label(head, text=title, font=(self.font_family, 12, "bold"),
+                     bg=self.theme["surface"], fg=self.theme["text"]).pack(anchor=tk.W)
+            if subtitle:
+                tk.Label(head, text=subtitle, font=(self.font_family, 9),
+                         bg=self.theme["surface"], fg=self.theme["text_secondary"]).pack(anchor=tk.W, pady=(2, 0))
+            tk.Frame(card, bg=self.theme["border"], height=1).pack(fill=tk.X, padx=16, pady=(0, 10))
         return card
 
+    # ---------- Root layout ----------
     def build_ui(self):
         self._configure_styles()
 
-        content_wrapper = tk.Frame(self.main_frame, bg=self.theme["bg"])
-        content_wrapper.pack(fill=tk.BOTH, expand=True, padx=25, pady=20)
+        self.main_frame.columnconfigure(0, weight=1)
+        self.main_frame.rowconfigure(2, weight=1)
 
         # Header
-        header = tk.Frame(content_wrapper, bg=self.theme["bg"])
-        header.pack(fill=tk.X, pady=(0, 10))
+        header = tk.Frame(self.main_frame, bg=self.theme["bg"])
+        header.grid(row=0, column=0, sticky="ew", padx=18, pady=(14, 8))
+        header.columnconfigure(0, weight=1)
 
         title_frame = tk.Frame(header, bg=self.theme["bg"])
-        title_frame.pack(side=tk.LEFT, fill=tk.Y)
-
-        tk.Label(title_frame, text="UNICODE Password Utility", font=(self.font_family, 28, "bold"),
+        title_frame.grid(row=0, column=0, sticky="w")
+        tk.Label(title_frame, text="UNIGEN", font=(self.font_family, 22, "bold"),
                  bg=self.theme["bg"], fg=self.theme["accent"]).pack(anchor=tk.W)
-        tk.Label(title_frame, text="Cryptographically secure generation & file protection",
-                 font=(self.font_family, 12), bg=self.theme["bg"], fg=self.theme["text_secondary"]).pack(anchor=tk.W, pady=(2, 0))
+        tk.Label(title_frame, text="Unicode password generation & file protection — up to 10,000 at once",
+                 font=(self.font_family, 10), bg=self.theme["bg"], fg=self.theme["text_secondary"]).pack(anchor=tk.W, pady=(1, 0))
 
-        theme_btn_frame = tk.Frame(header, bg=self.theme["bg"])
-        theme_btn_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=(20, 0))
+        theme_text = "☀  Light" if self.theme_name == "dark" else "☾  Dark"
+        theme_btn = self.make_button(header, theme_text, kind="neutral")
+        theme_btn.config(command=self.switch_theme, font=(self.font_family, 9, "bold"), padx=12, pady=6)
+        theme_btn.grid(row=0, column=1, sticky="e")
 
-        theme_text = "☀ Light" if self.theme_name == "dark" else "☾ Dark"
-        theme_btn = tk.Button(
-            theme_btn_frame, text=theme_text, font=(self.font_family, 10, "bold"),
-            bd=0, padx=14, pady=6, bg=self.theme["card_bg"], fg=self.theme["text"],
-            activebackground=self.theme["input_bg"], activeforeground=self.theme["text"],
-            cursor="hand2", command=self.switch_theme,
-            highlightthickness=1, highlightbackground=self.theme["card_border"]
-        )
-        theme_btn.pack(anchor=tk.E, pady=2)
-
-        # Header separator
-        sep = tk.Frame(content_wrapper, bg=self.theme["separator"], height=1)
-        sep.pack(fill=tk.X, pady=(0, 15))
+        tk.Frame(self.main_frame, bg=self.theme["border"], height=1).grid(row=1, column=0, sticky="ew", padx=18)
 
         # Tabs
-        tab_frame = tk.Frame(content_wrapper, bg=self.theme["bg"])
-        tab_frame.pack(fill=tk.X, pady=(0, 15))
+        tab_bar = tk.Frame(self.main_frame, bg=self.theme["bg"])
+        tab_bar.grid(row=2, column=0, sticky="new", padx=18, pady=(10, 0))
+        # placeholder row; actual content below replaces this — see content_frame row=3
 
+        tabs_row = tk.Frame(self.main_frame, bg=self.theme["bg"])
+        tabs_row.grid(row=2, column=0, sticky="ew", padx=18, pady=(10, 10))
         self.tab_buttons = {}
 
         self.gen_tab_btn = tk.Button(
-            tab_frame, text="  Password Generator  ",
-            font=(self.font_family, 11, "bold"), bd=0, padx=20, pady=8,
-            bg=self.theme["accent"], fg="white",
-            activebackground=self.theme["accent_hover"], activeforeground="white",
-            cursor="hand2", command=lambda: self.switch_tab("gen")
+            tabs_row, text="Password Generator", font=(self.font_family, 10, "bold"),
+            bd=0, padx=16, pady=7, cursor="hand2", relief=tk.FLAT,
+            command=lambda: self.switch_tab("gen")
         )
         self.gen_tab_btn.pack(side=tk.LEFT, padx=(0, 8))
         self.tab_buttons["gen"] = self.gen_tab_btn
 
         self.enc_tab_btn = tk.Button(
-            tab_frame, text="  File Protector  ",
-            font=(self.font_family, 11, "bold"), bd=0, padx=20, pady=8,
-            bg=self.theme["card_bg"], fg=self.theme["text_secondary"],
-            activebackground=self.theme["input_bg"], activeforeground=self.theme["text"],
-            cursor="hand2", command=lambda: self.switch_tab("enc")
+            tabs_row, text="File Protector", font=(self.font_family, 10, "bold"),
+            bd=0, padx=16, pady=7, cursor="hand2", relief=tk.FLAT,
+            command=lambda: self.switch_tab("enc")
         )
         self.enc_tab_btn.pack(side=tk.LEFT)
         self.tab_buttons["enc"] = self.enc_tab_btn
 
-        self.content_frame = tk.Frame(content_wrapper, bg=self.theme["bg"])
-        self.content_frame.pack(fill=tk.BOTH, expand=True)
+        self.main_frame.rowconfigure(3, weight=1)
+        self.content_frame = tk.Frame(self.main_frame, bg=self.theme["bg"])
+        self.content_frame.grid(row=3, column=0, sticky="nsew", padx=18, pady=(0, 14))
+        self.content_frame.columnconfigure(0, weight=1)
+        self.content_frame.rowconfigure(0, weight=1)
 
         self.build_generator_tab()
         self.build_file_protector_tab()
         self.show_tab(self.active_tab)
+        self._paint_tabs()
+
+    def _paint_tabs(self):
+        for name, btn in self.tab_buttons.items():
+            if name == self.active_tab:
+                btn.config(bg=self.theme["accent"], fg=self.theme["accent_fg"],
+                           activebackground=self.theme["accent_hover"], activeforeground=self.theme["accent_fg"])
+            else:
+                btn.config(bg=self.theme["surface"], fg=self.theme["text_secondary"],
+                           activebackground=self.theme["surface_alt"], activeforeground=self.theme["text"])
 
     def switch_tab(self, tab):
         self.active_tab = tab
-        for name, btn in self.tab_buttons.items():
-            if name == tab:
-                btn.config(bg=self.theme["accent"], fg="white")
-            else:
-                btn.config(bg=self.theme["card_bg"], fg=self.theme["text_secondary"])
+        self._paint_tabs()
         self.show_tab(tab)
 
     def show_tab(self, tab):
         if tab == "gen":
-            self.gen_frame.pack(fill=tk.BOTH, expand=True)
-            self.enc_frame.pack_forget()
+            self.enc_frame.grid_forget()
+            self.gen_frame.grid(row=0, column=0, sticky="nsew")
         else:
-            self.gen_frame.pack_forget()
-            self.enc_frame.pack(fill=tk.BOTH, expand=True)
+            self.gen_frame.grid_forget()
+            self.enc_frame.grid(row=0, column=0, sticky="nsew")
 
-    # ---------- Generator Tab ----------
+    # ---------- Generator tab (sidebar + main, grid based, no scroll canvas) ----------
     def build_generator_tab(self):
         self.gen_frame = tk.Frame(self.content_frame, bg=self.theme["bg"])
+        self.gen_frame.columnconfigure(1, weight=1)
+        self.gen_frame.rowconfigure(0, weight=1)
 
-        # Settings Card
-        settings_card = self.create_card(self.gen_frame, title="Generation Settings", pady=(0, 15))
-
-        params = tk.Frame(settings_card, bg=self.theme["card_bg"])
-        params.pack(fill=tk.X, padx=18, pady=(0, 12))
+        # ---- Sidebar (settings) ----
+        sidebar = self.create_card(self.gen_frame, title="Generation Settings")
+        sidebar.grid(row=0, column=0, sticky="nsw", padx=(0, 14))
+        sidebar.configure(width=300)
+        sidebar.grid_propagate(False)
 
         # Length
-        len_frame = tk.Frame(params, bg=self.theme["card_bg"])
-        len_frame.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 12))
-        tk.Label(len_frame, text="Password Length", font=(self.font_family, 10, "bold"),
-                 bg=self.theme["card_bg"], fg=self.theme["text"]).pack(anchor=tk.W)
-
-        len_row = tk.Frame(len_frame, bg=self.theme["card_bg"])
-        len_row.pack(fill=tk.X, pady=(6, 0))
+        tk.Label(sidebar, text="Password Length", font=(self.font_family, 10, "bold"),
+                 bg=self.theme["surface"], fg=self.theme["text"]).pack(anchor=tk.W, padx=16, pady=(0, 4))
+        len_row = tk.Frame(sidebar, bg=self.theme["surface"])
+        len_row.pack(fill=tk.X, padx=16, pady=(0, 12))
         self.len_var = tk.IntVar(value=self.current_values["length"])
         self.len_slider = tk.Scale(
             len_row, from_=8, to=128, orient=tk.HORIZONTAL,
-            variable=self.len_var, bg=self.theme["card_bg"], fg=self.theme["accent"],
-            highlightthickness=0, troughcolor=self.theme["trough"],
+            variable=self.len_var, bg=self.theme["surface"], fg=self.theme["accent"],
+            highlightthickness=0, troughcolor=self.theme["trough"], bd=0,
             activebackground=self.theme["accent"], showvalue=0,
-            command=self.on_len_change
+            command=self.on_len_change, sliderrelief=tk.FLAT
         )
         self.len_slider.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self.len_spin = tk.Spinbox(
-            len_row, from_=8, to=128, width=5, textvariable=self.len_var,
+            len_row, from_=8, to=128, width=4, textvariable=self.len_var,
             bg=self.theme["input_bg"], fg=self.theme["input_fg"], insertbackground=self.theme["input_fg"],
-            font=(self.font_family, 11), buttonbackground=self.theme["button_bg"],
+            font=(self.mono_family, 10), buttonbackground=self.theme["button_bg"], bd=0, relief=tk.FLAT,
             command=self.on_len_change
         )
-        self.len_spin.pack(side=tk.RIGHT, padx=(10, 0))
+        self.len_spin.pack(side=tk.RIGHT, padx=(8, 0))
         self.len_var.trace_add("write", lambda *args: self.on_len_change())
 
         # Count
-        cnt_frame = tk.Frame(params, bg=self.theme["card_bg"])
-        cnt_frame.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(12, 0))
-        tk.Label(cnt_frame, text="Number of Passwords", font=(self.font_family, 10, "bold"),
-                 bg=self.theme["card_bg"], fg=self.theme["text"]).pack(anchor=tk.W)
-
-        cnt_row = tk.Frame(cnt_frame, bg=self.theme["card_bg"])
-        cnt_row.pack(fill=tk.X, pady=(6, 0))
+        tk.Label(sidebar, text="Number of Passwords", font=(self.font_family, 10, "bold"),
+                 bg=self.theme["surface"], fg=self.theme["text"]).pack(anchor=tk.W, padx=16, pady=(0, 4))
+        cnt_row = tk.Frame(sidebar, bg=self.theme["surface"])
+        cnt_row.pack(fill=tk.X, padx=16, pady=(0, 14))
         self.cnt_var = tk.IntVar(value=self.current_values["count"])
         self.cnt_slider = tk.Scale(
             cnt_row, from_=1, to=10000, orient=tk.HORIZONTAL,
-            variable=self.cnt_var, bg=self.theme["card_bg"], fg=self.theme["accent"],
-            highlightthickness=0, troughcolor=self.theme["trough"],
+            variable=self.cnt_var, bg=self.theme["surface"], fg=self.theme["accent"],
+            highlightthickness=0, troughcolor=self.theme["trough"], bd=0,
             activebackground=self.theme["accent"], showvalue=0,
-            command=self.on_cnt_change
+            command=self.on_cnt_change, sliderrelief=tk.FLAT
         )
         self.cnt_slider.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self.cnt_spin = tk.Spinbox(
-            cnt_row, from_=1, to=10000, width=7, textvariable=self.cnt_var,
+            cnt_row, from_=1, to=10000, width=6, textvariable=self.cnt_var,
             bg=self.theme["input_bg"], fg=self.theme["input_fg"], insertbackground=self.theme["input_fg"],
-            font=(self.font_family, 11), buttonbackground=self.theme["button_bg"],
+            font=(self.mono_family, 10), buttonbackground=self.theme["button_bg"], bd=0, relief=tk.FLAT,
             command=self.on_cnt_change
         )
-        self.cnt_spin.pack(side=tk.RIGHT, padx=(10, 0))
+        self.cnt_spin.pack(side=tk.RIGHT, padx=(8, 0))
         self.cnt_var.trace_add("write", lambda *args: self.on_cnt_change())
 
-        # Character Sets
-        tk.Label(settings_card, text="Character Sets", font=(self.font_family, 12, "bold"),
-                 bg=self.theme["card_bg"], fg=self.theme["text"]).pack(anchor=tk.W, padx=18, pady=(10, 0))
-        tk.Frame(settings_card, bg=self.theme["separator"], height=1).pack(fill=tk.X, padx=18, pady=(8, 12))
+        tk.Label(sidebar, text="Character Sets", font=(self.font_family, 11, "bold"),
+                 bg=self.theme["surface"], fg=self.theme["text"]).pack(anchor=tk.W, padx=16, pady=(2, 6))
 
-        charset_grid = tk.Frame(settings_card, bg=self.theme["card_bg"])
-        charset_grid.pack(fill=tk.X, padx=18, pady=(0, 10))
+        # Scrollable-if-needed but compact checkbox list (single column, tight rows)
+        charset_list = tk.Frame(sidebar, bg=self.theme["surface"])
+        charset_list.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 6))
 
         self.charset_vars = {}
-        for i, (name, data) in enumerate(CHAR_SETS.items()):
+        for name, data in CHAR_SETS.items():
             var = tk.BooleanVar(value=self.current_values["charsets"].get(name, data["enabled"]))
             self.charset_vars[name] = var
             var.trace_add("write", lambda *args, n=name: self.current_values["charsets"].update({n: self.charset_vars[n].get()}))
 
-            cb_frame = tk.Frame(
-                charset_grid, bg=self.theme["input_bg"], padx=10, pady=8,
-                highlightthickness=1, highlightbackground=self.theme["card_border"]
-            )
-            cb_frame.grid(row=i // 4, column=i % 4, sticky="nsew", padx=5, pady=5)
-
+            row = tk.Frame(charset_list, bg=self.theme["input_bg"])
+            row.pack(fill=tk.X, pady=3)
             cb = tk.Checkbutton(
-                cb_frame, text=name, variable=var, bg=self.theme["input_bg"], fg=self.theme["text"],
+                row, text=name, variable=var, bg=self.theme["input_bg"], fg=self.theme["text"],
                 selectcolor=self.theme["accent"], activebackground=self.theme["input_bg"], activeforeground=self.theme["text"],
-                font=(self.font_family, 10, "bold"), command=self.update_pool_stats
+                font=(self.font_family, 9, "bold"), command=self.update_pool_stats,
+                anchor="w", padx=8, pady=4
             )
-            cb.pack(anchor=tk.W)
-            tk.Label(cb_frame, text=data["desc"], font=(self.font_family, 9),
-                     bg=self.theme["input_bg"], fg=self.theme["text_secondary"]).pack(anchor=tk.W)
+            cb.pack(fill=tk.X)
+            tk.Label(row, text=data["desc"], font=(self.font_family, 8),
+                     bg=self.theme["input_bg"], fg=self.theme["text_secondary"]).pack(anchor=tk.W, padx=8, pady=(0, 5))
 
-        for c in range(4):
-            charset_grid.columnconfigure(c, weight=1)
-
-        # Warning
         self.warn_label = tk.Label(
-            settings_card, text="Select at least one character set.",
-            font=(self.font_family, 10, "bold"), bg=self.theme["card_bg"], fg=self.theme["warning"]
+            sidebar, text="Select at least one character set.",
+            font=(self.font_family, 9, "bold"), bg=self.theme["surface"], fg=self.theme["danger"]
         )
-        self.warn_label.pack(anchor=tk.W, padx=18)
+        self.warn_label.pack(anchor=tk.W, padx=16, pady=(0, 6))
         self.warn_label.pack_forget()
 
-        # Generate Button
-        btn_frame = tk.Frame(settings_card, bg=self.theme["card_bg"])
-        btn_frame.pack(fill=tk.X, padx=18, pady=15)
-
-        self.gen_btn = tk.Button(
-            btn_frame, text="Generate Passwords", font=(self.font_family, 12, "bold"),
-            bd=0, padx=20, pady=10, bg=self.theme["accent"], fg="white",
-            activebackground=self.theme["accent_hover"], activeforeground="white",
-            cursor="hand2", command=self.generate_passwords
+        tip = tk.Label(
+            sidebar, text="Copying a password auto-clears your clipboard 30s later.",
+            font=(self.font_family, 8), bg=self.theme["surface"], fg=self.theme["text_faint"],
+            wraplength=260, justify=tk.LEFT
         )
-        self.gen_btn.pack(fill=tk.X)
+        tip.pack(anchor=tk.W, padx=16, pady=(4, 14))
 
-        # Progress bar
-        self.progress = ttk.Progressbar(settings_card, mode="determinate", maximum=100)
-        self.prog_label = tk.Label(
-            settings_card, text="", font=(self.font_family, 10),
-            bg=self.theme["card_bg"], fg=self.theme["text_secondary"]
-        )
+        # ---- Main column ----
+        main_col = tk.Frame(self.gen_frame, bg=self.theme["bg"])
+        main_col.grid(row=0, column=1, sticky="nsew")
+        main_col.columnconfigure(0, weight=1)
+        main_col.rowconfigure(2, weight=1)
 
-        # Stats Cards
-        stats_frame = tk.Frame(self.gen_frame, bg=self.theme["bg"])
-        stats_frame.pack(fill=tk.X, pady=(0, 15))
+        # Stats row
+        stats_frame = tk.Frame(main_col, bg=self.theme["bg"])
+        stats_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        stats_frame.columnconfigure((0, 1, 2), weight=1)
 
         self.stat_cards = {}
-        for title, key, color in [
-            ("Pool Size", "pool", self.theme["text"]),
-            ("Entropy", "entropy", self.theme["text"]),
-            ("Strength", "strength", self.theme["text"])
-        ]:
+        for i, (title, key) in enumerate([("Pool Size", "pool"), ("Entropy", "entropy"), ("Strength", "strength")]):
             card = tk.Frame(
-                stats_frame, bg=self.theme["stat_card_bg"], padx=15, pady=12,
-                highlightthickness=1, highlightbackground=self.theme["card_border"]
+                stats_frame, bg=self.theme["surface"], padx=14, pady=10,
+                highlightthickness=1, highlightbackground=self.theme["border"]
             )
-            card.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10) if key != "strength" else 0)
-            tk.Label(card, text=title, font=(self.font_family, 10),
-                     bg=self.theme["stat_card_bg"], fg=self.theme["text_secondary"]).pack(anchor=tk.W)
-            lbl = tk.Label(card, text="-", font=(self.font_family, 18, "bold"),
-                           bg=self.theme["stat_card_bg"], fg=color)
-            lbl.pack(anchor=tk.W, pady=(4, 0))
+            card.grid(row=0, column=i, sticky="ew", padx=(0 if i == 0 else 8, 0))
+            tk.Label(card, text=title, font=(self.font_family, 9),
+                     bg=self.theme["surface"], fg=self.theme["text_secondary"]).pack(anchor=tk.W)
+            lbl = tk.Label(card, text="-", font=(self.mono_family, 16, "bold"),
+                           bg=self.theme["surface"], fg=self.theme["text"])
+            lbl.pack(anchor=tk.W, pady=(3, 0))
             self.stat_cards[key] = lbl
 
-        # Output Card
-        out_card = self.create_card(self.gen_frame, title="Generated Passwords", pady=(0, 15), fill=tk.BOTH, expand=True)
+        # Generate button + progress
+        gen_btn_frame = tk.Frame(main_col, bg=self.theme["bg"])
+        gen_btn_frame.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        self.gen_btn = self.make_button(gen_btn_frame, "Generate Passwords", kind="accent")
+        self.gen_btn.config(command=self.generate_passwords, font=(self.font_family, 12, "bold"))
+        self.gen_btn.pack(fill=tk.X, ipady=3)
+
+        self.progress = ttk.Progressbar(gen_btn_frame, mode="determinate", maximum=100,
+                                         style="Accent.Horizontal.TProgressbar")
+        self.prog_label = tk.Label(gen_btn_frame, text="", font=(self.font_family, 9),
+                                    bg=self.theme["bg"], fg=self.theme["text_secondary"])
+
+        # Output card (expands to fill remaining space)
+        out_card = self.create_card(main_col, title="Generated Passwords")
+        out_card.grid(row=2, column=0, sticky="nsew")
+        out_card.columnconfigure(0, weight=1)
+        out_card.rowconfigure(0, weight=1)
+
+        text_wrap = tk.Frame(out_card, bg=self.theme["surface"])
+        text_wrap.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 8))
 
         self.output_text = scrolledtext.ScrolledText(
-            out_card, wrap=tk.WORD, bg=self.theme["text_area_bg"], fg=self.theme["text_area_fg"],
-            insertbackground=self.theme["text_area_fg"], font=("Consolas", 11),
-            bd=0, padx=12, pady=12, relief=tk.FLAT
+            text_wrap, wrap=tk.NONE, bg=self.theme["bg"], fg=self.theme["text"],
+            insertbackground=self.theme["text"], font=(self.mono_family, 10),
+            bd=0, padx=10, pady=10, relief=tk.FLAT
         )
-        self.output_text.pack(fill=tk.BOTH, expand=True, padx=18, pady=(0, 12))
+        self.output_text.pack(fill=tk.BOTH, expand=True)
         self._style_scrolledtext(self.output_text)
 
         if not self.generated_passwords:
-            self.output_text.insert(tk.END, "Click 'Generate Passwords' to begin.\n")
+            self.output_text.insert(tk.END, "Click \u201cGenerate Passwords\u201d to begin.\n")
         else:
             for i, pwd in enumerate(self.generated_passwords):
                 self.output_text.insert(tk.END, f"#{i+1}: {pwd}\n")
         self.output_text.config(state=tk.DISABLED)
 
+        # Copy status (used by secure-clipboard countdown)
+        self.gen_copy_status = tk.Label(
+            out_card, text="", font=(self.font_family, 8),
+            bg=self.theme["surface"], fg=self.theme["text_secondary"]
+        )
+        self.gen_copy_status.pack(anchor=tk.W, padx=16, pady=(0, 4))
+
         # Action buttons
-        act_frame = tk.Frame(out_card, bg=self.theme["card_bg"])
-        act_frame.pack(fill=tk.X, padx=18, pady=(0, 15))
+        act_frame = tk.Frame(out_card, bg=self.theme["surface"])
+        act_frame.pack(fill=tk.X, padx=16, pady=(0, 14))
 
-        self.copy_btn = tk.Button(
-            act_frame, text="Copy All", font=(self.font_family, 11, "bold"),
-            bd=0, padx=20, pady=8, bg=self.theme["button_bg"], fg="white",
-            activebackground=self.theme["input_bg"], activeforeground="white",
-            cursor="hand2", command=self.copy_all_passwords, state=tk.DISABLED
-        )
-        self.copy_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+        self.copy_btn = self.make_button(act_frame, "Copy All", kind="neutral")
+        self.copy_btn.config(command=self.copy_all_passwords, state=tk.DISABLED)
+        self.copy_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
 
-        self.save_btn = tk.Button(
-            act_frame, text="Save to File", font=(self.font_family, 11, "bold"),
-            bd=0, padx=20, pady=8, bg=self.theme["success"], fg="white",
-            activebackground=self.theme["success_hover"], activeforeground="white",
-            cursor="hand2", command=self.save_passwords, state=tk.DISABLED
-        )
-        self.save_btn.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(8, 0))
+        self.save_btn = self.make_button(act_frame, "Save to File", kind="success")
+        self.save_btn.config(command=self.save_passwords, state=tk.DISABLED)
+        self.save_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
+
+        self.encrypt_shred_btn = self.make_button(act_frame, "Encrypt & Shred File", kind="danger")
+        self.encrypt_shred_btn.config(command=self.encrypt_and_shred_password_file, state=tk.DISABLED)
+        self.encrypt_shred_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0))
 
         if self.generated_passwords:
             self.copy_btn.config(state=tk.NORMAL)
             self.save_btn.config(state=tk.NORMAL)
+        if self.last_saved_password_path:
+            self.encrypt_shred_btn.config(state=tk.NORMAL)
 
-    # ---------- File Protector Tab ----------
+    # ---------- File Protector tab (two columns to avoid vertical overflow) ----------
     def build_file_protector_tab(self):
         self.enc_frame = tk.Frame(self.content_frame, bg=self.theme["bg"])
+        self.enc_frame.columnconfigure(0, weight=1)
+        self.enc_frame.columnconfigure(1, weight=1)
+        self.enc_frame.rowconfigure(0, weight=1)
 
         if not CRYPTO_AVAILABLE:
-            card = self.create_card(self.enc_frame, title="Missing Dependency", pady=15)
+            card = self.create_card(self.enc_frame, title="Missing Dependency")
+            card.grid(row=0, column=0, columnspan=2, sticky="nsew")
             tk.Label(card, text="The 'cryptography' library is required.",
-                     font=(self.font_family, 14), bg=self.theme["card_bg"], fg=self.theme["danger"]).pack(pady=20)
+                     font=(self.font_family, 13), bg=self.theme["surface"], fg=self.theme["danger"]).pack(pady=16, padx=16)
             tk.Label(card, text="Install:  pip install cryptography",
-                     font=(self.font_family, 12), bg=self.theme["card_bg"], fg=self.theme["warning"]).pack()
+                     font=(self.font_family, 11), bg=self.theme["surface"], fg=self.theme["warning"]).pack(padx=16)
             return
 
-        # Encrypt Card
-        enc_card = self.create_card(self.enc_frame, title="Encrypt File", pady=(0, 15))
-        tk.Label(
-            enc_card, text="AES-256-GCM + PBKDF2 (600,000 iterations, SHA-256)",
-            font=(self.font_family, 10), bg=self.theme["card_bg"], fg=self.theme["text_secondary"]
-        ).pack(anchor=tk.W, padx=18, pady=(0, 10))
+        # ---- Encrypt card (left) ----
+        enc_card = self.create_card(self.enc_frame, title="Encrypt File",
+                                     subtitle="AES-256-GCM + PBKDF2 (600,000 iterations, SHA-256)")
+        enc_card.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
 
-        # File picker
-        fp_frame = tk.Frame(enc_card, bg=self.theme["card_bg"])
-        fp_frame.pack(fill=tk.X, padx=18, pady=5)
+        fp_frame = tk.Frame(enc_card, bg=self.theme["surface"])
+        fp_frame.pack(fill=tk.X, padx=16, pady=4)
         self.enc_file_path = tk.StringVar(value=self.current_values["enc_file"])
         tk.Entry(
             fp_frame, textvariable=self.enc_file_path, state="readonly",
             bg=self.theme["input_bg"], fg=self.theme["entry_fg"],
             readonlybackground=self.theme["input_bg"], disabledforeground=self.theme["entry_fg"],
-            font=(self.font_family, 11), bd=0, insertbackground=self.theme["input_fg"]
-        ).pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=6)
-        tk.Button(
-            fp_frame, text="Browse", font=(self.font_family, 10, "bold"), bd=0, padx=15, pady=6,
-            bg=self.theme["button_bg"], fg="white", activebackground=self.theme["input_bg"], cursor="hand2",
-            command=self.browse_encrypt_file
-        ).pack(side=tk.RIGHT, padx=(10, 0))
+            font=(self.font_family, 10), bd=0, insertbackground=self.theme["input_fg"]
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=5)
+        browse_btn = self.make_button(fp_frame, "Browse", kind="neutral")
+        browse_btn.config(command=self.browse_encrypt_file, font=(self.font_family, 9, "bold"), padx=12, pady=5)
+        browse_btn.pack(side=tk.RIGHT, padx=(8, 0))
 
-        # Passphrase
-        tk.Label(
-            enc_card, text="Passphrase (min 8 characters):", font=(self.font_family, 10, "bold"),
-            bg=self.theme["card_bg"], fg=self.theme["text"]
-        ).pack(anchor=tk.W, padx=18, pady=(12, 0))
+        tk.Label(enc_card, text="Passphrase (min 8 characters)", font=(self.font_family, 9, "bold"),
+                 bg=self.theme["surface"], fg=self.theme["text"]).pack(anchor=tk.W, padx=16, pady=(10, 0))
         self.enc_pwd_var = tk.StringVar(value=self.current_values["enc_pwd"])
         tk.Entry(
-            enc_card, textvariable=self.enc_pwd_var, show="*",
+            enc_card, textvariable=self.enc_pwd_var, show="•",
             bg=self.theme["input_bg"], fg=self.theme["input_fg"],
-            font=(self.font_family, 11), bd=0, insertbackground=self.theme["input_fg"]
-        ).pack(fill=tk.X, padx=18, pady=6, ipady=6)
+            font=(self.font_family, 10), bd=0, insertbackground=self.theme["input_fg"]
+        ).pack(fill=tk.X, padx=16, pady=5, ipady=5)
         self.enc_pwd_var.trace_add("write", lambda *args: self.on_enc_pwd_change())
 
-        # Shred checkbox
         self.shred_after_enc_var = tk.BooleanVar(value=self.current_values["shred_after"])
         shred_cb = tk.Checkbutton(
-            enc_card, text="Securely delete original file after encryption",
+            enc_card, text="Verify, then securely shred the original after encryption",
             variable=self.shred_after_enc_var,
-            bg=self.theme["card_bg"], fg=self.theme["text_secondary"],
-            selectcolor=self.theme["accent"], activebackground=self.theme["card_bg"],
-            font=(self.font_family, 10),
+            bg=self.theme["surface"], fg=self.theme["text_secondary"],
+            selectcolor=self.theme["accent"], activebackground=self.theme["surface"],
+            font=(self.font_family, 9),
             command=lambda: self.current_values.update({"shred_after": self.shred_after_enc_var.get()})
         )
-        shred_cb.pack(anchor=tk.W, padx=18, pady=(5, 0))
+        shred_cb.pack(anchor=tk.W, padx=16, pady=(6, 0))
 
-        # Encrypt button
-        self.enc_btn = tk.Button(
-            enc_card, text="Encrypt", font=(self.font_family, 12, "bold"),
-            bd=0, padx=20, pady=10, bg=self.theme["danger"], fg="white",
-            activebackground=self.theme["danger_hover"], cursor="hand2",
-            command=self.encrypt_file, state=tk.DISABLED
-        )
-        self.enc_btn.pack(fill=tk.X, padx=18, pady=12)
+        self.enc_btn = self.make_button(enc_card, "Encrypt", kind="danger")
+        self.enc_btn.config(command=self.encrypt_file, state=tk.DISABLED, font=(self.font_family, 11, "bold"))
+        self.enc_btn.pack(fill=tk.X, padx=16, pady=10)
 
-        # Status label
         self.enc_status = tk.Label(
-            enc_card, text="", font=(self.font_family, 10),
-            bg=self.theme["card_bg"], fg=self.theme["text_secondary"]
+            enc_card, text="", font=(self.font_family, 9),
+            bg=self.theme["surface"], fg=self.theme["text_secondary"], wraplength=380, justify=tk.LEFT
         )
-        self.enc_status.pack(anchor=tk.W, padx=18, pady=(0, 10))
+        self.enc_status.pack(anchor=tk.W, padx=16, pady=(0, 6))
 
-        # Result area label
-        tk.Label(
-            enc_card, text="Encrypted Output (Base64):", font=(self.font_family, 10, "bold"),
-            bg=self.theme["card_bg"], fg=self.theme["text"]
-        ).pack(anchor=tk.W, padx=18, pady=(5, 5))
+        tk.Label(enc_card, text="Encrypted Output (Base64)", font=(self.font_family, 9, "bold"),
+                 bg=self.theme["surface"], fg=self.theme["text"]).pack(anchor=tk.W, padx=16, pady=(2, 4))
 
-        # Result text area
         self.enc_result_text = scrolledtext.ScrolledText(
-            enc_card, wrap=tk.WORD, bg=self.theme["text_area_bg"], fg=self.theme["accent"],
-            insertbackground=self.theme["accent"], font=("Consolas", 10),
-            bd=0, padx=10, pady=10, relief=tk.FLAT, height=8
+            enc_card, wrap=tk.WORD, bg=self.theme["bg"], fg=self.theme["accent"],
+            insertbackground=self.theme["accent"], font=(self.mono_family, 9),
+            bd=0, padx=8, pady=8, relief=tk.FLAT, height=6
         )
-        self.enc_result_text.pack(fill=tk.X, padx=18, pady=(0, 10))
+        self.enc_result_text.pack(fill=tk.X, padx=16, pady=(0, 8))
         self._style_scrolledtext(self.enc_result_text)
         self.enc_result_text.insert(tk.END, "Click 'Encrypt' to generate encrypted output.\n")
         self.enc_result_text.config(state=tk.DISABLED)
 
-        # Copy & Save buttons
-        enc_act_frame = tk.Frame(enc_card, bg=self.theme["card_bg"])
-        enc_act_frame.pack(fill=tk.X, padx=18, pady=(0, 15))
-
-        self.enc_copy_btn = tk.Button(
-            enc_act_frame, text="Copy to Clipboard", font=(self.font_family, 11, "bold"),
-            bd=0, padx=20, pady=10, bg=self.theme["button_bg"], fg="white",
-            activebackground=self.theme["input_bg"], activeforeground="white",
-            cursor="hand2", command=self.copy_encrypted, state=tk.DISABLED
-        )
-        self.enc_copy_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
-
-        self.enc_save_btn = tk.Button(
-            enc_act_frame, text="Save to File", font=(self.font_family, 11, "bold"),
-            bd=0, padx=20, pady=10, bg=self.theme["success"], fg="white",
-            activebackground=self.theme["success_hover"], activeforeground="white",
-            cursor="hand2", command=self.save_encrypted, state=tk.DISABLED
-        )
-        self.enc_save_btn.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(8, 0))
+        enc_act_frame = tk.Frame(enc_card, bg=self.theme["surface"])
+        enc_act_frame.pack(fill=tk.X, padx=16, pady=(0, 14))
+        self.enc_copy_btn = self.make_button(enc_act_frame, "Copy", kind="neutral")
+        self.enc_copy_btn.config(command=self.copy_encrypted, state=tk.DISABLED, font=(self.font_family, 10, "bold"))
+        self.enc_copy_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        self.enc_save_btn = self.make_button(enc_act_frame, "Save to File", kind="success")
+        self.enc_save_btn.config(command=self.save_encrypted, state=tk.DISABLED, font=(self.font_family, 10, "bold"))
+        self.enc_save_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0))
 
         if self.last_encrypted_b64:
             self.enc_copy_btn.config(state=tk.NORMAL)
             self.enc_save_btn.config(state=tk.NORMAL)
 
-        # Decrypt Card
-        dec_card = self.create_card(self.enc_frame, title="Decrypt File", pady=(0, 15))
-        tk.Label(
-            dec_card, text="Select an encrypted .enc file to restore",
-            font=(self.font_family, 10), bg=self.theme["card_bg"], fg=self.theme["text_secondary"]
-        ).pack(anchor=tk.W, padx=18, pady=(0, 10))
+        # ---- Right column: Decrypt (top) + Shred (bottom) ----
+        right_col = tk.Frame(self.enc_frame, bg=self.theme["bg"])
+        right_col.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+        right_col.columnconfigure(0, weight=1)
+        right_col.rowconfigure(0, weight=0)
+        right_col.rowconfigure(1, weight=1)
 
-        dfp_frame = tk.Frame(dec_card, bg=self.theme["card_bg"])
-        dfp_frame.pack(fill=tk.X, padx=18, pady=5)
+        dec_card = self.create_card(right_col, title="Decrypt File",
+                                     subtitle="Select an encrypted .enc file to restore")
+        dec_card.grid(row=0, column=0, sticky="new", pady=(0, 10))
+
+        dfp_frame = tk.Frame(dec_card, bg=self.theme["surface"])
+        dfp_frame.pack(fill=tk.X, padx=16, pady=4)
         self.dec_file_path = tk.StringVar(value=self.current_values["dec_file"])
         tk.Entry(
             dfp_frame, textvariable=self.dec_file_path, state="readonly",
             bg=self.theme["input_bg"], fg=self.theme["entry_fg"],
             readonlybackground=self.theme["input_bg"], disabledforeground=self.theme["entry_fg"],
-            font=(self.font_family, 11), bd=0, insertbackground=self.theme["input_fg"]
-        ).pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=6)
-        tk.Button(
-            dfp_frame, text="Browse", font=(self.font_family, 10, "bold"), bd=0, padx=15, pady=6,
-            bg=self.theme["button_bg"], fg="white", activebackground=self.theme["input_bg"], cursor="hand2",
-            command=self.browse_decrypt_file
-        ).pack(side=tk.RIGHT, padx=(10, 0))
+            font=(self.font_family, 10), bd=0, insertbackground=self.theme["input_fg"]
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=5)
+        dec_browse = self.make_button(dfp_frame, "Browse", kind="neutral")
+        dec_browse.config(command=self.browse_decrypt_file, font=(self.font_family, 9, "bold"), padx=12, pady=5)
+        dec_browse.pack(side=tk.RIGHT, padx=(8, 0))
 
-        tk.Label(
-            dec_card, text="Passphrase:", font=(self.font_family, 10, "bold"),
-            bg=self.theme["card_bg"], fg=self.theme["text"]
-        ).pack(anchor=tk.W, padx=18, pady=(12, 0))
+        tk.Label(dec_card, text="Passphrase", font=(self.font_family, 9, "bold"),
+                 bg=self.theme["surface"], fg=self.theme["text"]).pack(anchor=tk.W, padx=16, pady=(10, 0))
         self.dec_pwd_var = tk.StringVar(value=self.current_values["dec_pwd"])
         tk.Entry(
-            dec_card, textvariable=self.dec_pwd_var, show="*",
+            dec_card, textvariable=self.dec_pwd_var, show="•",
             bg=self.theme["input_bg"], fg=self.theme["input_fg"],
-            font=(self.font_family, 11), bd=0, insertbackground=self.theme["input_fg"]
-        ).pack(fill=tk.X, padx=18, pady=6, ipady=6)
+            font=(self.font_family, 10), bd=0, insertbackground=self.theme["input_fg"]
+        ).pack(fill=tk.X, padx=16, pady=5, ipady=5)
         self.dec_pwd_var.trace_add("write", lambda *args: self.on_dec_pwd_change())
 
-        self.dec_btn = tk.Button(
-            dec_card, text="Decrypt & Save", font=(self.font_family, 12, "bold"),
-            bd=0, padx=20, pady=10, bg=self.theme["success"], fg="white",
-            activebackground=self.theme["success_hover"], cursor="hand2",
-            command=self.decrypt_file, state=tk.DISABLED
-        )
-        self.dec_btn.pack(fill=tk.X, padx=18, pady=12)
+        self.dec_btn = self.make_button(dec_card, "Decrypt & Save", kind="success")
+        self.dec_btn.config(command=self.decrypt_file, state=tk.DISABLED, font=(self.font_family, 11, "bold"))
+        self.dec_btn.pack(fill=tk.X, padx=16, pady=10)
         self.dec_status = tk.Label(
-            dec_card, text="", font=(self.font_family, 10),
-            bg=self.theme["card_bg"], fg=self.theme["text_secondary"]
+            dec_card, text="", font=(self.font_family, 9),
+            bg=self.theme["surface"], fg=self.theme["text_secondary"], wraplength=380, justify=tk.LEFT
         )
-        self.dec_status.pack(anchor=tk.W, padx=18, pady=(0, 10))
+        self.dec_status.pack(anchor=tk.W, padx=16, pady=(0, 12))
 
-        # Shred Card
-        shred_card = self.create_card(self.enc_frame, title="Secure Shred", pady=(0, 15))
+        shred_card = self.create_card(right_col, title="Manual Secure Shred",
+                                       subtitle="Multi-pass overwrite (random + zero) then delete")
+        shred_card.grid(row=1, column=0, sticky="nsew")
 
-        # Info label about shred mechanism
-        tk.Label(
-            shred_card,
-            text=("While shred is the gold standard for secure file deletion on most Unix-like systems, "
-                  "the Python-native fallback provides a multi-pass overwrite using random data and zeros. "
-                  "Always verify that the script reports a successful secure deletion."),
-            font=(self.font_family, 9), bg=self.theme["card_bg"], fg=self.theme["text_secondary"],
-            wraplength=900, justify=tk.LEFT
-        ).pack(anchor=tk.W, padx=18, pady=(0, 10))
-
-        sfp_frame = tk.Frame(shred_card, bg=self.theme["card_bg"])
-        sfp_frame.pack(fill=tk.X, padx=18, pady=5)
+        sfp_frame = tk.Frame(shred_card, bg=self.theme["surface"])
+        sfp_frame.pack(fill=tk.X, padx=16, pady=4)
         self.shred_file_path = tk.StringVar()
         tk.Entry(
             sfp_frame, textvariable=self.shred_file_path, state="readonly",
             bg=self.theme["input_bg"], fg=self.theme["entry_fg"],
             readonlybackground=self.theme["input_bg"], disabledforeground=self.theme["entry_fg"],
-            font=(self.font_family, 11), bd=0, insertbackground=self.theme["input_fg"]
-        ).pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=6)
-        tk.Button(
-            sfp_frame, text="Browse", font=(self.font_family, 10, "bold"), bd=0, padx=15, pady=6,
-            bg=self.theme["button_bg"], fg="white", activebackground=self.theme["input_bg"], cursor="hand2",
-            command=self.browse_shred_file
-        ).pack(side=tk.RIGHT, padx=(10, 0))
+            font=(self.font_family, 10), bd=0, insertbackground=self.theme["input_fg"]
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=5)
+        shred_browse = self.make_button(sfp_frame, "Browse", kind="neutral")
+        shred_browse.config(command=self.browse_shred_file, font=(self.font_family, 9, "bold"), padx=12, pady=5)
+        shred_browse.pack(side=tk.RIGHT, padx=(8, 0))
 
-        self.shred_btn = tk.Button(
-            shred_card, text="Shred File", font=(self.font_family, 12, "bold"),
-            bd=0, padx=20, pady=10, bg=self.theme["danger"], fg="white",
-            activebackground=self.theme["danger_hover"], cursor="hand2",
-            command=self.shred_file_dialog, state=tk.DISABLED
-        )
-        self.shred_btn.pack(fill=tk.X, padx=18, pady=12)
+        self.shred_btn = self.make_button(shred_card, "Shred File", kind="danger")
+        self.shred_btn.config(command=self.shred_file_dialog, state=tk.DISABLED, font=(self.font_family, 11, "bold"))
+        self.shred_btn.pack(fill=tk.X, padx=16, pady=10)
 
-        # Shred status with warning styling
         self.shred_status = tk.Label(
-            shred_card, text="", font=(self.font_family, 10),
-            bg=self.theme["card_bg"], fg=self.theme["text_secondary"]
+            shred_card, text="", font=(self.font_family, 9),
+            bg=self.theme["surface"], fg=self.theme["text_secondary"], wraplength=380, justify=tk.LEFT
         )
-        self.shred_status.pack(anchor=tk.W, padx=18, pady=(0, 10))
+        self.shred_status.pack(anchor=tk.W, padx=16, pady=(0, 6))
 
-        # Info
-        info = tk.Frame(self.enc_frame, bg=self.theme["bg"])
-        info.pack(fill=tk.X, pady=(0, 15))
-        info_text = ("Format: PBKDF2 (600k iter, SHA-256) → AES-256-GCM\n"
-                     "Extension: .enc  |  Cross-platform: Windows, Linux, macOS")
+        info_text = "PBKDF2 (600k iter, SHA-256) \u2192 AES-256-GCM  \u00b7  .enc extension  \u00b7  Windows / Linux / macOS"
         tk.Label(
-            info, text=info_text, font=("Consolas", 10),
-            bg=self.theme["bg"], fg=self.theme["info_text"], justify=tk.LEFT
-        ).pack(anchor=tk.W)
+            shred_card, text=info_text, font=(self.mono_family, 8),
+            bg=self.theme["surface"], fg=self.theme["text_faint"], wraplength=380, justify=tk.LEFT
+        ).pack(anchor=tk.W, padx=16, pady=(0, 12))
 
-    # ---------- Event Handlers ----------
+    # ---------- Event handlers ----------
     def on_len_change(self, *args):
         try:
             v = self.len_var.get()
@@ -855,14 +889,14 @@ class PasswordUtilityApp:
             length = 20
         pool_size = len(pool)
 
-        self.stat_cards["pool"].config(text=f"{pool_size} chars")
+        self.stat_cards["pool"].config(text=f"{pool_size:,}")
         entropy = calculate_entropy(length, pool_size)
         self.stat_cards["entropy"].config(text=f"{entropy:.1f} bits")
-        rating, color = rate_entropy(entropy)
-        self.stat_cards["strength"].config(text=rating, fg=color)
+        rating, color_key = rate_entropy(entropy)
+        self.stat_cards["strength"].config(text=rating, fg=self.theme[color_key])
 
         if pool_size == 0:
-            self.warn_label.pack(anchor=tk.W, padx=18, pady=(0, 5))
+            self.warn_label.pack(anchor=tk.W, padx=16, pady=(0, 6))
             self.gen_btn.config(state=tk.DISABLED)
         else:
             self.warn_label.pack_forget()
@@ -871,14 +905,12 @@ class PasswordUtilityApp:
     def generate_passwords(self):
         if self.gen_running:
             return
-
         pool = self.get_active_pool()
         try:
             length = self.len_var.get()
             count = self.cnt_var.get()
         except Exception:
             return
-
         if not pool or length <= 0 or count <= 0:
             return
 
@@ -887,23 +919,26 @@ class PasswordUtilityApp:
         self.output_text.delete(1.0, tk.END)
 
         if count > 100:
-            self.progress.pack(fill=tk.X, padx=18, pady=(0, 5))
-            self.prog_label.pack(anchor=tk.W, padx=18)
+            self.progress.pack(fill=tk.X, pady=(8, 3))
+            self.prog_label.pack(anchor=tk.W)
             self.root.update()
 
         self.generated_passwords = []
         chunk = max(1, count // 100)
+        lines = []
 
         for i in range(count):
             pwd = generate_password(length, pool)
             self.generated_passwords.append(pwd)
-            self.output_text.insert(tk.END, f"#{i+1}: {pwd}\n")
+            lines.append(f"#{i + 1}: {pwd}")
 
             if count > 100 and ((i + 1) % chunk == 0 or i == count - 1):
                 pct = int((i + 1) / count * 100)
                 self.progress["value"] = pct
-                self.prog_label.config(text=f"Generating... {pct}% ({i+1}/{count})")
+                self.prog_label.config(text=f"Generating\u2026 {pct}% ({i + 1:,}/{count:,})")
                 self.root.update_idletasks()
+
+        self.output_text.insert(tk.END, "\n".join(lines) + "\n")
 
         if count > 100:
             self.progress.pack_forget()
@@ -913,14 +948,13 @@ class PasswordUtilityApp:
         self.copy_btn.config(state=tk.NORMAL)
         self.save_btn.config(state=tk.NORMAL)
         self.gen_running = False
+        self.gen_copy_status.config(text="")
 
     def copy_all_passwords(self):
         if not self.generated_passwords:
             return
         text = "\n".join(self.generated_passwords)
-        self.root.clipboard_clear()
-        self.root.clipboard_append(text)
-        messagebox.showinfo("Copied", f"{len(self.generated_passwords)} passwords copied to clipboard.")
+        self.copy_to_clipboard_secure(text, status_label=self.gen_copy_status)
 
     def save_passwords(self):
         if not self.generated_passwords:
@@ -935,11 +969,85 @@ class PasswordUtilityApp:
                 with open(path, "w", encoding="utf-8") as f:
                     f.write("\n".join(self.generated_passwords))
                 self.last_saved_password_path = path
+                self.encrypt_shred_btn.config(state=tk.NORMAL)
                 messagebox.showinfo("Saved", f"Saved to:\n{path}")
             except Exception as e:
                 messagebox.showerror("Error", str(e))
 
-    # ---------- Encryption ----------
+    # ---------- One-click: encrypt the saved password list, then shred original ----------
+    def encrypt_and_shred_password_file(self):
+        if not CRYPTO_AVAILABLE:
+            messagebox.showerror("Missing Dependency", "Install 'cryptography' to use this feature:\npip install cryptography")
+            return
+
+        path = self.last_saved_password_path
+        if not path or not os.path.exists(path):
+            if self.generated_passwords:
+                self.save_passwords()
+                path = self.last_saved_password_path
+            if not path or not os.path.exists(path):
+                messagebox.showwarning("No file", "Save the password list to a file first.")
+                return
+
+        pwd = simpledialog.askstring(
+            "Encryption Passphrase",
+            "Enter a passphrase (min 8 characters) to protect this password file:",
+            show="•", parent=self.root
+        )
+        if not pwd or len(pwd) < 8:
+            if pwd is not None:
+                messagebox.showwarning("Too short", "Passphrase must be at least 8 characters.")
+            return
+
+        try:
+            with open(path, "rb") as f:
+                original_data = f.read()
+
+            salt = os.urandom(16)
+            iv = os.urandom(12)
+            key = self.derive_key(pwd, salt)
+            aesgcm = AESGCM(key)
+            ct = aesgcm.encrypt(iv, original_data, None)
+            combined = salt + iv + ct
+
+            enc_path = path + ".enc"
+            with open(enc_path, "w", encoding="ascii") as f:
+                f.write(base64.b64encode(combined).decode("ascii"))
+
+            # Verify: the encrypted file must decrypt back to the exact original bytes
+            # before the plaintext is destroyed.
+            with open(enc_path, "r", encoding="ascii") as f:
+                check_b64 = f.read().strip()
+            check_combined = base64.b64decode(check_b64)
+            check_salt, check_iv, check_ct = check_combined[:16], check_combined[16:28], check_combined[28:]
+            check_key = self.derive_key(pwd, check_salt)
+            decrypted_back = AESGCM(check_key).decrypt(check_iv, check_ct, None)
+
+            if decrypted_back == original_data:
+                result = self.shred_file(path)
+                if result == "fallback":
+                    messagebox.showwarning(
+                        "Encrypted, deletion not fully verified",
+                        f"Encrypted to:\n{enc_path}\n\n"
+                        "The original file was removed, but the secure multi-pass overwrite "
+                        "could not be confirmed. If this matters, use a dedicated secure-erase tool."
+                    )
+                else:
+                    messagebox.showinfo(
+                        "Done",
+                        f"Encrypted to:\n{enc_path}\n\nOriginal plaintext securely shredded:\n{path}"
+                    )
+                self.last_saved_password_path = None
+                self.encrypt_shred_btn.config(state=tk.DISABLED)
+            else:
+                messagebox.showerror(
+                    "Verification failed",
+                    "The encrypted file did not verify correctly \u2014 the original was NOT deleted."
+                )
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+    # ---------- Encryption (generic file protector) ----------
     def browse_encrypt_file(self):
         path = filedialog.askopenfilename(title="Select file to encrypt")
         if path:
@@ -966,12 +1074,7 @@ class PasswordUtilityApp:
         self.dec_btn.config(state=tk.NORMAL if ready else tk.DISABLED)
 
     def derive_key(self, password, salt):
-        kdf = PBKDF2HMAC(
-            algorithm=hashes.SHA256(),
-            length=32,
-            salt=salt,
-            iterations=600000,
-        )
+        kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=600_000)
         return kdf.derive(password.encode("utf-8"))
 
     def encrypt_file(self):
@@ -980,7 +1083,7 @@ class PasswordUtilityApp:
         if not path or len(pwd) < 8:
             return
 
-        self.enc_status.config(text="Encrypting...", fg=self.theme["accent"])
+        self.enc_status.config(text="Encrypting\u2026", fg=self.theme["accent"])
         self.root.update()
 
         try:
@@ -992,20 +1095,18 @@ class PasswordUtilityApp:
             key = self.derive_key(pwd, salt)
             aesgcm = AESGCM(key)
             ct = aesgcm.encrypt(iv, data, None)
-
             combined = salt + iv + ct
             b64 = base64.b64encode(combined).decode("ascii")
 
             self.last_encrypted_b64 = b64
             self.last_encrypted_filename = Path(path).name + ".enc"
 
-            # Show in text area
             self.enc_result_text.config(state=tk.NORMAL)
             self.enc_result_text.delete(1.0, tk.END)
             preview = b64[:1200] + "..." if len(b64) > 1200 else b64
             self.enc_result_text.insert(tk.END, preview + "\n")
             if len(b64) > 1200:
-                self.enc_result_text.insert(tk.END, f"\n[Total length: {len(b64)} characters - use Copy or Save for full data]\n")
+                self.enc_result_text.insert(tk.END, f"\n[Total length: {len(b64)} characters \u2014 use Copy or Save for full data]\n")
             self.enc_result_text.config(state=tk.DISABLED)
 
             self.enc_copy_btn.config(state=tk.NORMAL)
@@ -1014,26 +1115,29 @@ class PasswordUtilityApp:
             status_msg = "Encryption complete. Use Copy or Save below."
             status_fg = self.theme["success"]
 
-            # Shred original if requested
             if self.shred_after_enc_var.get():
                 try:
-                    result = self.shred_file(path)
-                    if result == "fallback":
-                        status_msg = "Encrypted. Original file deleted (standard fallback, overwrite failed)."
-                        status_fg = self.theme["warning"]
-                        # Show FATAL SECURITY WARNING
-                        messagebox.showwarning(
-                            "FATAL SECURITY WARNING",
-                            "Secure overwrite failed for the original file.\n\n"
-                            "The file was removed using standard Python deletion only, "
-                            "which may leave recoverable data on disk.\n\n"
-                            "If this file contains sensitive data, manual secure deletion "
-                            "(e.g., using shred, srm, or a secure erase tool) is strongly recommended."
-                        )
+                    # Verify the ciphertext actually decrypts back before touching the original.
+                    verify_key = self.derive_key(pwd, salt)
+                    decrypted_back = AESGCM(verify_key).decrypt(iv, ct, None)
+                    if decrypted_back == data:
+                        result = self.shred_file(path)
+                        if result == "fallback":
+                            status_msg = "Encrypted & verified. Original deleted (overwrite could not be confirmed)."
+                            status_fg = self.theme["warning"]
+                            messagebox.showwarning(
+                                "Deletion not fully verified",
+                                "The original file was removed, but the secure multi-pass overwrite "
+                                "could not be confirmed. Consider a dedicated secure-erase tool for "
+                                "highly sensitive data."
+                            )
+                        else:
+                            status_msg = "Encryption complete. Original securely shredded after verification."
                     else:
-                        status_msg = "Encryption complete. Original file securely deleted."
+                        status_msg = "Encrypted, but verification failed \u2014 original was NOT deleted."
+                        status_fg = self.theme["danger"]
                 except Exception as e:
-                    status_msg = f"Encrypted, but shred failed: {e}"
+                    status_msg = f"Encrypted, but shred step failed: {e}"
                     status_fg = self.theme["warning"]
 
             self.enc_status.config(text=status_msg, fg=status_fg)
@@ -1044,9 +1148,7 @@ class PasswordUtilityApp:
     def copy_encrypted(self):
         if not self.last_encrypted_b64:
             return
-        self.root.clipboard_clear()
-        self.root.clipboard_append(self.last_encrypted_b64)
-        messagebox.showinfo("Copied", "Encrypted base64 copied to clipboard.")
+        self.copy_to_clipboard_secure(self.last_encrypted_b64, status_label=self.enc_status)
 
     def save_encrypted(self):
         if not self.last_encrypted_b64:
@@ -1071,7 +1173,7 @@ class PasswordUtilityApp:
         if not path or not pwd:
             return
 
-        self.dec_status.config(text="Decrypting...", fg=self.theme["accent"])
+        self.dec_status.config(text="Decrypting\u2026", fg=self.theme["accent"])
         self.root.update()
 
         try:
@@ -1082,29 +1184,23 @@ class PasswordUtilityApp:
             if len(combined) < 28:
                 raise ValueError("Invalid file format")
 
-            salt = combined[:16]
-            iv = combined[16:28]
-            ct = combined[28:]
-
+            salt, iv, ct = combined[:16], combined[16:28], combined[28:]
             key = self.derive_key(pwd, salt)
-            aesgcm = AESGCM(key)
-            plain = aesgcm.decrypt(iv, ct, None)
+            plain = AESGCM(key).decrypt(iv, ct, None)
 
             out_path = filedialog.asksaveasfilename(
-                defaultextension="",
-                filetypes=[("All files", "*.*")],
-                initialfile=Path(path).stem
+                defaultextension="", filetypes=[("All files", "*.*")], initialfile=Path(path).stem
             )
             if out_path:
                 with open(out_path, "wb") as f:
                     f.write(plain)
                 self.dec_status.config(text=f"Saved: {out_path}", fg=self.theme["success"])
                 messagebox.showinfo("Success", f"File decrypted and saved.\n\n{out_path}")
-        except Exception as e:
+        except Exception:
             self.dec_status.config(text="Error: wrong password or corrupt file", fg=self.theme["danger"])
             messagebox.showerror("Error", "Decryption failed. Wrong password or corrupt file.")
 
-    # ---------- Shred ----------
+    # ---------- Manual shred ----------
     def browse_shred_file(self):
         path = filedialog.askopenfilename(title="Select file to shred")
         if path:
@@ -1119,27 +1215,21 @@ class PasswordUtilityApp:
         path = self.shred_file_path.get()
         if not path or not os.path.exists(path):
             return
-        if not messagebox.askyesno(
-            "Confirm Shred",
-            f"Permanently shred this file?\n\n{path}\n\nThis action cannot be undone."
-        ):
+        if not messagebox.askyesno("Confirm Shred", f"Permanently shred this file?\n\n{path}\n\nThis cannot be undone."):
             return
-        self.shred_status.config(text="Shredding...", fg=self.theme["accent"])
+        self.shred_status.config(text="Shredding\u2026", fg=self.theme["accent"])
         self.root.update()
         try:
             result = self.shred_file(path)
             if result == "fallback":
                 self.shred_status.config(
-                    text="FATAL SECURITY WARNING: File deleted with standard fallback. Manual secure deletion required.",
+                    text="Deleted, but secure overwrite could not be confirmed.",
                     fg=self.theme["danger"]
                 )
                 messagebox.showwarning(
-                    "FATAL SECURITY WARNING",
-                    "Secure overwrite failed for the selected file.\n\n"
-                    "The file was removed using standard Python deletion only, "
-                    "which may leave recoverable data on disk.\n\n"
-                    "If this file contains sensitive data, manual secure deletion "
-                    "(e.g., using shred, srm, or a secure erase tool) is strongly recommended."
+                    "Deletion not fully verified",
+                    "The file was removed, but the secure multi-pass overwrite could not be "
+                    "confirmed. Consider a dedicated secure-erase tool for highly sensitive data."
                 )
             else:
                 self.shred_status.config(text="File securely shredded.", fg=self.theme["success"])
@@ -1160,7 +1250,6 @@ class PasswordUtilityApp:
         size = os.path.getsize(path)
         overwrite_ok = True
 
-        # Secure overwrite
         if size > 0:
             try:
                 chunk_size = 1024 * 1024
@@ -1177,7 +1266,6 @@ class PasswordUtilityApp:
                             os.fsync(f.fileno())
                         except OSError:
                             pass
-                    # Final zero pass
                     f.seek(0)
                     written = 0
                     while written < size:
@@ -1192,7 +1280,6 @@ class PasswordUtilityApp:
             except Exception:
                 overwrite_ok = False
 
-        # Deletion fallback (always attempt standard Python deletion)
         try:
             if sys.platform == "win32":
                 os.chmod(path, stat.S_IWRITE)
