@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 UNIGEN — Unicode Password Utility (Desktop Edition)
-Modern Tkinter app, sized to fit a single screen without scrolling.
+Modern Tkinter app, sized to fit a single screen.
 Compatible with Windows, Linux, and macOS.
 
 Requirements: cryptography (pip install cryptography)
