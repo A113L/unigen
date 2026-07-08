@@ -1,102 +1,83 @@
-🔑 **Unicode Password Utility**
+🔑 **Unicode Password Utility (UNIGEN)**
 
 [![unigen.jpg](https://i.postimg.cc/kg0KKsq1/unigen.jpg)](https://postimg.cc/87b7VhFM)
 
-The Unicode Password Utility is a Python 3 script designed for generating cryptographically strong, high-entropy passwords using an extensive Unicode character pool and managing them securely through file encryption.
+UNIGEN is a cross-platform Python 3 **desktop app** (Tkinter) for generating cryptographically strong, high-entropy Unicode passwords and protecting sensitive files with authenticated encryption. It's a single script — no install step beyond `pip install cryptography` — and runs the same on Windows, Linux, and macOS.
 
-It leverages the modern cryptography library (Fernet, AES-128 GCM) and prioritizes security by integrating methods for secure file deletion to ensure plain-text passwords are not left on disk.
+Everything happens in two tabs: **Password Generator** and **File Protector**.
 
 ✨ **Key Features**
 
-1. High-Entropy Generation: Generates passwords using a vast pool of over 400 unique Unicode characters (Latin, Cyrillic, CJK, Math Symbols, Dingbats, etc.).
+1. **High-Entropy Generation** — Generate 1 to 10,000 passwords at once, 8–128 characters long, drawn from a pool of 400+ unique Unicode characters across Latin, Latin Extended, Cyrillic, CJK & Kana, Greek, Math & Symbols, and Box Drawing sets — plus a bonus **"Source Code (this file)"** set built live from every unique character in the script itself.
+2. **Live Strength Feedback** — Pool size, Shannon entropy (bits), and a strength rating update in real time as you toggle character sets and adjust length.
+3. **Authenticated File Encryption** — AES-256-GCM (via the `cryptography` library's AEAD primitive) with a key derived by PBKDF2-HMAC-SHA256 at 600,000 iterations, a fresh 16-byte salt and 12-byte nonce per file. Output is a portable Base64-encoded `.enc` file.
+4. **One-Click "Encrypt & Shred"** — From the Generator tab, save your password list, encrypt it with a passphrase, and — only *after* the ciphertext is verified to decrypt back to the exact original bytes — securely shred the plaintext copy.
+5. **General File Protector** — Encrypt or decrypt *any* file, not just password lists, with an optional "verify, then shred the original" checkbox.
+6. **Secure Shredding, No External Tools Required** — A pure Python multi-pass overwrite (3 random-data passes + 1 zero pass, `fsync`'d between each) followed by deletion. Works identically on Windows/Linux/macOS with no dependency on the Unix `shred` binary, and reports whether the overwrite was verified ("secure") or only the delete could be confirmed ("fallback").
+7. **Clipboard-Manager-Safe Copy** — Copying a generated password or encrypted blob doesn't just hit the clipboard, it's tagged so well-behaved clipboard managers skip storing/syncing it:
+   - **Windows** — sets the `ExcludeClipboardContentFromMonitorProcessing`, `CanIncludeInClipboardHistory`, and `CanUploadToCloudClipboard` clipboard formats (the same convention 1Password/Bitwarden/KeePass use), so it won't land in Clipboard History or Cloud Clipboard.
+   - **macOS** — tags the pasteboard entry with the `org.nspasteboard.*` marker types, honored by Paste, Maccy, Copied, Flycut, and other clipboard managers that follow the convention.
+   - **Linux** — offers the `x-kde-passwordManagerHint` MIME type alongside the text via `xclip`, which KDE Klipper (and tools that mirror its convention) checks before saving history.
 
-2. Cryptographic Security: Uses Fernet (built on AES-128 GCM) for strong encryption of saved password files, secured by a user-provided password.
-
-3. Password Strength Rating: Calculates and displays the logarithmic entropy (in bits) of generated passwords.
-
-4. Secure Deletion: Employs the external shred utility (Linux/macOS) or a robust Python-native secure overwrite mechanism as a fallback to destroy temporary and decrypted plain-text files.
-
-5. Integrated Editor: Allows users to specify and launch an external text editor (like nano, vi, or notepad) immediately after decryption for easy modification before re-encryption.
+   This is best-effort — there's no single cross-desktop standard, so e.g. plain GNOME clipboard extensions will still see it — but it degrades gracefully to a normal copy everywhere, and the status line tells you honestly whether exclusion succeeded.
+8. **One-Click Clipboard Wipe** — A "Clear Clipboard" button on both tabs clears the OS clipboard through Tkinter *and* a native fallback (`EmptyClipboard` via ctypes on Windows, `pbcopy` on macOS, `xclip`/`xsel`/`wl-copy` on Linux) so nothing lingers after you're done.
+9. **Dark / Light Theme** — Toggle in the header; the whole UI (including scrollbars and progress bars) re-themes instantly.
 
 🛠 **Prerequisites**
 
-To run this utility, you need:
-
-Python 3.6+
-
-The cryptography library.
+- Python 3.8+
+- Tkinter — bundled with the standard Python installer on Windows and macOS. On Linux it's often a separate package:
+  ```
+  sudo apt install python3-tk      # Debian/Ubuntu
+  sudo dnf install python3-tkinter # Fedora
+  ```
+- The `cryptography` library (only needed for the File Protector tab — the Password Generator tab works without it).
+- *(Optional, Linux only)* `xclip` for full clipboard-manager exclusion when copying passwords; `xsel` or `wl-copy` also work as plain-copy fallbacks but don't support the exclusion hint.
 
 🚀 **Installation**
 
-1. Download Script
-
-```wget https://raw.githubusercontent.com/A113L/Unicode-Password-Generator-Bash-Script/refs/heads/main/unigen.py```
-
-
-2. Install Dependencies
-
-You only need the cryptography library:
-
-```pip install cryptography```
-
-
-3. (Optional) Check for shred
-
-The script automatically prefers the shred utility for the most secure file deletion on Linux and macOS. If you are on Windows or shred is not available, the script will automatically use the built-in Python secure overwrite fallback.
+1. Download the script
+   ```
+   wget https://github.com/A113L/unigen/raw/refs/heads/main/unigen
+   ```
+2. Install dependencies
+   ```
+   pip install cryptography
+   ```
+   *(On Linux, also install `python3-tk` and, optionally, `xclip` — see Prerequisites above.)*
 
 💻 **Usage**
 
-Run the script from your terminal:
+```
+chmod +x unigen
+./unigen
+```
 
-```python3 unigen.py```
+This opens the UNIGEN window, sized to fit your screen without scrolling.
 
+**Password Generator tab**
+1. Set the password **length** (8–128) and **count** (1–10,000) with the sliders or spinboxes.
+2. Toggle whichever **character sets** you want in the pool — the Pool Size, Entropy, and Strength cards update live.
+3. Click **Generate Passwords**.
+4. From here you can:
+   - **Copy All** — copies to the clipboard with clipboard-manager exclusion applied (see Features above).
+   - **Save to File** — writes the list to a plain-text `.txt` file you choose.
+   - **Encrypt & Shred File** — (enabled after saving) prompts for a passphrase, encrypts the saved list to a `.enc` file next to it, verifies the round-trip, then securely shreds the plaintext original.
+   - **Clear Clipboard** — wipes the clipboard immediately.
 
-The script will prompt you to choose between two modes: (G)enerate or (D)ecrypt.
-
-1. **Generate Mode (G)**
-
-This mode creates new passwords and saves them securely.
-
-*Choose (G)enerate.*
-
-Enter the desired password length and count.
-
-*Choose y to save to an ENCRYPTED file.*
-
-The passwords are written to a temporary plain-text file (passwords_temp_*.txt).
-
-You will be prompted to enter a strong encryption password.
-
-The temporary file is encrypted to the final .enc file.
-
-CRITICAL: The temporary plain-text file is then securely deleted.
-
-2. **Decrypt Mode (D)**
-
-This mode allows you to safely view and edit your stored passwords.
-
-*Choose (D)ecrypt.*
-
-Enter the name of your encrypted file (e.g., passwords_encrypted_*.enc).
-
-Enter the decryption password.
-
-The content is decrypted and written to a plain-text file (e.g., original_file_decrypted.txt).
-
-The script will display the content and WARN you that the plain-text file is currently on disk.
-
-You will be prompted to enter an editor command (e.g., nano, notepad, code) to edit the plain-text file.
-
-After exiting the editor, you will be prompted to re-encrypt the file. Choosing y will:
-
-Re-encrypt the edited content back to the original encrypted file.
-
-SECURELY DELETE the plain-text decrypted file.
+**File Protector tab**
+- **Encrypt File** (left) — browse to any file, enter a passphrase (min 8 characters), optionally check "verify, then securely shred the original after encryption", and click **Encrypt**. The result is shown as Base64 and can be copied or saved as a `.enc` file.
+- **Decrypt File** (top right) — browse to a `.enc` file, enter the passphrase, and click **Decrypt & Save** to restore the original bytes to a location you choose.
+- **Manual Secure Shred** (bottom right) — browse to any file and permanently destroy it with the same multi-pass overwrite used elsewhere, independent of encryption.
+- **Clear Clipboard** is also available here.
 
 🔒 **Security Notes**
 
-*Master Password:* The security of your encrypted file relies entirely on the strength of the encryption password you choose. Use a unique and very strong phrase for this.
+- **Passphrase strength is everything.** UNIGEN enforces only a minimum length (8 characters); the real security of an encrypted file rests entirely on how strong and unique your passphrase is.
+- **Encryption**: AES-256-GCM gives you authenticated encryption (confidentiality *and* integrity — tampering with the ciphertext causes decryption to fail rather than silently returning corrupted data). Keys are derived per-file with PBKDF2-HMAC-SHA256 at 600,000 iterations and a random 16-byte salt, so the same passphrase never produces the same key twice.
+- **Shredding**: the multi-pass overwrite makes recovery via standard file-recovery tools impractical on traditional storage, but on SSDs, copy-on-write filesystems (Btrfs, ZFS, APFS), or filesystems with snapshots/journaling, overwritten data can persist elsewhere on the device regardless of what any application does. Treat shredding as a strong best-effort, not an absolute guarantee — for maximum assurance, use full-disk encryption as your baseline.
+- **Clipboard exclusion is best-effort.** It prevents storage by clipboard managers that follow the relevant OS convention; it does not prevent any other running application from reading the clipboard while your password is on it — clear the clipboard promptly after pasting.
 
-*File Deletion:* While shred is the gold standard for secure file deletion on most Unix-like systems, the Python-native fallback provides a multi-pass overwrite using random data and zeros. Always verify that the script reports a successful secure deletion. If a "FATAL SECURITY WARNING" appears, the file may require manual secure deletion.
+📄 **License**
 
-*Encryption Standard:* Fernet ensures authenticated encryption (integrity and confidentiality) using AES-128 GCM.
+See the repository for license details.
