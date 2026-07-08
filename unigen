@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 UNIGEN — Unicode Password Utility (Desktop Edition)
-Modern Tkinter app, sized to fit a single screen.
+Modern Tkinter app, sized to fit a single screen without scrolling.
 Compatible with Windows, Linux, and macOS.
 
 Requirements: cryptography (pip install cryptography)
@@ -1925,6 +1925,12 @@ class PasswordUtilityApp:
 
 def main():
     root = tk.Tk()
+    try:
+        _icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "unigen_icon_128.png")
+        if os.path.exists(_icon_path):
+            root.iconphoto(True, tk.PhotoImage(file=_icon_path))
+    except Exception:
+        pass
     if sys.platform == "win32":
         try:
             from ctypes import windll
