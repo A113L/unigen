@@ -1,498 +1,1938 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-UNICODE Password Utility (Generator & Encrypter/Decrypter)
+UNIGEN — Unicode Password Utility (Desktop Edition)
+Modern Tkinter app, sized to fit a single screen without scrolling.
+Compatible with Windows, Linux, and macOS.
 
-This script generates cryptographically secure passwords using a vast Unicode character pool.
-It uses the Python 'cryptography' library (Fernet, AES-128 GCM) for cross-platform encryption.
-It offers two modes:
-1. Generate: Creates passwords and securely encrypts them to a file using a user-chosen
-   password. The unencrypted temporary file is SECURELY DELETED using shred (Linux/macOS only).
-2. Decrypt: Decrypts an existing password file. After viewing/editing, the plain-text file
-   is re-encrypted and then SECURELY DELETED using shred or a Python-native fallback.
-
-Requires 'cryptography' to be installed. 'shred' (Linux/macOS) is preferred for secure deletion.
+Requirements: cryptography (pip install cryptography)
 """
-import string
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, scrolledtext, simpledialog
 import secrets
 import math
-import sys
-import subprocess
 import os
-import getpass
-from datetime import datetime
-import platform # Added for platform detection
+import sys
+import stat
+import base64
+import subprocess
+import shutil
+import time
+from pathlib import Path
 
-# --- Python Cryptography Imports (Replaces OpenSSL) ---
-from base64 import urlsafe_b64encode
-from cryptography.fernet import Fernet, InvalidToken
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-from cryptography.hazmat.backends import default_backend
+try:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    from cryptography.hazmat.primitives import hashes
+    CRYPTO_AVAILABLE = True
+except ImportError:
+    CRYPTO_AVAILABLE = False
 
-# --- ANSI Color Codes ---
-class Colors:
-    """Class to hold ANSI escape codes for console output coloring."""
-    RESET = '\033[0m'
-    HEADER = '\033[95m'   # Magenta
-    INFO = '\033[94m'     # Blue
-    SUCCESS = '\033[92m'  # Green
-    WARNING = '\033[93m'  # Yellow
-    FAIL = '\033[91m'     # Red
-    BOLD = '\033[1m'
-    
-def colored(text, color_code):
-    """Wraps text in ANSI color codes."""
-    return f"{color_code}{text}{Colors.RESET}"
 
-# --- Configuration ---
+# ---------- Self-source character set ----------
+def load_self_source_chars():
+    """Read this script's own source file and return its unique, printable,
+    non-whitespace characters. Kept dynamic (rather than hard-coded) so the
+    character set always matches whatever this file actually contains."""
+    try:
+        src_path = os.path.abspath(__file__)
+        with open(src_path, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read()
+    except Exception:
+        return ""
+    seen = set()
+    result = []
+    for ch in content:
+        if ch in ("\n", "\r", "\t", " "):
+            continue
+        if not ch.isprintable():
+            continue
+        if ch not in seen:
+            seen.add(ch)
+            result.append(ch)
+    return "".join(sorted(result))
 
-# Character sets consolidated based on user request. All are combined for max entropy.
+
+# ---------- Character Sets ----------
 CHAR_SETS = {
-    'Latin (Standard)': "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~",
-    'Latin (Extended)': "ąćęłńóśźżĄĆĘŁŃÓŚŹŻäöüßÄÖÜèéêëēėęùúûüūîïíīįìôöòóœøãåáàâæçñ",
-    'Cyrillic': "абвгдеёжзийклмнопрстуфхцчшщъыьэюяАВГДЕЁЖЗИЙКЛМНОПРСТФХЦЧШЩЪЫЬЭЮЯ",
-    'Asian (CJK, Hiragana, Katakana)': "漢字日本語中文测试字符あいうえおかきくけこさしすせそたちつてとなにぬねのアイウエオカキクケコサシスセソタチツテトナニヌネノ",
-    'Math/Symbols & Currency': "∞±≠∑∏√∫∂∆πµΩ≈≡≤≥∇¢£¥€₩₪₹₽฿₫₴₦₲",
-    'Dingbats & Misc': "★☆☀☁☂☃☄☠☢☣♠♣♥♦♪♫✔✖✳❄‼",
-    'Greek': "ΑΒΓΔΕΖΗΘΙΚΛΜΝΞΟΠΡΣΤΥΦΧΨΩαβγδελμνξοπρςστυφχψω",
+    "Latin (Standard)": {
+        "chars": r"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!\"#$%&'()*+,-./:;<=>?@[\]^_`{|}~",
+        "enabled": True,
+        "desc": "ASCII letters, digits, symbols"
+    },
+    "Latin (Extended)": {
+        "chars": "ąćęłńóśźżĄĆĘŁŃÓŚŹŻäöüßÄÖÜèéêëēėęùúûüūîïíīįìôöòóœøãåáàâæçñ",
+        "enabled": False,
+        "desc": "European accents"
+    },
+    "Cyrillic": {
+        "chars": "абвгдеёжзийклмнопрстуфхцчшщъыьэюяАБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ",
+        "enabled": False,
+        "desc": "Russian alphabet"
+    },
+    "CJK & Kana": {
+        "chars": "漢字日本語中文测试字符あいうえおかきくけこさしすせそたちつてとなにぬねのアイウエオカキクケコサシスセソタチツテトナニヌネノ",
+        "enabled": False,
+        "desc": "Asian scripts"
+    },
+    "Greek": {
+        "chars": "ΑΒΓΔΕΖΗΘΙΚΛΜΝΞΟΠΡΣΤΥΦΧΨΩαβγδελμνξοπρςστυφχψω",
+        "enabled": False,
+        "desc": "Greek letters"
+    },
+    "Math & Symbols": {
+        "chars": "+-*/=<>~^|&%$@#!?±√∞≠≤≥∑∏∫∂∆πµΩ≈≡∇¢£¥€₹₽°²³¹º¼½¾¿",
+        "enabled": False,
+        "desc": "Math operators & currency"
+    },
+    "Box Drawing": {
+        "chars": "─━│┃┄┅┆┇┈┉┊┋┌┍┎┏┐┑┒┓└┕┖┗┘┙┚┛├┝┞┟┠┡┢┣┤┥┦┧┨┩┪┫┬┭┮┯┰┱┲┳┴┵┶┷┸┹┺┻┼┽┾┿╀╁╂╃╄╅╆╇╈╉╊╋╌╍╎╏═║╒╓╔╕╖╗╘╙╚╛╜╝╞╟╠╡╢╣╤╥╦╧╨╩╪╫╬╭╮╯╰╱╲╳╴╵╶╷╸╹╺╻╼╽╾╿",
+        "enabled": False,
+        "desc": "Geometric & box"
+    },
 }
 
-# Consolidate all characters into one pool string, removing duplicates using set()
-UNICODE_POOL = "".join(set("".join(CHAR_SETS.values())))
-POOL_SIZE = len(UNICODE_POOL)
+# Dynamically add a charset made of every unique character in this file.
+_SELF_CHARS = load_self_source_chars()
+if _SELF_CHARS:
+    CHAR_SETS["Source Code (this file)"] = {
+        "chars": _SELF_CHARS,
+        "enabled": True,
+        "desc": f"{len(_SELF_CHARS):,} unique chars pulled live from this script"
+    }
 
-# --- Crypto Functions ---
 
-def derive_key(password: str, salt: bytes) -> bytes:
-    """Derives a 32-byte key from a password and salt using PBKDF2HMAC for Fernet."""
-    password_bytes = password.encode()
-    kdf = PBKDF2HMAC(
-        algorithm=hashes.SHA256(),
-        length=32,
-        salt=salt,
-        iterations=480000, # Recommended number of iterations for security
-        backend=default_backend()
-    )
-    # Fernet keys must be 32 url-safe base64-encoded bytes
-    return urlsafe_b64encode(kdf.derive(password_bytes))
+# ---------- Themes ----------
+THEMES = {
+    "dark": {
+        "bg": "#0b0d13",
+        "surface": "#12151d",
+        "surface_alt": "#171b26",
+        "border": "#232838",
+        "input_bg": "#1b2130",
+        "input_fg": "#e8ebf2",
+        "entry_fg": "#ffffff",
+        "text": "#e8ebf2",
+        "text_secondary": "#8b93a5",
+        "text_faint": "#5b6478",
+        "accent": "#f5a623",
+        "accent_hover": "#d88f14",
+        "accent_fg": "#ffffff",
+        "success": "#2dd4bf",
+        "success_hover": "#22b8a5",
+        "danger": "#f0576b",
+        "danger_hover": "#d5405b",
+        "warning": "#f5a623",
+        "trough": "#232838",
+        "select": "#f5a623",
+        "button_bg": "#232838",
+        "button_fg": "#ffffff",
+    },
+    "light": {
+        "bg": "#f4f5f7",
+        "surface": "#ffffff",
+        "surface_alt": "#eef0f4",
+        "border": "#dde1e8",
+        "input_bg": "#eef0f4",
+        "input_fg": "#12151d",
+        "entry_fg": "#000000",
+        "text": "#12151d",
+        "text_secondary": "#5b6478",
+        "text_faint": "#8b93a5",
+        "accent": "#b4740e",
+        "accent_hover": "#96600b",
+        "accent_fg": "#ffffff",
+        "success": "#0d9488",
+        "success_hover": "#0b7a70",
+        "danger": "#dc2626",
+        "danger_hover": "#b91c1c",
+        "warning": "#b4740e",
+        "trough": "#dde1e8",
+        "select": "#b4740e",
+        "button_bg": "#dde1e8",
+        "button_fg": "#ffffff",
+    },
+}
 
-def encrypt_file(input_file, output_file, key_password):
-    """
-    Encrypts an input file to an output file using Fernet (AES-128 GCM).
-    The output file contains the salt (16 bytes) prepended to the Fernet token.
-    """
-    print(colored(f"\n--- Starting Fernet Encryption: {input_file} -> {output_file} ---", Colors.HEADER))
-    
-    # 1. Generate unique salt and derive key
-    salt = os.urandom(16)
-    key = derive_key(key_password, salt)
-    f = Fernet(key)
-
-    try:
-        # 2. Read plaintext content (assuming it's UTF-8 text)
-        with open(input_file, 'r', encoding='utf-8') as f_in_text:
-            plaintext_content = f_in_text.read()
-
-        # 3. Encrypt the content (Fernet works on bytes)
-        plaintext_bytes = plaintext_content.encode('utf-8')
-        encrypted_data = f.encrypt(plaintext_bytes)
-        
-        # 4. Write salt + encrypted data (binary mode)
-        with open(output_file, 'wb') as f_out_binary:
-            f_out_binary.write(salt)
-            f_out_binary.write(encrypted_data)
-        
-        print(colored(f"Encryption successful! Content saved to '{output_file}'.", Colors.SUCCESS))
-
-    except Exception as e:
-        print(colored(f"❌ Encryption failed: {e}", Colors.FAIL))
-        raise
-
-# --- Utility Functions ---
 
 def calculate_entropy(length, pool_size):
-    """
-    Calculates Logarithmic Entropy (Shannon H) in bits: H = L * log2(N), 
-    where L is length and N is pool size.
-    """
-    if pool_size <= 1:
-        return 0.00
-    entropy = length * math.log2(pool_size)
-    return round(entropy, 2)
+    if pool_size <= 1 or length <= 0:
+        return 0.0
+    return length * math.log2(pool_size)
 
-def rate_entropy(entropy):
-    """Rates password strength based on entropy bits and returns a colored string."""
-    if entropy < 40:
-        return colored("Very Weak", Colors.FAIL)
-    elif entropy < 60:
-        return colored("Weak", Colors.FAIL)
-    elif entropy < 80:
-        return colored("Moderate", Colors.WARNING)
-    elif entropy < 100:
-        return colored("Strong", Colors.SUCCESS)
+
+def rate_entropy(bits):
+    if bits < 40:
+        return "Very weak", "danger"
+    elif bits < 60:
+        return "Weak", "danger"
+    elif bits < 80:
+        return "Moderate", "warning"
+    elif bits < 110:
+        return "Strong", "success"
     else:
-        return colored("Very Strong", Colors.SUCCESS)
+        return "Very strong", "success"
 
-def generate_password(length):
-    """Generates a secure password using secrets.choice for cryptographic randomness."""
-    if length <= 0:
+
+def generate_password(length, pool):
+    if not pool or length <= 0:
         return ""
-    return ''.join(secrets.choice(UNICODE_POOL) for _ in range(length))
+    return "".join(secrets.choice(pool) for _ in range(length))
 
-def _secure_overwrite_python_native(filepath, passes=3):
-    """
-    Python-native secure file overwrite using os.urandom and os.fsync.
-    This overwrites file content with random data and zeros before deletion.
-    """
-    try:
-        size = os.path.getsize(filepath)
-    except OSError:
-        # File might be gone or inaccessible
-        return True # Treat as deleted if size can't be found/file is gone
 
-    # 1. Overwrite with random data
-    for _ in range(passes):
+class PasswordUtilityApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("UNIGEN — Unicode Password Utility")
+
+        # Size to fit the current screen without needing to scroll.
+        self.root.update_idletasks()
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+        win_w = max(1000, min(1280, screen_w - 80))
+        win_h = max(680, min(820, screen_h - 100))
+        x = (screen_w - win_w) // 2
+        y = max(0, (screen_h - win_h) // 2 - 20)
+        self.root.geometry(f"{win_w}x{win_h}+{x}+{y}")
+        self.root.minsize(1000, 680)
+
+        self.theme_name = "dark"
+        self.theme = THEMES["dark"]
+        self.root.configure(bg=self.theme["bg"])
+
+        self.font_family = "Segoe UI" if sys.platform == "win32" else "Helvetica"
+        self.mono_family = "Consolas" if sys.platform == "win32" else (
+            "Menlo" if sys.platform == "darwin" else "DejaVu Sans Mono"
+        )
         try:
-            # Open for reading and writing, keeping existing size
-            with open(filepath, 'r+b') as f:
-                f.seek(0)
-                f.write(os.urandom(size))
-                f.flush()
-                os.fsync(f.fileno()) # Force write to disk
+            tk.Label(root, text="", font=(self.font_family, 1)).destroy()
         except Exception:
-            continue
+            self.font_family = "Helvetica"
 
-    # 2. Overwrite with zeros (common final pass)
-    try:
-        with open(filepath, 'r+b') as f:
-            f.seek(0)
-            f.write(b'\0' * size)
-            f.flush()
-            os.fsync(f.fileno())
-    except Exception:
-        pass 
+        self.current_values = {
+            "length": 20,
+            "count": 3,
+            "charsets": {name: data["enabled"] for name, data in CHAR_SETS.items()},
+            "enc_file": "",
+            "enc_pwd": "",
+            "dec_file": "",
+            "dec_pwd": "",
+            "shred_after": True,
+            "autoclear_enabled": True,
+            "autoclear_seconds": 20,
+            "linux_try_exclusion": False,
+        }
+        self.active_tab = "gen"
+        self.generated_passwords = []
+        self.gen_running = False
+        self.last_encrypted_b64 = None
+        self.last_encrypted_filename = None
+        self.last_saved_password_path = None
+        self._autoclear_after_id = None
+        self._autoclear_pending_text = None
+        self._syncing_autoclear = False
 
-    # 3. Truncate and remove
-    try:
-        os.remove(filepath)
-        return True
-    except Exception:
-        return False
+        # No scrollable canvas — the layout below is built to fit one screen.
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
+        self.main_frame = tk.Frame(self.root, bg=self.theme["bg"])
+        self.main_frame.grid(row=0, column=0, sticky="nsew")
 
+        self.build_ui()
+        self.update_pool_stats()
 
-def secure_delete(filepath):
-    """
-    Securely deletes a file using the 'shred' utility (preferred) or a Python-native fallback.
-    """
-    if not os.path.exists(filepath):
-        return
+    # ---------- Clipboard ----------
+    def copy_to_clipboard(self, text, status_label=None):
+        """Copy text to the system clipboard, and — on every OS we can
+        detect a mechanism for — tag it so well-behaved clipboard managers
+        skip it entirely instead of storing/syncing it:
 
-    print(f"\nAttempting to securely delete: {filepath}")
-    
-    deleted_successfully = False
-    
-    # --- Attempt 1: Use shred (External Utility) ---
-    try:
-        if platform.system() in ('Linux', 'Darwin'): # Check for Linux or macOS
-            shred_command = ['shred', '-n', '3', '-z', '-u', filepath]
-            subprocess.run(shred_command, check=True, capture_output=True, text=True)
-            print(colored("✅ Secure deletion via 'shred' successful.", Colors.SUCCESS))
-            deleted_successfully = True
-        else:
-            raise FileNotFoundError("Platform does not support shred easily.")
-        
-    except FileNotFoundError:
-        # shred not found or platform unsupported (e.g., Windows)
-        print(colored("⚠️ 'shred' command not found or not supported on this platform.", Colors.WARNING))
-        
-        # --- Attempt 2: Python Native Overwrite ---
-        print("Falling back to Python-native secure overwrite method.")
-        if _secure_overwrite_python_native(filepath):
-            print(colored("✅ Python-native secure overwrite and deletion successful.", Colors.SUCCESS))
-            deleted_successfully = True
-        else:
-            # If native secure deletion failed, we must resort to standard delete
-            print(colored(f"❌ Python-native secure overwrite failed. Falling back to os.remove().", Colors.FAIL))
-            try:
-                os.remove(filepath)
-                print(f"Standard deletion of '{filepath}' complete (UNSECURE).")
-                deleted_successfully = True
-            except Exception as e_inner:
-                print(colored(f"❌ Fatal Error: Could not delete file even with os.remove. Manual deletion required.", Colors.FAIL))
-                print(colored(f"The vulnerable file '{filepath}' remains on disk! Error: {e_inner}", Colors.FAIL))
+          Windows  Registers the "ExcludeClipboardContentFromMonitorProcessing",
+                   "CanIncludeInClipboardHistory" and "CanUploadToCloudClipboard"
+                   clipboard formats. These are the exact formats Windows'
+                   own Clipboard History / Cloud Clipboard check, and the
+                   same convention used by 1Password, Bitwarden and KeePass.
+          macOS    Tags the pasteboard entry with the informal but widely
+                   adopted nspasteboard.org marker types
+                   (org.nspasteboard.ConcealedType / TransientType /
+                   AutoGeneratedType), honoured by Paste, Maccy, Copied,
+                   Flycut and others.
+          Linux    (Opt-in, off by default) Offers the
+                   "x-kde-passwordManagerHint" MIME type alongside the real
+                   text on the X11 CLIPBOARD selection, which KDE Klipper
+                   (and tools that mirror its convention, e.g.
+                   KeePassXC/Bitwarden on Linux) checks before storing
+                   clipboard history. Off by default because this relies on
+                   a forked xclip/xsel helper process staying alive to
+                   answer paste requests — some distros reap that orphan
+                   after a few seconds, silently emptying the clipboard.
+                   The default path instead keeps this app's own process as
+                   the clipboard owner, which doesn't have that failure
+                   mode.
 
-    except subprocess.CalledProcessError as e:
-        # shred failed for other reason (e.g., permissions)
-        print(colored(f"❌ 'shred' failed (Error: {e.stderr.strip()}). Falling back to Python-native overwrite.", Colors.FAIL))
-        
-        # Fallback to Python Native Overwrite
-        if _secure_overwrite_python_native(filepath):
-            print(colored("✅ Python-native secure overwrite and deletion successful.", Colors.SUCCESS))
-            deleted_successfully = True
-        else:
-            # If native secure deletion failed, we must resort to standard delete
-            print(colored(f"❌ Python-native secure overwrite failed. Falling back to os.remove().", Colors.FAIL))
-            try:
-                os.remove(filepath)
-                print(f"Standard deletion of '{filepath}' complete (UNSECURE).")
-                deleted_successfully = True
-            except Exception as e_inner:
-                print(colored(f"❌ Fatal Error: Could not delete file even with os.remove. Manual deletion required.", Colors.FAIL))
-                print(colored(f"The vulnerable file '{filepath}' remains on disk! Error: {e_inner}", Colors.FAIL))
-                
-    if not deleted_successfully:
-        print(colored(f"FATAL SECURITY WARNING: The file '{filepath}' may still exist on disk unsecurely.", Colors.FAIL + Colors.BOLD))
-
-
-# --- Generator/Decryptor Logic ---
-
-def run_generator():
-    """Logic for generating and encrypting passwords."""
-    print(colored("\n--- Unicode Password Generator (Python 3) ---", Colors.HEADER + Colors.BOLD))
-
-    # 1. Get Password Length
-    try:
-        length = int(input("Enter desired password length (e.g., 20): ") or 20)
-        if length < 1:
-            print(colored("Error: Invalid length. Using default length of 20.", Colors.FAIL))
-            length = 20
-    except ValueError:
-        print(colored("Error: Invalid length. Using default length of 20.", Colors.FAIL))
-        length = 20
-
-    # 2. Get Number of Passwords
-    try:
-        count = int(input("Enter number of passwords to generate (e.g., 3): ") or 3)
-        if count < 1:
-            print(colored("Error: Invalid count. Using default count of 3.", Colors.FAIL))
-            count = 3
-    except ValueError:
-        print(colored("Error: Invalid count. Using default count of 3.", Colors.FAIL))
-        count = 3
-
-    # 3. Ask for File Save and Encryption
-    save_choice = input("Do you want to save the passwords to an *ENCRYPTED* file? (y/n): ").strip().lower()
-    save_file = ""
-    temp_file = "" 
-
-    if save_choice == 'y':
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        save_file = f"passwords_encrypted_{timestamp}.enc"
-        temp_file = f"passwords_temp_{timestamp}.txt"
-        
-        print(colored(f"Passwords will be saved to temporary file: {temp_file}", Colors.INFO))
-        print(colored(f"Then encrypted to final file: {save_file}", Colors.INFO))
-        
+        This is best-effort: a clipboard manager that implements none of
+        these conventions (e.g. most GNOME extensions, generic Wayland
+        history tools) will still see the copied text like any other app —
+        there's no universal cross-desktop standard for this. When the
+        OS-level exclusion can't be performed (missing tool, API failure),
+        this transparently falls back to a plain clipboard copy so Copy
+        never silently does nothing.
+        """
+        secured, note = False, ""
         try:
-            with open(temp_file, 'w', encoding='utf-8') as f:
-                f.write("--- Generated Passwords ---\n\n")
-        except IOError:
-            print(colored(f"Error: Could not open or write to temporary file {temp_file}.", Colors.FAIL))
-            save_file = "" 
-            temp_file = ""
-
-    # Calculate Entropy
-    entropy = calculate_entropy(length, POOL_SIZE)
-    strength = rate_entropy(entropy)
-
-    print(colored("\n--- Generation Parameters ---", Colors.BOLD))
-    print(f"Character Pool Size: {POOL_SIZE} unique characters")
-    print(f"Password Length:       {length} characters")
-    print(f"Logarithmic Entropy: {entropy} bits")
-    print(f"Estimated Strength:  {strength}")
-    print(colored("-----------------------------", Colors.BOLD) + "\n")
-
-    generated_passwords = []
-    
-    for i in range(1, count + 1):
-        pwd = generate_password(length)
-        generated_passwords.append(pwd)
-        print(f"#{i}: {colored(pwd, Colors.INFO)}") # Colorize the actual generated password
-        
-    # 4. Save to Temporary File and Encrypt (if requested)
-    if temp_file and save_file:
-        try:
-            # 4a: Write to Temporary File
-            with open(temp_file, 'a', encoding='utf-8') as f:
-                for pwd in generated_passwords:
-                    f.write(f"{pwd}\n")
-                f.write("\n--- End of Passwords ---\n")
-            
-            print(colored(f"\nSuccessfully saved {count} passwords to temporary file '{temp_file}'.", Colors.INFO))
-            
-            # 4b: Get Password from User
-            encryption_key = getpass.getpass("Enter your chosen encryption password (will not be displayed): ").strip()
-            if not encryption_key:
-                print(colored("Error: Encryption password cannot be empty. Cancelling save.", Colors.FAIL))
-                raise ValueError("Empty encryption key.")
-
-            # 4c: Encrypt
-            encrypt_file(temp_file, save_file, encryption_key)
-            
-            # 4d: Clean up the Temporary File
-            secure_delete(temp_file)
-            
-        except (ValueError, IOError) as e:
-            print(colored(f"\nError during save/encryption process: {e}", Colors.FAIL))
-            if os.path.exists(temp_file):
-                print(colored(f"The temporary file '{temp_file}' still exists and must be SECURELY DELETED.", Colors.FAIL + Colors.BOLD))
+            if sys.platform == "win32":
+                secured, note = self._copy_windows_excluded(text)
+            elif sys.platform == "darwin":
+                secured, note = self._copy_macos_excluded(text)
+            elif self.current_values.get("linux_try_exclusion", False):
+                # Linux/X11 has no system-level clipboard service the way
+                # Windows and macOS do — xclip/xsel write by forking a
+                # background helper that must stay alive to answer paste
+                # requests. If a session manager or cgroup cleanup reaps
+                # that orphaned helper (common on newer systemd distros),
+                # the clipboard silently goes empty later even though the
+                # write appeared to succeed. Because of that fragility this
+                # path is opt-in; by default Linux uses the same category
+                # of approach that already works reliably on Windows: our
+                # own long-running process holds the clipboard directly.
+                secured, note = self._copy_linux_excluded(text)
+            else:
+                secured, note = False, ""
         except Exception as e:
-            print(colored(f"\nAn unexpected error occurred: {e}", Colors.FAIL))
-            if os.path.exists(temp_file):
-                print(colored(f"The temporary file '{temp_file}' still exists and must be SECURELY DELETED.", Colors.FAIL + Colors.BOLD))
-            
-    print("\nGenerator finished. Don't forget to secure the generated passwords.")
+            secured, note = False, f"exclusion attempt raised {e}"
 
-# ---------------------------------------------------------------------
+        if secured:
+            # Don't just trust the exit code — some paths (a forked xclip
+            # that gets reaped, an xclip build too old for the multi-target
+            # syntax we pass, a DE that ignores the marker but still eats
+            # the write) can report success while nothing pasteable is
+            # actually left on the clipboard. Read it back and confirm.
+            verified = False
+            for _ in range(3):
+                time.sleep(0.05)
+                readback = self._read_clipboard_text()
+                if readback == text:
+                    verified = True
+                    break
+            if not verified:
+                secured = False
+                note = (note + "; " if note else "") + "could not verify native write, falling back"
 
-def decrypt_file():
-    """Logic for decrypting an encrypted file and offering re-encryption."""
-    print(colored("\n--- Fernet File Decryption ---", Colors.HEADER + Colors.BOLD))
-    
-    encrypted_file = input("Enter the name of the ENCRYPTED file (e.g., passwords_encrypted_YYYYMMDD_HHMMSS.enc): ").strip()
-    
-    if not encrypted_file or not os.path.exists(encrypted_file):
-        print(colored(f"Decryption cancelled. File '{encrypted_file}' not found or name not provided.", Colors.WARNING))
-        return
-
-    if encrypted_file.endswith(".enc"):
-        decrypted_file = encrypted_file[:-4] + "_decrypted.txt"
-    else:
-        decrypted_file = encrypted_file + "_decrypted.txt"
-    
-    print(colored(f"The decrypted content will be saved to: {decrypted_file}", Colors.INFO))
-    
-    decryption_key = getpass.getpass("Enter the decryption password (will not be displayed): ").strip()
-
-    if not decryption_key:
-        print(colored("Error: Decryption password cannot be empty. Cancelling decryption.", Colors.FAIL))
-        return
-
-    try:
-        # 1. Read encrypted content (binary mode)
-        with open(encrypted_file, 'rb') as f_in_binary:
-            file_content = f_in_binary.read()
-        
-        # 2. Extract salt (first 16 bytes) and encrypted token
-        if len(file_content) < 16:
-            print(colored("Error: Encrypted file is too short/corrupted.", Colors.FAIL))
-            return
-
-        salt = file_content[:16]
-        encrypted_token = file_content[16:]
-        
-        # 3. Derive key and initialize Fernet
-        key = derive_key(decryption_key, salt)
-        f = Fernet(key)
-
-        # 4. Decrypt the content
-        try:
-            decrypted_bytes = f.decrypt(encrypted_token)
-        except InvalidToken:
-            print(colored("\n❌ Decryption failed: Invalid password or corrupted data.", Colors.FAIL))
-            return
-
-        # 5. Decode to text (assuming it's UTF-8 text)
-        decrypted_content = decrypted_bytes.decode('utf-8')
-
-        # 6. Write decrypted content to temporary file (text mode)
-        with open(decrypted_file, 'w', encoding='utf-8') as f_out_text:
-            f_out_text.write(decrypted_content)
-
-        print(colored(f"\nDecryption successful! Content saved to '{decrypted_file}'.", Colors.SUCCESS))
-
-        # --- Display Content ---
-        print(colored("\n--- Decrypted Content ---", Colors.BOLD))
-        print(decrypted_content)
-        print(colored("---------------------------", Colors.BOLD) + "\n")
-
-        print(colored("WARNING: The file listed above is currently saved as PLAIN TEXT on disk.", Colors.FAIL))
-        print("You can now open and edit the file if needed.")
-
-        # --- External Editor Launch Option ---
-        default_editor = ""
-        current_os = platform.system()
-        
-        if current_os == 'Linux':
-            default_editor = 'nano'
-        elif current_os == 'Darwin': # macOS
-            default_editor = 'open' # Opens with default app
-        elif current_os == 'Windows':
-            default_editor = 'notepad'
-        
-        editor_prompt = f"To edit the plain-text file, enter an editor command (e.g., '{default_editor}', 'vi', 'code'). Leave blank to skip: "
-        editor_choice = input(editor_prompt).strip()
-
-        if editor_choice:
+        if not secured:
+            # Fallback: plain Tkinter clipboard. Still copies correctly,
+            # just without the manager-exclusion hints.
             try:
-                # Use subprocess to run the editor command on the file
-                print(colored(f"Launching editor: {editor_choice} {decrypted_file}", Colors.INFO))
-                
-                # Check for common non-blocking commands (like 'open' on Mac or 'start' on Windows - though 'start' requires shell=True)
-                # Sticking to simple run for cross-platform compatibility, which will block for CLI editors.
-                subprocess.run([editor_choice, decrypted_file])
-                
-                # We need to re-read the file after the user (hopefully) edited and saved it
-                print(colored(f"Editor closed. Re-reading file '{decrypted_file}' for re-encryption...", Colors.INFO))
-
-            except FileNotFoundError:
-                print(colored(f"❌ Error: Editor command '{editor_choice}' not found.", Colors.FAIL))
+                self.root.clipboard_clear()
+                self.root.clipboard_append(text)
+                self.root.update()
             except Exception as e:
-                print(colored(f"❌ Error launching editor: {e}", Colors.FAIL))
-        
-        # --- Offer Re-encryption ---
-        re_encrypt_choice = input(f"Do you want to re-encrypt '{decrypted_file}' now? (y/n): ").strip().lower()
-        
-        if re_encrypt_choice == 'y':
-            print(f"Re-encrypting the file back to '{encrypted_file}'.")
-            
-            # Re-encrypt using the original password
-            encrypt_file(decrypted_file, encrypted_file, decryption_key)
-            
-            # Clean up the decrypted file SECURELY
-            secure_delete(decrypted_file) 
-            print(colored("\nRe-encryption complete. Plain-text file automatically deleted.", Colors.SUCCESS))
-            
+                if status_label is not None:
+                    status_label.config(text=f"Copy failed: {e}", fg=self.theme["danger"])
+                return
+        # NOTE: when secured is True, the OS-native call above already put
+        # the real text on the system clipboard as its primary format —
+        # we deliberately do NOT also call Tkinter's clipboard_append here,
+        # since that would take ownership again and silently strip the
+        # exclusion formats we just attached.
+
+        if status_label is not None:
+            if secured:
+                msg = "Copied — excluded from clipboard managers."
+            elif note:
+                msg = f"Copied (not excluded: {note})"
+            else:
+                msg = "Copied."
+            if self.current_values.get("autoclear_enabled", True):
+                secs = self.current_values.get("autoclear_seconds", 20)
+                msg += f" Auto-clears in {secs}s."
+            status_label.config(text=msg, fg=self.theme["accent"])
+
+        # Schedule (or cancel) the auto-clear timer for this copy. Passing
+        # status_label through means the "cleared" confirmation shows up
+        # in the same place the "will clear in Ns" notice did, instead of
+        # only in the dedicated Clear Clipboard status label elsewhere on
+        # the tab (which is easy to miss and looks like the paste just
+        # silently failed).
+        self._schedule_autoclear(text, status_label=status_label)
+
+    # --- Auto-clear (self-destructing clipboard) ---
+    def _schedule_autoclear(self, text, status_label=None):
+        """(Re)schedule the auto-clear timer for the text we just copied.
+        Any previously pending timer is cancelled first, so only the most
+        recent copy is ever waiting to be cleared.
+
+        NOTE on limitations: there is no reliable, cross-platform way for a
+        plain desktop app to detect "the user pasted this" — X11/Wayland,
+        macOS and Windows all expose clipboard *change* notifications at
+        best, not paste events tied to a specific target app, and sandboxed
+        or permission-gated APIs make this worse, not better. So instead of
+        pretending to detect paste, this clears the clipboard automatically
+        after a fixed delay. Right before clearing, it re-checks the
+        clipboard contents and only proceeds if they still match what this
+        app put there — so if you've since copied something else, that new
+        content is left alone.
+        """
+        if getattr(self, "_autoclear_after_id", None):
+            try:
+                self.root.after_cancel(self._autoclear_after_id)
+            except Exception:
+                pass
+            self._autoclear_after_id = None
+        self._autoclear_pending_text = None
+
+        if not self.current_values.get("autoclear_enabled", True):
+            return
+
+        try:
+            seconds = int(self.current_values.get("autoclear_seconds", 20))
+        except Exception:
+            seconds = 20
+        seconds = max(5, min(300, seconds))
+
+        self._autoclear_pending_text = text
+        self._autoclear_after_id = self.root.after(
+            seconds * 1000, lambda: self._autoclear_fire(text, status_label)
+        )
+
+    def _autoclear_fire(self, expected_text, status_label=None):
+        """Timer callback: wipe the clipboard, but only if it still holds
+        exactly what we copied — never something the user copied since."""
+        self._autoclear_after_id = None
+        self._autoclear_pending_text = None
+
+        current = self._read_clipboard_text()
+        # current is None when we couldn't determine the clipboard's
+        # contents at all (every read path failed). In that case we still
+        # go ahead and clear, since a stale secret sitting uncleared is the
+        # worse failure mode of the two.
+        if current is not None and current != expected_text:
+            return
+
+        self.clear_clipboard()
+        msg = "Clipboard auto-cleared (timeout)."
+        # Update the label the original copy notified through (e.g. "Copy
+        # All"'s gen_copy_status), so the confirmation appears wherever the
+        # "will auto-clear" notice did — not just in the separate Clear
+        # Clipboard status label, which is easy to miss entirely.
+        if status_label is not None:
+            try:
+                status_label.config(text=msg, fg=self.theme["success"])
+            except Exception:
+                pass
+        if hasattr(self, "gen_clip_status"):
+            self.gen_clip_status.config(text=msg, fg=self.theme["success"])
+        if hasattr(self, "clip_status"):
+            self.clip_status.config(text=msg, fg=self.theme["success"])
+
+    def _read_clipboard_text(self):
+        """Best-effort read-back of the current clipboard text.
+
+        copy_to_clipboard() writes via OS-native calls (WinAPI / osascript /
+        xclip / xsel / wl-copy) on most platforms rather than through
+        Tkinter, specifically so it can attach the clipboard-manager
+        exclusion markers. That means Tkinter's own clipboard_get() often
+        can't see what was actually set (it only sees clipboard content
+        Tkinter itself owns), so we read back using the same native tools
+        first and only fall back to Tkinter's clipboard_get() last.
+
+        Returns the text, "" if the clipboard is empty, or None if we
+        couldn't determine the contents at all.
+        """
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                from ctypes import wintypes
+                CF_UNICODETEXT = 13
+                user32 = ctypes.WinDLL("user32", use_last_error=True)
+                kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+                user32.GetClipboardData.restype = wintypes.HANDLE
+                user32.GetClipboardData.argtypes = [wintypes.UINT]
+                kernel32.GlobalLock.restype = wintypes.LPVOID
+                kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+                kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+                if not user32.OpenClipboard(None):
+                    raise RuntimeError("could not open clipboard")
+                try:
+                    h = user32.GetClipboardData(CF_UNICODETEXT)
+                    if not h:
+                        return ""
+                    ptr = kernel32.GlobalLock(h)
+                    if not ptr:
+                        return ""
+                    try:
+                        return ctypes.wstring_at(ptr)
+                    finally:
+                        kernel32.GlobalUnlock(h)
+                finally:
+                    user32.CloseClipboard()
+            except Exception:
+                return None
+
+        if sys.platform != "darwin":
+            # Linux/X11: try Tkinter's OWN clipboard first. This matters a
+            # lot here, not just as a nicety — when this app itself holds
+            # the clipboard (the default path; see linux_try_exclusion),
+            # shelling out to `xclip -o`/`xsel -o` instead would make that
+            # new process ask OUR window for the data over the X11
+            # selection protocol, while OUR main thread sits blocked inside
+            # subprocess.run() waiting for that same process to return.
+            # Neither side can proceed — a self-deadlock that freezes the
+            # whole app until forcibly killed. Tkinter's own clipboard_get()
+            # is answered in-process with no such round trip, so it's both
+            # faster and safe to call from the main thread.
+            try:
+                return self.root.clipboard_get()
+            except Exception:
+                pass
+            # Only reachable when Tk doesn't currently own the selection —
+            # i.e. the opt-in linux_try_exclusion path, where xclip/xsel
+            # itself is the owner and reading via the matching external
+            # tool is the only way to see the content (and is safe, since
+            # it's a genuinely separate process answering, not us).
+            for cmd in (["xclip", "-selection", "clipboard", "-o"],
+                        ["xsel", "--clipboard", "--output"],
+                        ["wl-paste", "-n"]):
+                if shutil.which(cmd[0]):
+                    try:
+                        out = subprocess.run(cmd, capture_output=True, check=True, timeout=1.0)
+                        return out.stdout.decode("utf-8", errors="ignore")
+                    except Exception:
+                        continue
+            return None
+
+        # macOS: pbpaste talks to the system pasteboard service directly
+        # (not to our own process), so no deadlock risk here — still
+        # timeout-guarded defensively.
+        try:
+            if shutil.which("pbpaste"):
+                out = subprocess.run(["pbpaste"], capture_output=True, check=True, timeout=1.0)
+                return out.stdout.decode("utf-8", errors="ignore")
+        except Exception:
+            pass
+
+        try:
+            return self.root.clipboard_get()
+        except Exception:
+            return None
+
+    def _copy_windows_excluded(self, text):
+        """Write `text` to the Windows clipboard together with the marker
+        formats Windows Clipboard History / Cloud Clipboard (and clipboard
+        manager apps that follow the same convention) check before storing
+        or syncing content. Pure ctypes — no pywin32 dependency required."""
+        try:
+            import ctypes
+            from ctypes import wintypes
+        except Exception as e:
+            return False, f"ctypes unavailable ({e})"
+
+        CF_UNICODETEXT = 13
+        GMEM_MOVEABLE = 0x0002
+        GMEM_ZEROINIT = 0x0040
+
+        try:
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+
+            kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
+            kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+            kernel32.GlobalLock.restype = wintypes.LPVOID
+            kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+            kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+            kernel32.GlobalFree.argtypes = [wintypes.HGLOBAL]
+
+            user32.OpenClipboard.argtypes = [wintypes.HWND]
+            user32.SetClipboardData.restype = wintypes.HANDLE
+            user32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
+            user32.RegisterClipboardFormatW.argtypes = [wintypes.LPCWSTR]
+            user32.RegisterClipboardFormatW.restype = wintypes.UINT
+
+            def _alloc_bytes(data: bytes):
+                size = len(data) if data else 1
+                h = kernel32.GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, size)
+                if not h:
+                    return None
+                ptr = kernel32.GlobalLock(h)
+                if not ptr:
+                    kernel32.GlobalFree(h)
+                    return None
+                if data:
+                    ctypes.memmove(ptr, data, len(data))
+                kernel32.GlobalUnlock(h)
+                return h
+        except Exception as e:
+            return False, f"WinAPI setup failed ({e})"
+
+        if not user32.OpenClipboard(None):
+            return False, "could not open clipboard"
+        try:
+            user32.EmptyClipboard()
+
+            # Real text, so paste keeps working normally everywhere.
+            buf = (text + "\0").encode("utf-16-le")
+            h_text = _alloc_bytes(buf)
+            if h_text:
+                user32.SetClipboardData(CF_UNICODETEXT, h_text)
+            else:
+                return False, "could not allocate clipboard text buffer"
+
+            # Marker formats. Presence alone is what matters; DWORD 0 is
+            # the documented "false" payload for the history/cloud flags.
+            zero_dword = (0).to_bytes(4, "little")
+            markers = {
+                "ExcludeClipboardContentFromMonitorProcessing": b"",
+                "CanIncludeInClipboardHistory": zero_dword,
+                "CanUploadToCloudClipboard": zero_dword,
+            }
+            for name, payload in markers.items():
+                fmt_id = user32.RegisterClipboardFormatW(name)
+                if not fmt_id:
+                    continue
+                h = _alloc_bytes(payload)
+                if h:
+                    user32.SetClipboardData(fmt_id, h)
+        finally:
+            user32.CloseClipboard()
+        return True, ""
+
+    def _copy_macos_excluded(self, text):
+        """Write `text` to the macOS pasteboard tagged with the
+        nspasteboard.org marker types, via a JXA (JavaScript for Automation)
+        one-liner — this uses macOS's built-in ObjC bridge, so it needs no
+        extra Python packages (no pyobjc)."""
+        if not shutil.which("osascript"):
+            return False, "osascript not found"
+        script = (
+            "ObjC.import('AppKit');"
+            "function run(argv){"
+            "var text=argv[0];"
+            "var pb=$.NSPasteboard.generalPasteboard;"
+            "pb.clearContents();"
+            "pb.setStringForType(text,'public.utf8-plain-text');"
+            "pb.setStringForType('','org.nspasteboard.ConcealedType');"
+            "pb.setStringForType('','org.nspasteboard.TransientType');"
+            "pb.setStringForType('','org.nspasteboard.AutoGeneratedType');"
+            "}"
+        )
+        try:
+            subprocess.run(
+                ["osascript", "-l", "JavaScript", "-e", script, text],
+                check=True, capture_output=True, timeout=2.0
+            )
+            return True, ""
+        except Exception as e:
+            return False, f"osascript exclusion failed ({e})"
+
+    def _copy_linux_excluded(self, text):
+        """Write `text` to the X11/Wayland clipboard, offering the
+        'x-kde-passwordManagerHint' MIME type alongside the real text so
+        KDE Klipper (and tools mirroring its convention) skip storing it in
+        clipboard history. There is no equivalent convention honoured by
+        GNOME's built-in clipboard tooling, so on GNOME-only systems this
+        still copies fine — it just can't be hidden from history there."""
+        data = text.encode("utf-8")
+
+        # X11: a single xclip process can be told to answer TARGETS
+        # requests for several MIME types from the same input, so we offer
+        # the real text AND the KDE password-manager hint in one call.
+        if shutil.which("xclip"):
+            try:
+                subprocess.run(
+                    ["xclip", "-selection", "clipboard", "-t",
+                     "UTF8_STRING,x-kde-passwordManagerHint", "-in"],
+                    input=data, check=True, timeout=2.0
+                )
+                return True, ""
+            except Exception:
+                pass
+
+        # xsel has no multi-target flag, so it can only offer plain text —
+        # still copies correctly, just without the exclusion hint.
+        if shutil.which("xsel"):
+            try:
+                subprocess.run(["xsel", "--clipboard", "--input"], input=data, check=True, timeout=2.0)
+                return True, "xsel has no exclusion-hint support — install xclip for that."
+            except Exception:
+                pass
+
+        # Wayland fallback. wl-copy only offers one MIME type per
+        # invocation, so we prioritise correct pasting over exclusion here.
+        if shutil.which("wl-copy"):
+            try:
+                subprocess.run(
+                    ["wl-copy", "--type", "text/plain;charset=utf-8"],
+                    input=data, check=True, timeout=2.0
+                )
+                return True, "wl-copy has no exclusion-hint support — install xclip for that."
+            except Exception:
+                pass
+
+        return False, "no xclip/xsel/wl-copy found"
+
+    # --- Robust clipboard wipe: Tkinter + OS-native fallbacks ---
+    def clear_clipboard(self):
+        """Clear the system clipboard on Windows, Linux and macOS."""
+        # A manual clear (or the auto-clear timer itself) makes any pending
+        # auto-clear timer redundant — cancel it so it doesn't fire again
+        # later against whatever new content the user has copied since.
+        if getattr(self, "_autoclear_after_id", None):
+            try:
+                self.root.after_cancel(self._autoclear_after_id)
+            except Exception:
+                pass
+            self._autoclear_after_id = None
+        self._autoclear_pending_text = None
+
+        errors = []
+
+        # 1. Tkinter CLIPBOARD
+        try:
+            self.root.clipboard_clear()
+            self.root.update()
+        except Exception as e:
+            errors.append(f"Tkinter: {e}")
+
+        # 2. Tkinter PRIMARY (X11 middle-click)
+        try:
+            self.root.selection_clear()
+        except Exception:
+            pass
+
+        # 3. OS-native fallbacks
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                from ctypes import wintypes
+                user32 = ctypes.WinDLL("user32", use_last_error=True)
+                if user32.OpenClipboard(None):
+                    user32.EmptyClipboard()
+                    user32.CloseClipboard()
+            except Exception as e:
+                errors.append(f"WinAPI: {e}")
+        elif sys.platform == "darwin":
+            try:
+                subprocess.run(["pbcopy"], input=b"", check=True, timeout=2.0)
+            except Exception as e:
+                errors.append(f"pbcopy: {e}")
+        else:  # Linux / *BSD
+            # Try xclip first, then xsel
+            cleared = False
+            for cmd in (["xclip", "-selection", "clipboard", "-in"],
+                        ["xsel", "--clipboard", "--input"]):
+                if shutil.which(cmd[0]):
+                    try:
+                        subprocess.run(cmd, input=b"", check=True, timeout=2.0)
+                        cleared = True
+                        break
+                    except Exception as e:
+                        errors.append(f"{cmd[0]}: {e}")
+            if not cleared:
+                # Last resort: try wl-copy (Wayland)
+                if shutil.which("wl-copy"):
+                    try:
+                        subprocess.run(["wl-copy", "--clear"], check=True, timeout=2.0)
+                    except Exception as e:
+                        errors.append(f"wl-copy: {e}")
+
+        # Clear any text selection in our widgets so Ctrl+C cant re-copy old data
+        try:
+            if hasattr(self, "output_text"):
+                self.output_text.tag_remove("sel", "1.0", tk.END)
+                self.output_text.mark_set("insert", "1.0")
+        except Exception:
+            pass
+
+        if hasattr(self, "clip_status"):
+            if errors and not (sys.platform == "linux" and shutil.which("xclip") or shutil.which("xsel") or shutil.which("wl-copy")):
+                self.clip_status.config(
+                    text=f"Cleared (Tkinter). Install xclip/xsel/wl-copy for full system wipe.",
+                    fg=self.theme["warning"]
+                )
+            else:
+                self.clip_status.config(text="Clipboard cleared.", fg=self.theme["success"])
+
+        # Also update generator tab status if visible
+        if hasattr(self, "gen_clip_status"):
+            self.gen_clip_status.config(text="Clipboard cleared.", fg=self.theme["success"])
+
+    # ---------- Auto-clear controls (shown identically on both tabs) ----------
+    def _build_autoclear_controls(self, parent, which):
+        """Build the 'auto-clear clipboard after copy' checkbox + delay
+        spinbox. `which` is 'gen' or 'enc' — used to keep two independent
+        Tkinter variable sets (one per tab) mirrored to the same underlying
+        current_values entries, since both tabs are built at once."""
+        wrap = tk.Frame(parent, bg=self.theme["surface"])
+        wrap.pack(fill=tk.X, padx=16, pady=(0, 10))
+
+        enabled_var = tk.BooleanVar(value=self.current_values.get("autoclear_enabled", True))
+        seconds_var = tk.IntVar(value=self.current_values.get("autoclear_seconds", 20))
+        setattr(self, f"autoclear_enabled_var_{which}", enabled_var)
+        setattr(self, f"autoclear_seconds_var_{which}", seconds_var)
+
+        cb = tk.Checkbutton(
+            wrap, text="Auto-clear clipboard after", variable=enabled_var,
+            bg=self.theme["surface"], fg=self.theme["text"],
+            selectcolor=self.theme["accent"], activebackground=self.theme["surface"],
+            activeforeground=self.theme["text"], font=(self.font_family, 9, "bold"),
+            anchor="w", padx=0,
+            command=lambda: self._on_autoclear_change(which)
+        )
+        cb.pack(side=tk.LEFT)
+
+        spin = tk.Spinbox(
+            wrap, from_=5, to=300, width=4, textvariable=seconds_var,
+            bg=self.theme["input_bg"], fg=self.theme["input_fg"], insertbackground=self.theme["input_fg"],
+            font=(self.mono_family, 9), buttonbackground=self.theme["button_bg"], bd=0, relief=tk.FLAT,
+            command=lambda: self._on_autoclear_change(which)
+        )
+        spin.pack(side=tk.LEFT, padx=(6, 4))
+        seconds_var.trace_add("write", lambda *args: self._on_autoclear_change(which))
+
+        tk.Label(wrap, text="seconds (best-effort \u2014 paste can't be reliably detected)",
+                 font=(self.font_family, 8), bg=self.theme["surface"],
+                 fg=self.theme["text_secondary"]).pack(side=tk.LEFT)
+
+        if sys.platform not in ("win32", "darwin"):
+            self._build_linux_exclusion_control(parent, which)
+
+    def _build_linux_exclusion_control(self, parent, which):
+        """Linux-only: opt-in checkbox for the xclip/xsel 'hide from KDE
+        Klipper' write path. Off by default because that path forks a
+        background helper process that must stay alive to answer paste
+        requests — some distros/session managers reap that orphan after a
+        few seconds, silently emptying the clipboard. The default path
+        (our own long-running process holding the clipboard via Tkinter)
+        doesn't have that failure mode, matching what already works
+        reliably on Windows/macOS."""
+        wrap = tk.Frame(parent, bg=self.theme["surface"])
+        wrap.pack(fill=tk.X, padx=16, pady=(0, 10))
+
+        var = tk.BooleanVar(value=self.current_values.get("linux_try_exclusion", False))
+        setattr(self, f"linux_exclusion_var_{which}", var)
+
+        cb = tk.Checkbutton(
+            wrap, text="Try to hide copies from Linux clipboard managers (KDE Klipper, etc.)",
+            variable=var, bg=self.theme["surface"], fg=self.theme["text"],
+            selectcolor=self.theme["accent"], activebackground=self.theme["surface"],
+            activeforeground=self.theme["text"], font=(self.font_family, 9, "bold"),
+            anchor="w", padx=0,
+            command=lambda: self._on_linux_exclusion_change(which)
+        )
+        cb.pack(anchor=tk.W)
+
+        tk.Label(
+            wrap, text="Experimental \u2014 on some distros this can make the clipboard "
+                       "empty out on its own before you paste. Leave off if paste keeps failing.",
+            font=(self.font_family, 8), bg=self.theme["surface"],
+            fg=self.theme["text_secondary"], wraplength=380, justify=tk.LEFT
+        ).pack(anchor=tk.W)
+
+    def _on_linux_exclusion_change(self, which):
+        """Mirror the Linux exclusion opt-in across both tabs, same pattern
+        as _on_autoclear_change."""
+        if self._syncing_autoclear:
+            return
+        self._syncing_autoclear = True
+        try:
+            var = getattr(self, f"linux_exclusion_var_{which}", None)
+            if var is None:
+                return
+            enabled = var.get()
+            self.current_values["linux_try_exclusion"] = enabled
+            for other in ("gen", "enc"):
+                if other == which:
+                    continue
+                other_var = getattr(self, f"linux_exclusion_var_{other}", None)
+                if other_var is not None:
+                    other_var.set(enabled)
+        finally:
+            self._syncing_autoclear = False
+
+    def _on_autoclear_change(self, which):
+        """Fired when either tab's auto-clear checkbox/spinbox changes.
+        Updates current_values and mirrors the new value onto the other
+        tab's controls (guarded against re-entrant trace callbacks)."""
+        if self._syncing_autoclear:
+            return
+        self._syncing_autoclear = True
+        try:
+            enabled_var = getattr(self, f"autoclear_enabled_var_{which}", None)
+            seconds_var = getattr(self, f"autoclear_seconds_var_{which}", None)
+            if enabled_var is None or seconds_var is None:
+                return
+
+            enabled = enabled_var.get()
+            try:
+                seconds = int(seconds_var.get())
+            except (tk.TclError, ValueError):
+                seconds = self.current_values.get("autoclear_seconds", 20)
+            seconds = max(5, min(300, seconds))
+
+            self.current_values["autoclear_enabled"] = enabled
+            self.current_values["autoclear_seconds"] = seconds
+
+            for other in ("gen", "enc"):
+                if other == which:
+                    continue
+                other_enabled = getattr(self, f"autoclear_enabled_var_{other}", None)
+                other_seconds = getattr(self, f"autoclear_seconds_var_{other}", None)
+                if other_enabled is not None:
+                    other_enabled.set(enabled)
+                if other_seconds is not None:
+                    other_seconds.set(seconds)
+        finally:
+            self._syncing_autoclear = False
+
+    # ---------- Theme switch ----------
+    def switch_theme(self):
+        new_theme = "light" if self.theme_name == "dark" else "dark"
+        self.theme_name = new_theme
+        self.theme = THEMES[new_theme]
+        self.root.configure(bg=self.theme["bg"])
+
+        saved_output = self.output_text.get(1.0, tk.END) if hasattr(self, "output_text") else ""
+        saved_enc_result = self.enc_result_text.get(1.0, tk.END) if hasattr(self, "enc_result_text") else ""
+        saved_enc_status = self.enc_status.cget("text") if hasattr(self, "enc_status") else ""
+        saved_dec_status = self.dec_status.cget("text") if hasattr(self, "dec_status") else ""
+        saved_shred_status = self.shred_status.cget("text") if hasattr(self, "shred_status") else ""
+        saved_clip_status = self.clip_status.cget("text") if hasattr(self, "clip_status") else ""
+        saved_gen_clip_status = self.gen_clip_status.cget("text") if hasattr(self, "gen_clip_status") else ""
+
+        self.main_frame.destroy()
+        self.main_frame = tk.Frame(self.root, bg=self.theme["bg"])
+        self.main_frame.grid(row=0, column=0, sticky="nsew")
+
+        self.build_ui()
+
+        if saved_output.strip() and hasattr(self, "output_text"):
+            self.output_text.config(state=tk.NORMAL)
+            self.output_text.delete(1.0, tk.END)
+            self.output_text.insert(tk.END, saved_output)
+            self.output_text.config(state=tk.DISABLED)
+            if self.generated_passwords:
+                self.copy_btn.config(state=tk.NORMAL)
+                self.save_btn.config(state=tk.NORMAL)
+                self.encrypt_shred_btn.config(state=tk.NORMAL)
+
+        if saved_enc_result.strip() and hasattr(self, "enc_result_text"):
+            self.enc_result_text.config(state=tk.NORMAL)
+            self.enc_result_text.delete(1.0, tk.END)
+            self.enc_result_text.insert(tk.END, saved_enc_result)
+            self.enc_result_text.config(state=tk.DISABLED)
+            if self.last_encrypted_b64:
+                self.enc_copy_btn.config(state=tk.NORMAL)
+                self.enc_save_btn.config(state=tk.NORMAL)
+
+        if hasattr(self, "enc_status"):
+            self.enc_status.config(text=saved_enc_status)
+        if hasattr(self, "dec_status"):
+            self.dec_status.config(text=saved_dec_status)
+        if hasattr(self, "shred_status"):
+            self.shred_status.config(text=saved_shred_status)
+        if hasattr(self, "clip_status"):
+            self.clip_status.config(text=saved_clip_status)
+        if hasattr(self, "gen_clip_status"):
+            self.gen_clip_status.config(text=saved_gen_clip_status)
+
+        self.update_pool_stats()
+        self.show_tab(self.active_tab)
+        self.check_enc_ready()
+        self.check_dec_ready()
+        self.check_shred_ready()
+
+    # ---------- UI helpers ----------
+    def _configure_styles(self):
+        style = ttk.Style()
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+        style.configure(
+            "Accent.Horizontal.TProgressbar",
+            background=self.theme["accent"], troughcolor=self.theme["trough"],
+            borderwidth=0, lightcolor=self.theme["accent"], darkcolor=self.theme["accent"],
+        )
+
+    def _style_scrolledtext(self, widget):
+        for child in widget.winfo_children():
+            if isinstance(child, tk.Scrollbar):
+                child.configure(
+                    bg=self.theme["border"], activebackground=self.theme["input_bg"],
+                    troughcolor=self.theme["trough"],
+                )
+
+    def make_button(self, parent, text, kind="neutral", **pack_kwargs):
+        """kind: accent | success | danger | neutral"""
+        palette = {
+            "accent": (self.theme["accent"], self.theme["accent_hover"], "#ffffff"),
+            "success": (self.theme["success"], self.theme["success_hover"], "#ffffff"),
+            "danger": (self.theme["danger"], self.theme["danger_hover"], "#ffffff"),
+            "neutral": (self.theme["button_bg"], self.theme["input_bg"], "#ffffff"),
+        }[kind]
+        bg, hover, fg = palette
+
+        # Ensure neutral buttons in light mode have enough contrast for white text
+        if kind == "neutral" and self.theme_name == "light":
+            bg, hover = "#4b5563", "#374151"
+
+        btn = tk.Button(
+            parent, text=text, font=(self.font_family, 11, "bold"),
+            bd=0, padx=18, pady=9, bg=bg, fg=fg,
+            activebackground=hover, activeforeground=fg,
+            cursor="hand2", relief=tk.FLAT,
+        )
+
+        def on_enter(_e):
+            if str(btn["state"]) != tk.DISABLED:
+                btn.config(bg=hover)
+
+        def on_leave(_e):
+            if str(btn["state"]) != tk.DISABLED:
+                btn.config(bg=bg)
+
+        btn.bind("<Enter>", on_enter)
+        btn.bind("<Leave>", on_leave)
+        btn._base_bg = bg
+        return btn
+
+    def create_card(self, parent, title=None, subtitle=None):
+        card = tk.Frame(
+            parent, bg=self.theme["surface"], bd=0,
+            highlightthickness=1, highlightbackground=self.theme["border"]
+        )
+        if title:
+            head = tk.Frame(card, bg=self.theme["surface"])
+            head.pack(fill=tk.X, padx=16, pady=(13, 8))
+            tk.Label(head, text=title, font=(self.font_family, 12, "bold"),
+                     bg=self.theme["surface"], fg=self.theme["text"]).pack(anchor=tk.W)
+            if subtitle:
+                tk.Label(head, text=subtitle, font=(self.font_family, 9),
+                         bg=self.theme["surface"], fg=self.theme["text_secondary"]).pack(anchor=tk.W, pady=(2, 0))
+            tk.Frame(card, bg=self.theme["border"], height=1).pack(fill=tk.X, padx=16, pady=(0, 10))
+        return card
+
+    # ---------- Root layout ----------
+    def build_ui(self):
+        self._configure_styles()
+
+        self.main_frame.columnconfigure(0, weight=1)
+        # Row 0 = header, 1 = separator, 2 = tabs, 3 = content
+        self.main_frame.rowconfigure(3, weight=1)
+
+        # Header
+        header = tk.Frame(self.main_frame, bg=self.theme["bg"])
+        header.grid(row=0, column=0, sticky="ew", padx=18, pady=(14, 8))
+        header.columnconfigure(0, weight=1)
+
+        title_frame = tk.Frame(header, bg=self.theme["bg"])
+        title_frame.grid(row=0, column=0, sticky="w")
+        tk.Label(title_frame, text="UNIGEN", font=(self.font_family, 22, "bold"),
+                 bg=self.theme["bg"], fg=self.theme["accent"]).pack(anchor=tk.W)
+        tk.Label(title_frame, text="Unicode password generation & file protection — up to 10,000 at once",
+                 font=(self.font_family, 10), bg=self.theme["bg"], fg=self.theme["text_secondary"]).pack(anchor=tk.W, pady=(1, 0))
+
+        theme_text = "☀  Light" if self.theme_name == "dark" else "☾  Dark"
+        theme_btn = self.make_button(header, theme_text, kind="neutral")
+        theme_btn.config(command=self.switch_theme, font=(self.font_family, 9, "bold"), padx=12, pady=6)
+        theme_btn.grid(row=0, column=1, sticky="e")
+
+        tk.Frame(self.main_frame, bg=self.theme["border"], height=1).grid(row=1, column=0, sticky="ew", padx=18)
+
+        # Tabs
+        tabs_row = tk.Frame(self.main_frame, bg=self.theme["bg"])
+        tabs_row.grid(row=2, column=0, sticky="ew", padx=18, pady=(10, 10))
+        self.tab_buttons = {}
+
+        self.gen_tab_btn = tk.Button(
+            tabs_row, text="Password Generator", font=(self.font_family, 10, "bold"),
+            bd=0, padx=16, pady=7, cursor="hand2", relief=tk.FLAT,
+            command=lambda: self.switch_tab("gen")
+        )
+        self.gen_tab_btn.pack(side=tk.LEFT, padx=(0, 8))
+        self.tab_buttons["gen"] = self.gen_tab_btn
+
+        self.enc_tab_btn = tk.Button(
+            tabs_row, text="File Protector", font=(self.font_family, 10, "bold"),
+            bd=0, padx=16, pady=7, cursor="hand2", relief=tk.FLAT,
+            command=lambda: self.switch_tab("enc")
+        )
+        self.enc_tab_btn.pack(side=tk.LEFT)
+        self.tab_buttons["enc"] = self.enc_tab_btn
+
+        self.content_frame = tk.Frame(self.main_frame, bg=self.theme["bg"])
+        self.content_frame.grid(row=3, column=0, sticky="nsew", padx=18, pady=(0, 14))
+        self.content_frame.columnconfigure(0, weight=1)
+        self.content_frame.rowconfigure(0, weight=1)
+
+        self.build_generator_tab()
+        self.build_file_protector_tab()
+
+        # Grid both frames permanently; use lift/lower to switch so geometry is always valid
+        self.gen_frame.grid(row=0, column=0, sticky="nsew")
+        self.enc_frame.grid(row=0, column=0, sticky="nsew")
+        self.show_tab(self.active_tab)
+        self._paint_tabs()
+
+    def _paint_tabs(self):
+        for name, btn in self.tab_buttons.items():
+            if name == self.active_tab:
+                btn.config(bg=self.theme["accent"], fg=self.theme["accent_fg"],
+                           activebackground=self.theme["accent_hover"], activeforeground=self.theme["accent_fg"])
+            else:
+                btn.config(bg=self.theme["surface"], fg=self.theme["text_secondary"],
+                           activebackground=self.theme["surface_alt"], activeforeground=self.theme["text"])
+
+    def switch_tab(self, tab):
+        self.active_tab = tab
+        self._paint_tabs()
+        self.show_tab(tab)
+
+    def show_tab(self, tab):
+        if tab == "gen":
+            self.gen_frame.lift()
+            self.enc_frame.lower()
         else:
-            print(colored(f"\nWARNING: The file '{decrypted_file}' is currently in PLAIN TEXT.", Colors.FAIL + Colors.BOLD))
-            print("Remember to SECURELY delete or re-encrypt it when finished editing.")
+            self.enc_frame.lift()
+            self.gen_frame.lower()
 
+    # ---------- Generator tab (sidebar + main, grid based, no scroll canvas) ----------
+    def build_generator_tab(self):
+        self.gen_frame = tk.Frame(self.content_frame, bg=self.theme["bg"])
+        self.gen_frame.columnconfigure(1, weight=1)
+        self.gen_frame.rowconfigure(0, weight=1)
 
-    except IOError as e:
-        print(colored(f"\nError: Could not read/write file during decryption: {e}", Colors.FAIL))
-        if os.path.exists(decrypted_file):
-            # Clean up the failed output file 
-            secure_delete(decrypted_file)
-            print(f"Incomplete output file has been deleted.")
-            
-    except Exception as e:
-        print(colored(f"\nAn unexpected error occurred: {e}", Colors.FAIL))
-        if os.path.exists(decrypted_file):
-            # Clean up the failed output file 
-            secure_delete(decrypted_file)
-            print(f"Incomplete output file has been deleted.")
+        # ---- Sidebar (settings) ----
+        sidebar = self.create_card(self.gen_frame, title="Generation Settings")
+        sidebar.grid(row=0, column=0, sticky="nsw", padx=(0, 14))
+        sidebar.configure(width=300)
+        sidebar.grid_propagate(False)
 
-# ---------------------------------------------------------------------
+        # Length
+        tk.Label(sidebar, text="Password Length", font=(self.font_family, 10, "bold"),
+                 bg=self.theme["surface"], fg=self.theme["text"]).pack(anchor=tk.W, padx=16, pady=(0, 4))
+        len_row = tk.Frame(sidebar, bg=self.theme["surface"])
+        len_row.pack(fill=tk.X, padx=16, pady=(0, 12))
+        self.len_var = tk.IntVar(value=self.current_values["length"])
+        self.len_slider = tk.Scale(
+            len_row, from_=8, to=128, orient=tk.HORIZONTAL,
+            variable=self.len_var, bg=self.theme["surface"], fg=self.theme["accent"],
+            highlightthickness=0, troughcolor=self.theme["trough"], bd=0,
+            activebackground=self.theme["accent"], showvalue=0,
+            command=self.on_len_change, sliderrelief=tk.FLAT
+        )
+        self.len_slider.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.len_spin = tk.Spinbox(
+            len_row, from_=8, to=128, width=4, textvariable=self.len_var,
+            bg=self.theme["input_bg"], fg=self.theme["input_fg"], insertbackground=self.theme["input_fg"],
+            font=(self.mono_family, 10), buttonbackground=self.theme["button_bg"], bd=0, relief=tk.FLAT,
+            command=self.on_len_change
+        )
+        self.len_spin.pack(side=tk.RIGHT, padx=(8, 0))
+        self.len_var.trace_add("write", lambda *args: self.on_len_change())
+
+        # Count
+        tk.Label(sidebar, text="Number of Passwords", font=(self.font_family, 10, "bold"),
+                 bg=self.theme["surface"], fg=self.theme["text"]).pack(anchor=tk.W, padx=16, pady=(0, 4))
+        cnt_row = tk.Frame(sidebar, bg=self.theme["surface"])
+        cnt_row.pack(fill=tk.X, padx=16, pady=(0, 14))
+        self.cnt_var = tk.IntVar(value=self.current_values["count"])
+        self.cnt_slider = tk.Scale(
+            cnt_row, from_=1, to=10000, orient=tk.HORIZONTAL,
+            variable=self.cnt_var, bg=self.theme["surface"], fg=self.theme["accent"],
+            highlightthickness=0, troughcolor=self.theme["trough"], bd=0,
+            activebackground=self.theme["accent"], showvalue=0,
+            command=self.on_cnt_change, sliderrelief=tk.FLAT
+        )
+        self.cnt_slider.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.cnt_spin = tk.Spinbox(
+            cnt_row, from_=1, to=10000, width=6, textvariable=self.cnt_var,
+            bg=self.theme["input_bg"], fg=self.theme["input_fg"], insertbackground=self.theme["input_fg"],
+            font=(self.mono_family, 10), buttonbackground=self.theme["button_bg"], bd=0, relief=tk.FLAT,
+            command=self.on_cnt_change
+        )
+        self.cnt_spin.pack(side=tk.RIGHT, padx=(8, 0))
+        self.cnt_var.trace_add("write", lambda *args: self.on_cnt_change())
+
+        tk.Label(sidebar, text="Character Sets", font=(self.font_family, 11, "bold"),
+                 bg=self.theme["surface"], fg=self.theme["text"]).pack(anchor=tk.W, padx=16, pady=(2, 6))
+
+        # Scrollable-if-needed but compact checkbox list (single column, tight rows)
+        charset_list = tk.Frame(sidebar, bg=self.theme["surface"])
+        charset_list.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 6))
+
+        self.charset_vars = {}
+        for name, data in CHAR_SETS.items():
+            var = tk.BooleanVar(value=self.current_values["charsets"].get(name, data["enabled"]))
+            self.charset_vars[name] = var
+            var.trace_add("write", lambda *args, n=name: self.current_values["charsets"].update({n: self.charset_vars[n].get()}))
+
+            row = tk.Frame(charset_list, bg=self.theme["input_bg"])
+            row.pack(fill=tk.X, pady=3)
+            cb = tk.Checkbutton(
+                row, text=name, variable=var, bg=self.theme["input_bg"], fg=self.theme["text"],
+                selectcolor=self.theme["accent"], activebackground=self.theme["input_bg"], activeforeground=self.theme["text"],
+                font=(self.font_family, 9, "bold"), command=self.update_pool_stats,
+                anchor="w", padx=8, pady=4
+            )
+            cb.pack(fill=tk.X)
+            tk.Label(row, text=data["desc"], font=(self.font_family, 8),
+                     bg=self.theme["input_bg"], fg=self.theme["text_secondary"]).pack(anchor=tk.W, padx=8, pady=(0, 5))
+
+        self.warn_label = tk.Label(
+            sidebar, text="Select at least one character set.",
+            font=(self.font_family, 9, "bold"), bg=self.theme["surface"], fg=self.theme["danger"]
+        )
+        self.warn_label.pack(anchor=tk.W, padx=16, pady=(0, 6))
+        self.warn_label.pack_forget()
+
+        # ---- Main column ----
+        main_col = tk.Frame(self.gen_frame, bg=self.theme["bg"])
+        main_col.grid(row=0, column=1, sticky="nsew")
+        main_col.columnconfigure(0, weight=1)
+        main_col.rowconfigure(2, weight=1)
+
+        # Stats row
+        stats_frame = tk.Frame(main_col, bg=self.theme["bg"])
+        stats_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        stats_frame.columnconfigure((0, 1, 2), weight=1)
+
+        self.stat_cards = {}
+        for i, (title, key) in enumerate([("Pool Size", "pool"), ("Entropy", "entropy"), ("Strength", "strength")]):
+            card = tk.Frame(
+                stats_frame, bg=self.theme["surface"], padx=14, pady=10,
+                highlightthickness=1, highlightbackground=self.theme["border"]
+            )
+            card.grid(row=0, column=i, sticky="ew", padx=(0 if i == 0 else 8, 0))
+            tk.Label(card, text=title, font=(self.font_family, 9),
+                     bg=self.theme["surface"], fg=self.theme["text_secondary"]).pack(anchor=tk.W)
+            lbl = tk.Label(card, text="-", font=(self.mono_family, 16, "bold"),
+                           bg=self.theme["surface"], fg=self.theme["text"])
+            lbl.pack(anchor=tk.W, pady=(3, 0))
+            self.stat_cards[key] = lbl
+
+        # Generate button + progress
+        gen_btn_frame = tk.Frame(main_col, bg=self.theme["bg"])
+        gen_btn_frame.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        self.gen_btn = self.make_button(gen_btn_frame, "Generate Passwords", kind="accent")
+        self.gen_btn.config(command=self.generate_passwords, font=(self.font_family, 12, "bold"))
+        self.gen_btn.pack(fill=tk.X, ipady=3)
+
+        self.progress = ttk.Progressbar(gen_btn_frame, mode="determinate", maximum=100,
+                                         style="Accent.Horizontal.TProgressbar")
+        self.prog_label = tk.Label(gen_btn_frame, text="", font=(self.font_family, 9),
+                                    bg=self.theme["bg"], fg=self.theme["text_secondary"])
+
+        # Output card (expands to fill remaining space)
+        out_card = self.create_card(main_col, title="Generated Passwords")
+        out_card.grid(row=2, column=0, sticky="nsew")
+        out_card.columnconfigure(0, weight=1)
+        out_card.rowconfigure(0, weight=1)
+
+        text_wrap = tk.Frame(out_card, bg=self.theme["surface"])
+        text_wrap.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 8))
+
+        self.output_text = scrolledtext.ScrolledText(
+            text_wrap, wrap=tk.NONE, bg=self.theme["bg"], fg=self.theme["text"],
+            insertbackground=self.theme["text"], font=(self.mono_family, 10),
+            bd=0, padx=10, pady=10, relief=tk.FLAT
+        )
+        self.output_text.pack(fill=tk.BOTH, expand=True)
+        self._style_scrolledtext(self.output_text)
+
+        if not self.generated_passwords:
+            self.output_text.insert(tk.END, "Click \u201cGenerate Passwords\u201d to begin.\n")
+        else:
+            for i, pwd in enumerate(self.generated_passwords):
+                self.output_text.insert(tk.END, f"#{i+1}: {pwd}\n")
+        self.output_text.config(state=tk.DISABLED)
+
+        # Copy status
+        self.gen_copy_status = tk.Label(
+            out_card, text="", font=(self.font_family, 8),
+            bg=self.theme["surface"], fg=self.theme["text_secondary"]
+        )
+        self.gen_copy_status.pack(anchor=tk.W, padx=16, pady=(0, 4))
+
+        # Action buttons
+        act_frame = tk.Frame(out_card, bg=self.theme["surface"])
+        act_frame.pack(fill=tk.X, padx=16, pady=(0, 10))
+
+        self.copy_btn = self.make_button(act_frame, "Copy All", kind="neutral")
+        self.copy_btn.config(command=self.copy_all_passwords, state=tk.DISABLED)
+        self.copy_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+
+        self.save_btn = self.make_button(act_frame, "Save to File", kind="success")
+        self.save_btn.config(command=self.save_passwords, state=tk.DISABLED)
+        self.save_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
+
+        self.encrypt_shred_btn = self.make_button(act_frame, "Encrypt & Shred File", kind="danger")
+        self.encrypt_shred_btn.config(command=self.encrypt_and_shred_password_file, state=tk.DISABLED)
+        self.encrypt_shred_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0))
+
+        # --- NEW: Clear Clipboard button in Generator tab ---
+        self.gen_clear_btn = self.make_button(act_frame, "Clear Clipboard", kind="neutral")
+        self.gen_clear_btn.config(command=self.clear_clipboard, font=(self.font_family, 10, "bold"))
+        self.gen_clear_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0))
+
+        self.gen_clip_status = tk.Label(
+            out_card, text="", font=(self.font_family, 8),
+            bg=self.theme["surface"], fg=self.theme["text_secondary"]
+        )
+        self.gen_clip_status.pack(anchor=tk.W, padx=16, pady=(0, 4))
+
+        self._build_autoclear_controls(out_card, which="gen")
+
+        if self.generated_passwords:
+            self.copy_btn.config(state=tk.NORMAL)
+            self.save_btn.config(state=tk.NORMAL)
+        if self.last_saved_password_path:
+            self.encrypt_shred_btn.config(state=tk.NORMAL)
+
+    # ---------- File Protector tab (two columns to avoid vertical overflow) ----------
+    def build_file_protector_tab(self):
+        self.enc_frame = tk.Frame(self.content_frame, bg=self.theme["bg"])
+        self.enc_frame.columnconfigure(0, weight=1)
+        self.enc_frame.columnconfigure(1, weight=1)
+        self.enc_frame.rowconfigure(0, weight=1)
+
+        if not CRYPTO_AVAILABLE:
+            card = self.create_card(self.enc_frame, title="Missing Dependency")
+            card.grid(row=0, column=0, columnspan=2, sticky="nsew")
+            tk.Label(card, text="The 'cryptography' library is required.",
+                     font=(self.font_family, 13), bg=self.theme["surface"], fg=self.theme["danger"]).pack(pady=16, padx=16)
+            tk.Label(card, text="Install:  pip install cryptography",
+                     font=(self.font_family, 11), bg=self.theme["surface"], fg=self.theme["warning"]).pack(padx=16)
+            return
+
+        # ---- Encrypt card (left) ----
+        enc_card = self.create_card(self.enc_frame, title="Encrypt File",
+                                     subtitle="AES-256-GCM + PBKDF2 (600,000 iterations, SHA-256)")
+        enc_card.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+
+        fp_frame = tk.Frame(enc_card, bg=self.theme["surface"])
+        fp_frame.pack(fill=tk.X, padx=16, pady=4)
+        self.enc_file_path = tk.StringVar(value=self.current_values["enc_file"])
+        tk.Entry(
+            fp_frame, textvariable=self.enc_file_path, state="readonly",
+            bg=self.theme["input_bg"], fg=self.theme["entry_fg"],
+            readonlybackground=self.theme["input_bg"], disabledforeground=self.theme["entry_fg"],
+            font=(self.font_family, 10), bd=0, insertbackground=self.theme["input_fg"]
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=5)
+        browse_btn = self.make_button(fp_frame, "Browse", kind="neutral")
+        browse_btn.config(command=self.browse_encrypt_file, font=(self.font_family, 9, "bold"), padx=12, pady=5)
+        browse_btn.pack(side=tk.RIGHT, padx=(8, 0))
+
+        tk.Label(enc_card, text="Passphrase (min 8 characters)", font=(self.font_family, 9, "bold"),
+                 bg=self.theme["surface"], fg=self.theme["text"]).pack(anchor=tk.W, padx=16, pady=(10, 0))
+        self.enc_pwd_var = tk.StringVar(value=self.current_values["enc_pwd"])
+        tk.Entry(
+            enc_card, textvariable=self.enc_pwd_var, show="•",
+            bg=self.theme["input_bg"], fg=self.theme["input_fg"],
+            font=(self.font_family, 10), bd=0, insertbackground=self.theme["input_fg"]
+        ).pack(fill=tk.X, padx=16, pady=5, ipady=5)
+        self.enc_pwd_var.trace_add("write", lambda *args: self.on_enc_pwd_change())
+
+        self.shred_after_enc_var = tk.BooleanVar(value=self.current_values["shred_after"])
+        shred_cb = tk.Checkbutton(
+            enc_card, text="Verify, then securely shred the original after encryption",
+            variable=self.shred_after_enc_var,
+            bg=self.theme["surface"], fg=self.theme["text_secondary"],
+            selectcolor=self.theme["accent"], activebackground=self.theme["surface"],
+            font=(self.font_family, 9),
+            command=lambda: self.current_values.update({"shred_after": self.shred_after_enc_var.get()})
+        )
+        shred_cb.pack(anchor=tk.W, padx=16, pady=(6, 0))
+
+        self.enc_btn = self.make_button(enc_card, "Encrypt", kind="danger")
+        self.enc_btn.config(command=self.encrypt_file, state=tk.DISABLED, font=(self.font_family, 11, "bold"))
+        self.enc_btn.pack(fill=tk.X, padx=16, pady=10)
+
+        self.enc_status = tk.Label(
+            enc_card, text="", font=(self.font_family, 9),
+            bg=self.theme["surface"], fg=self.theme["text_secondary"], wraplength=380, justify=tk.LEFT
+        )
+        self.enc_status.pack(anchor=tk.W, padx=16, pady=(0, 6))
+
+        tk.Label(enc_card, text="Encrypted Output (Base64)", font=(self.font_family, 9, "bold"),
+                 bg=self.theme["surface"], fg=self.theme["text"]).pack(anchor=tk.W, padx=16, pady=(2, 4))
+
+        self.enc_result_text = scrolledtext.ScrolledText(
+            enc_card, wrap=tk.WORD, bg=self.theme["bg"], fg=self.theme["accent"],
+            insertbackground=self.theme["accent"], font=(self.mono_family, 9),
+            bd=0, padx=8, pady=8, relief=tk.FLAT, height=6
+        )
+        self.enc_result_text.pack(fill=tk.X, padx=16, pady=(0, 8))
+        self._style_scrolledtext(self.enc_result_text)
+        self.enc_result_text.insert(tk.END, "Click 'Encrypt' to generate encrypted output.\n")
+        self.enc_result_text.config(state=tk.DISABLED)
+
+        enc_act_frame = tk.Frame(enc_card, bg=self.theme["surface"])
+        enc_act_frame.pack(fill=tk.X, padx=16, pady=(0, 14))
+        self.enc_copy_btn = self.make_button(enc_act_frame, "Copy", kind="neutral")
+        self.enc_copy_btn.config(command=self.copy_encrypted, state=tk.DISABLED, font=(self.font_family, 10, "bold"))
+        self.enc_copy_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        self.enc_save_btn = self.make_button(enc_act_frame, "Save to File", kind="success")
+        self.enc_save_btn.config(command=self.save_encrypted, state=tk.DISABLED, font=(self.font_family, 10, "bold"))
+        self.enc_save_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0))
+
+        if self.last_encrypted_b64:
+            self.enc_copy_btn.config(state=tk.NORMAL)
+            self.enc_save_btn.config(state=tk.NORMAL)
+
+        # ---- Right column: Decrypt (top) + Shred (bottom) ----
+        right_col = tk.Frame(self.enc_frame, bg=self.theme["bg"])
+        right_col.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+        right_col.columnconfigure(0, weight=1)
+        right_col.rowconfigure(0, weight=0)
+        right_col.rowconfigure(1, weight=1)
+
+        dec_card = self.create_card(right_col, title="Decrypt File",
+                                     subtitle="Select an encrypted .enc file to restore")
+        dec_card.grid(row=0, column=0, sticky="new", pady=(0, 10))
+
+        dfp_frame = tk.Frame(dec_card, bg=self.theme["surface"])
+        dfp_frame.pack(fill=tk.X, padx=16, pady=4)
+        self.dec_file_path = tk.StringVar(value=self.current_values["dec_file"])
+        tk.Entry(
+            dfp_frame, textvariable=self.dec_file_path, state="readonly",
+            bg=self.theme["input_bg"], fg=self.theme["entry_fg"],
+            readonlybackground=self.theme["input_bg"], disabledforeground=self.theme["entry_fg"],
+            font=(self.font_family, 10), bd=0, insertbackground=self.theme["input_fg"]
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=5)
+        dec_browse = self.make_button(dfp_frame, "Browse", kind="neutral")
+        dec_browse.config(command=self.browse_decrypt_file, font=(self.font_family, 9, "bold"), padx=12, pady=5)
+        dec_browse.pack(side=tk.RIGHT, padx=(8, 0))
+
+        tk.Label(dec_card, text="Passphrase", font=(self.font_family, 9, "bold"),
+                 bg=self.theme["surface"], fg=self.theme["text"]).pack(anchor=tk.W, padx=16, pady=(10, 0))
+        self.dec_pwd_var = tk.StringVar(value=self.current_values["dec_pwd"])
+        tk.Entry(
+            dec_card, textvariable=self.dec_pwd_var, show="•",
+            bg=self.theme["input_bg"], fg=self.theme["input_fg"],
+            font=(self.font_family, 10), bd=0, insertbackground=self.theme["input_fg"]
+        ).pack(fill=tk.X, padx=16, pady=5, ipady=5)
+        self.dec_pwd_var.trace_add("write", lambda *args: self.on_dec_pwd_change())
+
+        self.dec_btn = self.make_button(dec_card, "Decrypt & Save", kind="success")
+        self.dec_btn.config(command=self.decrypt_file, state=tk.DISABLED, font=(self.font_family, 11, "bold"))
+        self.dec_btn.pack(fill=tk.X, padx=16, pady=10)
+        self.dec_status = tk.Label(
+            dec_card, text="", font=(self.font_family, 9),
+            bg=self.theme["surface"], fg=self.theme["text_secondary"], wraplength=380, justify=tk.LEFT
+        )
+        self.dec_status.pack(anchor=tk.W, padx=16, pady=(0, 12))
+
+        shred_card = self.create_card(right_col, title="Manual Secure Shred",
+                                       subtitle="Multi-pass overwrite (random + zero) then delete")
+        shred_card.grid(row=1, column=0, sticky="nsew")
+
+        sfp_frame = tk.Frame(shred_card, bg=self.theme["surface"])
+        sfp_frame.pack(fill=tk.X, padx=16, pady=4)
+        self.shred_file_path = tk.StringVar()
+        tk.Entry(
+            sfp_frame, textvariable=self.shred_file_path, state="readonly",
+            bg=self.theme["input_bg"], fg=self.theme["entry_fg"],
+            readonlybackground=self.theme["input_bg"], disabledforeground=self.theme["entry_fg"],
+            font=(self.font_family, 10), bd=0, insertbackground=self.theme["input_fg"]
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=5)
+        shred_browse = self.make_button(sfp_frame, "Browse", kind="neutral")
+        shred_browse.config(command=self.browse_shred_file, font=(self.font_family, 9, "bold"), padx=12, pady=5)
+        shred_browse.pack(side=tk.RIGHT, padx=(8, 0))
+
+        self.shred_btn = self.make_button(shred_card, "Shred File", kind="danger")
+        self.shred_btn.config(command=self.shred_file_dialog, state=tk.DISABLED, font=(self.font_family, 11, "bold"))
+        self.shred_btn.pack(fill=tk.X, padx=16, pady=10)
+
+        self.shred_status = tk.Label(
+            shred_card, text="", font=(self.font_family, 9),
+            bg=self.theme["surface"], fg=self.theme["text_secondary"], wraplength=380, justify=tk.LEFT
+        )
+        self.shred_status.pack(anchor=tk.W, padx=16, pady=(0, 6))
+
+        # Clear Clipboard button inside Shred card
+        tk.Frame(shred_card, bg=self.theme["border"], height=1).pack(fill=tk.X, padx=16, pady=(8, 8))
+        self.clip_btn = self.make_button(shred_card, "Clear Clipboard", kind="neutral")
+        self.clip_btn.config(command=self.clear_clipboard, font=(self.font_family, 10, "bold"))
+        self.clip_btn.pack(fill=tk.X, padx=16, pady=(0, 6))
+
+        self.clip_status = tk.Label(
+            shred_card, text="", font=(self.font_family, 9),
+            bg=self.theme["surface"], fg=self.theme["text_secondary"], wraplength=380, justify=tk.LEFT
+        )
+        self.clip_status.pack(anchor=tk.W, padx=16, pady=(0, 6))
+
+        self._build_autoclear_controls(shred_card, which="enc")
+
+        info_text = "PBKDF2 (600k iter, SHA-256) \u2192 AES-256-GCM  \u00b7  .enc extension  \u00b7  Windows / Linux / macOS"
+        tk.Label(
+            shred_card, text=info_text, font=(self.mono_family, 8),
+            bg=self.theme["surface"], fg=self.theme["text_faint"], wraplength=380, justify=tk.LEFT
+        ).pack(anchor=tk.W, padx=16, pady=(0, 12))
+
+    # ---------- Event handlers ----------
+    def on_len_change(self, *args):
+        try:
+            v = self.len_var.get()
+            if v < 8:
+                self.len_var.set(8)
+            elif v > 128:
+                self.len_var.set(128)
+            self.current_values["length"] = self.len_var.get()
+        except Exception:
+            pass
+
+    def on_cnt_change(self, *args):
+        try:
+            v = self.cnt_var.get()
+            if v < 1:
+                self.cnt_var.set(1)
+            elif v > 10000:
+                self.cnt_var.set(10000)
+            self.current_values["count"] = self.cnt_var.get()
+        except Exception:
+            pass
+
+    def on_enc_pwd_change(self):
+        self.current_values["enc_pwd"] = self.enc_pwd_var.get()
+        self.check_enc_ready()
+
+    def on_dec_pwd_change(self):
+        self.current_values["dec_pwd"] = self.dec_pwd_var.get()
+        self.check_dec_ready()
+
+    def get_active_pool(self):
+        pool = ""
+        for name, data in CHAR_SETS.items():
+            if self.charset_vars[name].get():
+                pool += data["chars"]
+        seen = set()
+        result = []
+        for c in pool:
+            if c not in seen:
+                seen.add(c)
+                result.append(c)
+        return "".join(result)
+
+    def update_pool_stats(self):
+        pool = self.get_active_pool()
+        try:
+            length = self.len_var.get()
+        except Exception:
+            length = 20
+        pool_size = len(pool)
+
+        self.stat_cards["pool"].config(text=f"{pool_size:,}")
+        entropy = calculate_entropy(length, pool_size)
+        self.stat_cards["entropy"].config(text=f"{entropy:.1f} bits")
+        rating, color_key = rate_entropy(entropy)
+        self.stat_cards["strength"].config(text=rating, fg=self.theme[color_key])
+
+        if pool_size == 0:
+            self.warn_label.pack(anchor=tk.W, padx=16, pady=(0, 6))
+            self.gen_btn.config(state=tk.DISABLED)
+        else:
+            self.warn_label.pack_forget()
+            self.gen_btn.config(state=tk.NORMAL)
+
+    def generate_passwords(self):
+        if self.gen_running:
+            return
+        pool = self.get_active_pool()
+        try:
+            length = self.len_var.get()
+            count = self.cnt_var.get()
+        except Exception:
+            return
+        if not pool or length <= 0 or count <= 0:
+            return
+
+        self.gen_running = True
+        self.output_text.config(state=tk.NORMAL)
+        self.output_text.delete(1.0, tk.END)
+
+        if count > 100:
+            self.progress.pack(fill=tk.X, pady=(8, 3))
+            self.prog_label.pack(anchor=tk.W)
+            self.root.update()
+
+        self.generated_passwords = []
+        chunk = max(1, count // 100)
+        lines = []
+
+        for i in range(count):
+            pwd = generate_password(length, pool)
+            self.generated_passwords.append(pwd)
+            lines.append(f"#{i + 1}: {pwd}")
+
+            if count > 100 and ((i + 1) % chunk == 0 or i == count - 1):
+                pct = int((i + 1) / count * 100)
+                self.progress["value"] = pct
+                self.prog_label.config(text=f"Generating\u2026 {pct}% ({i + 1:,}/{count:,})")
+                self.root.update_idletasks()
+
+        self.output_text.insert(tk.END, "\n".join(lines) + "\n")
+
+        if count > 100:
+            self.progress.pack_forget()
+            self.prog_label.pack_forget()
+
+        self.output_text.config(state=tk.DISABLED)
+        self.copy_btn.config(state=tk.NORMAL)
+        self.save_btn.config(state=tk.NORMAL)
+        self.gen_running = False
+
+    def copy_all_passwords(self):
+        if not self.generated_passwords:
+            return
+        text = "\n".join(self.generated_passwords)
+        self.copy_to_clipboard(text, status_label=self.gen_copy_status)
+
+    def save_passwords(self):
+        if not self.generated_passwords:
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+            initialfile=f"passwords_{len(self.generated_passwords)}.txt"
+        )
+        if path:
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("\n".join(self.generated_passwords))
+                self.last_saved_password_path = path
+                self.encrypt_shred_btn.config(state=tk.NORMAL)
+                messagebox.showinfo("Saved", f"Saved to:\n{path}")
+            except Exception as e:
+                messagebox.showerror("Error", str(e))
+
+    # ---------- One-click: encrypt the saved password list, then shred original ----------
+    def encrypt_and_shred_password_file(self):
+        if not CRYPTO_AVAILABLE:
+            messagebox.showerror("Missing Dependency", "Install 'cryptography' to use this feature:\npip install cryptography")
+            return
+
+        path = self.last_saved_password_path
+        if not path or not os.path.exists(path):
+            if self.generated_passwords:
+                self.save_passwords()
+                path = self.last_saved_password_path
+            if not path or not os.path.exists(path):
+                messagebox.showwarning("No file", "Save the password list to a file first.")
+                return
+
+        pwd = simpledialog.askstring(
+            "Encryption Passphrase",
+            "Enter a passphrase (min 8 characters) to protect this password file:",
+            show="•", parent=self.root
+        )
+        if not pwd or len(pwd) < 8:
+            if pwd is not None:
+                messagebox.showwarning("Too short", "Passphrase must be at least 8 characters.")
+            return
+
+        try:
+            with open(path, "rb") as f:
+                original_data = f.read()
+
+            salt = os.urandom(16)
+            iv = os.urandom(12)
+            key = self.derive_key(pwd, salt)
+            aesgcm = AESGCM(key)
+            ct = aesgcm.encrypt(iv, original_data, None)
+            combined = salt + iv + ct
+
+            enc_path = path + ".enc"
+            with open(enc_path, "w", encoding="ascii") as f:
+                f.write(base64.b64encode(combined).decode("ascii"))
+
+            # Verify: the encrypted file must decrypt back to the exact original bytes
+            # before the plaintext is destroyed.
+            with open(enc_path, "r", encoding="ascii") as f:
+                check_b64 = f.read().strip()
+            check_combined = base64.b64decode(check_b64)
+            check_salt, check_iv, check_ct = check_combined[:16], check_combined[16:28], check_combined[28:]
+            check_key = self.derive_key(pwd, check_salt)
+            decrypted_back = AESGCM(check_key).decrypt(check_iv, check_ct, None)
+
+            if decrypted_back == original_data:
+                result = self.shred_file(path)
+                if result == "fallback":
+                    messagebox.showwarning(
+                        "Encrypted, deletion not fully verified",
+                        f"Encrypted to:\n{enc_path}\n\n"
+                        "The original file was removed, but the secure multi-pass overwrite "
+                        "could not be confirmed. If this matters, use a dedicated secure-erase tool."
+                    )
+                else:
+                    messagebox.showinfo(
+                        "Done",
+                        f"Encrypted to:\n{enc_path}\n\nOriginal plaintext securely shredded:\n{path}"
+                    )
+                self.last_saved_password_path = None
+                self.encrypt_shred_btn.config(state=tk.DISABLED)
+            else:
+                messagebox.showerror(
+                    "Verification failed",
+                    "The encrypted file did not verify correctly \u2014 the original was NOT deleted."
+                )
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+    # ---------- Encryption (generic file protector) ----------
+    def browse_encrypt_file(self):
+        path = filedialog.askopenfilename(title="Select file to encrypt")
+        if path:
+            self.enc_file_path.set(path)
+            self.current_values["enc_file"] = path
+            self.check_enc_ready()
+
+    def browse_decrypt_file(self):
+        path = filedialog.askopenfilename(
+            title="Select encrypted file",
+            filetypes=[("Encrypted files", "*.enc"), ("All files", "*.*")]
+        )
+        if path:
+            self.dec_file_path.set(path)
+            self.current_values["dec_file"] = path
+            self.check_dec_ready()
+
+    def check_enc_ready(self):
+        ready = bool(self.enc_file_path.get() and len(self.enc_pwd_var.get()) >= 8)
+        self.enc_btn.config(state=tk.NORMAL if ready else tk.DISABLED)
+
+    def check_dec_ready(self):
+        ready = bool(self.dec_file_path.get() and self.dec_pwd_var.get())
+        self.dec_btn.config(state=tk.NORMAL if ready else tk.DISABLED)
+
+    def derive_key(self, password, salt):
+        kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=600_000)
+        return kdf.derive(password.encode("utf-8"))
+
+    def encrypt_file(self):
+        path = self.enc_file_path.get()
+        pwd = self.enc_pwd_var.get()
+        if not path or len(pwd) < 8:
+            return
+
+        self.enc_status.config(text="Encrypting\u2026", fg=self.theme["accent"])
+        self.root.update()
+
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+
+            salt = os.urandom(16)
+            iv = os.urandom(12)
+            key = self.derive_key(pwd, salt)
+            aesgcm = AESGCM(key)
+            ct = aesgcm.encrypt(iv, data, None)
+            combined = salt + iv + ct
+            b64 = base64.b64encode(combined).decode("ascii")
+
+            self.last_encrypted_b64 = b64
+            self.last_encrypted_filename = Path(path).name + ".enc"
+
+            self.enc_result_text.config(state=tk.NORMAL)
+            self.enc_result_text.delete(1.0, tk.END)
+            preview = b64[:1200] + "..." if len(b64) > 1200 else b64
+            self.enc_result_text.insert(tk.END, preview + "\n")
+            if len(b64) > 1200:
+                self.enc_result_text.insert(tk.END, f"\n[Total length: {len(b64)} characters \u2014 use Copy or Save for full data]\n")
+            self.enc_result_text.config(state=tk.DISABLED)
+
+            self.enc_copy_btn.config(state=tk.NORMAL)
+            self.enc_save_btn.config(state=tk.NORMAL)
+
+            status_msg = "Encryption complete. Use Copy or Save below."
+            status_fg = self.theme["success"]
+
+            if self.shred_after_enc_var.get():
+                try:
+                    # Verify the ciphertext actually decrypts back before touching the original.
+                    verify_key = self.derive_key(pwd, salt)
+                    decrypted_back = AESGCM(verify_key).decrypt(iv, ct, None)
+                    if decrypted_back == data:
+                        result = self.shred_file(path)
+                        if result == "fallback":
+                            status_msg = "Encrypted & verified. Original deleted (overwrite could not be confirmed)."
+                            status_fg = self.theme["warning"]
+                            messagebox.showwarning(
+                                "Deletion not fully verified",
+                                "The original file was removed, but the secure multi-pass overwrite "
+                                "could not be confirmed. Consider a dedicated secure-erase tool for "
+                                "highly sensitive data."
+                            )
+                        else:
+                            status_msg = "Encryption complete. Original securely shredded after verification."
+                    else:
+                        status_msg = "Encrypted, but verification failed \u2014 original was NOT deleted."
+                        status_fg = self.theme["danger"]
+                except Exception as e:
+                    status_msg = f"Encrypted, but shred step failed: {e}"
+                    status_fg = self.theme["warning"]
+
+            self.enc_status.config(text=status_msg, fg=status_fg)
+        except Exception as e:
+            self.enc_status.config(text=f"Error: {str(e)}", fg=self.theme["danger"])
+            messagebox.showerror("Error", str(e))
+
+    def copy_encrypted(self):
+        if not self.last_encrypted_b64:
+            return
+        self.copy_to_clipboard(self.last_encrypted_b64, status_label=self.enc_status)
+
+    def save_encrypted(self):
+        if not self.last_encrypted_b64:
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".enc",
+            filetypes=[("Encrypted files", "*.enc"), ("All files", "*.*")],
+            initialfile=self.last_encrypted_filename or "encrypted.enc"
+        )
+        if path:
+            try:
+                with open(path, "w", encoding="ascii") as f:
+                    f.write(self.last_encrypted_b64)
+                self.enc_status.config(text=f"Saved: {path}", fg=self.theme["success"])
+                messagebox.showinfo("Saved", f"Encrypted file saved.\n\n{path}")
+            except Exception as e:
+                messagebox.showerror("Error", str(e))
+
+    def decrypt_file(self):
+        path = self.dec_file_path.get()
+        pwd = self.dec_pwd_var.get()
+        if not path or not pwd:
+            return
+
+        self.dec_status.config(text="Decrypting\u2026", fg=self.theme["accent"])
+        self.root.update()
+
+        try:
+            with open(path, "r", encoding="ascii") as f:
+                b64 = f.read().strip()
+
+            combined = base64.b64decode(b64)
+            if len(combined) < 28:
+                raise ValueError("Invalid file format")
+
+            salt, iv, ct = combined[:16], combined[16:28], combined[28:]
+            key = self.derive_key(pwd, salt)
+            plain = AESGCM(key).decrypt(iv, ct, None)
+
+            out_path = filedialog.asksaveasfilename(
+                defaultextension="", filetypes=[("All files", "*.*")], initialfile=Path(path).stem
+            )
+            if out_path:
+                with open(out_path, "wb") as f:
+                    f.write(plain)
+                self.dec_status.config(text=f"Saved: {out_path}", fg=self.theme["success"])
+                messagebox.showinfo("Success", f"File decrypted and saved.\n\n{out_path}")
+        except Exception:
+            self.dec_status.config(text="Error: wrong password or corrupt file", fg=self.theme["danger"])
+            messagebox.showerror("Error", "Decryption failed. Wrong password or corrupt file.")
+
+    # ---------- Manual shred ----------
+    def browse_shred_file(self):
+        path = filedialog.askopenfilename(title="Select file to shred")
+        if path:
+            self.shred_file_path.set(path)
+            self.check_shred_ready()
+
+    def check_shred_ready(self):
+        ready = bool(self.shred_file_path.get())
+        self.shred_btn.config(state=tk.NORMAL if ready else tk.DISABLED)
+
+    def shred_file_dialog(self):
+        path = self.shred_file_path.get()
+        if not path or not os.path.exists(path):
+            return
+        if not messagebox.askyesno("Confirm Shred", f"Permanently shred this file?\n\n{path}\n\nThis cannot be undone."):
+            return
+        self.shred_status.config(text="Shredding\u2026", fg=self.theme["accent"])
+        self.root.update()
+        try:
+            result = self.shred_file(path)
+            if result == "fallback":
+                self.shred_status.config(
+                    text="Deleted, but secure overwrite could not be confirmed.",
+                    fg=self.theme["danger"]
+                )
+                messagebox.showwarning(
+                    "Deletion not fully verified",
+                    "The file was removed, but the secure multi-pass overwrite could not be "
+                    "confirmed. Consider a dedicated secure-erase tool for highly sensitive data."
+                )
+            else:
+                self.shred_status.config(text="File securely shredded.", fg=self.theme["success"])
+                self.shred_file_path.set("")
+                self.check_shred_ready()
+                messagebox.showinfo("Shred Complete", "File has been securely deleted.")
+        except Exception as e:
+            self.shred_status.config(text=f"Error: {str(e)}", fg=self.theme["danger"])
+            messagebox.showerror("Error", str(e))
+
+    def shred_file(self, path, passes=3):
+        """Securely shred a file. Returns 'secure' or 'fallback'."""
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"File not found: {path}")
+        if os.path.isdir(path):
+            raise IsADirectoryError(f"Cannot shred a directory: {path}")
+
+        size = os.path.getsize(path)
+        overwrite_ok = True
+
+        if size > 0:
+            try:
+                chunk_size = 1024 * 1024
+                with open(path, "r+b") as f:
+                    for _ in range(passes):
+                        f.seek(0)
+                        written = 0
+                        while written < size:
+                            to_write = min(chunk_size, size - written)
+                            f.write(os.urandom(to_write))
+                            written += to_write
+                        f.flush()
+                        try:
+                            os.fsync(f.fileno())
+                        except OSError:
+                            pass
+                    f.seek(0)
+                    written = 0
+                    while written < size:
+                        to_write = min(chunk_size, size - written)
+                        f.write(b'\x00' * to_write)
+                        written += to_write
+                    f.flush()
+                    try:
+                        os.fsync(f.fileno())
+                    except OSError:
+                        pass
+            except Exception:
+                overwrite_ok = False
+
+        try:
+            if sys.platform == "win32":
+                os.chmod(path, stat.S_IWRITE)
+            os.remove(path)
+        except Exception as e:
+            action = "overwritten" if overwrite_ok else "overwrite failed"
+            raise RuntimeError(f"File {action} but could not be removed: {e}")
+
+        return "secure" if overwrite_ok else "fallback"
+
 
 def main():
-    """Main execution function with choice of Generate or Decrypt."""
-    
-    print(colored("--- Unicode Password Utility (Generate/Decrypt) ---", Colors.HEADER + Colors.BOLD))
-    
-    choice = input("Do you want to (G)enerate passwords or (D)ecrypt a file? (g/d): ").strip().lower()
-    
-    if choice == 'g':
-        run_generator()
-    elif choice == 'd':
-        decrypt_file()
-    else:
-        print(colored("Invalid choice. Exiting.", Colors.WARNING))
-        
-    print("\nHave a great day!")
-
-
-if __name__ == "__main__":
-    main()
-
+    root = tk.Tk()
+    if sys.platform == "win32":
+        try:
+            from ctypes import windll
+            windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            pass
+    app = PasswordUtilityApp(root)
+    root.mainloop()
 
 
 if __name__ == "__main__":
