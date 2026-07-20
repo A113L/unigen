@@ -175,10 +175,45 @@ def rate_entropy(bits):
         return "Very strong", "success"
 
 
+def estimate_passphrase_entropy(passphrase):
+    """Rough entropy estimate for a user-typed passphrase: infer the likely
+    character pool from which classes are present (lower/upper/digit/symbol/
+    other-unicode), then treat it as length * log2(pool) — the same
+    conservative model used elsewhere in this app for generated passwords.
+    This intentionally does NOT try to detect dictionary words or patterns;
+    it is a floor estimate, not a substitute for a real strength library."""
+    if not passphrase:
+        return 0.0
+    pool = 0
+    if any(c.islower() for c in passphrase):
+        pool += 26
+    if any(c.isupper() for c in passphrase):
+        pool += 26
+    if any(c.isdigit() for c in passphrase):
+        pool += 10
+    if any((not c.isalnum()) and c.isascii() and c.isprintable() for c in passphrase):
+        pool += 33
+    if any(not c.isascii() for c in passphrase):
+        pool += 300  # broad allowance for any non-ASCII/Unicode character used
+    if pool == 0:
+        pool = 1
+    return calculate_entropy(len(passphrase), pool)
+
+
 def generate_password(length, pool):
     if not pool or length <= 0:
         return ""
     return "".join(secrets.choice(pool) for _ in range(length))
+
+
+SSD_SHRED_CAVEAT = (
+    "Note: multi-pass overwrite reliably destroys data on traditional "
+    "spinning disks. On SSDs, and on copy-on-write or journaling filesystems "
+    "(e.g. btrfs, ZFS, APFS), wear leveling and snapshots mean old data may "
+    "still be recoverable at the hardware level even after a 'successful' "
+    "overwrite. Use full-disk encryption or a vendor secure-erase tool for "
+    "guarantees on that hardware."
+)
 
 
 class PasswordUtilityApp:
@@ -1339,6 +1374,12 @@ class PasswordUtilityApp:
         ).pack(fill=tk.X, padx=16, pady=5, ipady=5)
         self.enc_pwd_var.trace_add("write", lambda *args: self.on_enc_pwd_change())
 
+        self.enc_pwd_strength_label = tk.Label(
+            enc_card, text="", font=(self.font_family, 8),
+            bg=self.theme["surface"], fg=self.theme["text_faint"], anchor="w"
+        )
+        self.enc_pwd_strength_label.pack(fill=tk.X, padx=16, pady=(0, 2))
+
         self.enc_pwd_autoclear_var = tk.BooleanVar(value=self.current_values["enc_pwd_autoclear"])
         enc_pwd_autoclear_cb = tk.Checkbutton(
             enc_card,
@@ -1350,6 +1391,11 @@ class PasswordUtilityApp:
             command=lambda: self._on_pwd_autoclear_toggle("enc")
         )
         enc_pwd_autoclear_cb.pack(anchor=tk.W, padx=16, pady=(2, 0))
+        self._add_help_note(
+            enc_card,
+            "Reduces on-screen exposure time; not a guarantee against memory "
+            "forensics or OS swap/paging."
+        )
 
         self.shred_after_enc_var = tk.BooleanVar(value=self.current_values["shred_after"])
         shred_cb = tk.Checkbutton(
@@ -1443,6 +1489,11 @@ class PasswordUtilityApp:
             command=lambda: self._on_pwd_autoclear_toggle("dec")
         )
         dec_pwd_autoclear_cb.pack(anchor=tk.W, padx=16, pady=(2, 0))
+        self._add_help_note(
+            dec_card,
+            "Reduces on-screen exposure time; not a guarantee against memory "
+            "forensics or OS swap/paging."
+        )
 
         self.dec_btn = self.make_button(dec_card, "Decrypt & Save", kind="success")
         self.dec_btn.config(command=self.decrypt_file, state=tk.DISABLED, font=(self.font_family, 11, "bold"))
@@ -1527,6 +1578,25 @@ class PasswordUtilityApp:
         self.current_values["enc_pwd"] = self.enc_pwd_var.get()
         self.check_enc_ready()
         self._reset_pwd_autoclear_timer("enc")
+        self._update_pwd_strength_label()
+
+    def _update_pwd_strength_label(self):
+        pwd = self.enc_pwd_var.get()
+        label = getattr(self, "enc_pwd_strength_label", None)
+        if label is None:
+            return
+        if not pwd:
+            label.config(text="")
+            return
+        bits = estimate_passphrase_entropy(pwd)
+        rating, color_key = rate_entropy(bits)
+        note = ""
+        if len(pwd) < 12:
+            note = "  (12+ characters recommended regardless of rating)"
+        label.config(
+            text=f"Estimated strength: {rating} (~{bits:.0f} bits){note}",
+            fg=self.theme[color_key]
+        )
 
     def on_dec_pwd_change(self):
         self.current_values["dec_pwd"] = self.dec_pwd_var.get()
@@ -1690,6 +1760,13 @@ class PasswordUtilityApp:
         except Exception:
             pass
 
+    def _add_help_note(self, parent, text):
+        tk.Label(
+            parent, text=text, font=(self.font_family, 8),
+            bg=self.theme["surface"], fg=self.theme["text_faint"],
+            wraplength=380, justify=tk.LEFT, anchor="w"
+        ).pack(fill=tk.X, padx=16, pady=(0, 2))
+
     def save_passwords(self):
         if not self.generated_passwords:
             return
@@ -1771,7 +1848,7 @@ class PasswordUtilityApp:
                 else:
                     messagebox.showinfo(
                         "Done",
-                        f"Encrypted to:\n{enc_path}\n\nOriginal plaintext securely shredded:\n{path}"
+                        f"Encrypted to:\n{enc_path}\n\nOriginal plaintext securely shredded:\n{path}\n\n{SSD_SHRED_CAVEAT}"
                     )
                 self.last_saved_password_path = None
                 self.encrypt_shred_btn.config(state=tk.DISABLED)
@@ -1868,7 +1945,8 @@ class PasswordUtilityApp:
                                 "highly sensitive data."
                             )
                         else:
-                            status_msg = "Encryption complete. Original securely shredded after verification."
+                            status_msg = ("Encryption complete. Original securely shredded after verification. "
+                                          "(Overwrite isn't guaranteed on SSDs/COW filesystems.)")
                     else:
                         status_msg = "Encrypted, but verification failed \u2014 original was NOT deleted."
                         status_fg = self.theme["danger"]
@@ -1973,7 +2051,7 @@ class PasswordUtilityApp:
                 self.shred_status.config(text="File securely shredded.", fg=self.theme["success"])
                 self.shred_file_path.set("")
                 self.check_shred_ready()
-                messagebox.showinfo("Shred Complete", "File has been securely deleted.")
+                messagebox.showinfo("Shred Complete", f"File has been securely deleted.\n\n{SSD_SHRED_CAVEAT}")
         except Exception as e:
             self.shred_status.config(text=f"Error: {str(e)}", fg=self.theme["danger"])
             messagebox.showerror("Error", str(e))
