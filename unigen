@@ -246,6 +246,7 @@ class PasswordUtilityApp:
 
         self.build_ui()
         self.update_pool_stats()
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     # ---------- Clipboard ----------
     def copy_to_clipboard(self, text, status_label=None):
@@ -1668,6 +1669,27 @@ class PasswordUtilityApp:
         text = "\n".join(self.generated_passwords)
         self.copy_to_clipboard(text, status_label=self.gen_copy_status)
 
+    @staticmethod
+    def _restrict_file_permissions(path):
+        """Best-effort: restrict a just-written sensitive file to owner-only
+        read/write (chmod 600 on POSIX; ACL reset to the current user on
+        Windows). Never raises — this is defense-in-depth on top of the
+        content itself, not a hard requirement, so failures are swallowed."""
+        try:
+            if sys.platform == "win32":
+                try:
+                    subprocess.run(
+                        ["icacls", str(path), "/inheritance:r", "/grant:r",
+                         f"{os.environ.get('USERNAME', os.getlogin())}:F"],
+                        capture_output=True, timeout=3.0, check=False
+                    )
+                except Exception:
+                    pass
+            else:
+                os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+        except Exception:
+            pass
+
     def save_passwords(self):
         if not self.generated_passwords:
             return
@@ -1680,6 +1702,7 @@ class PasswordUtilityApp:
             try:
                 with open(path, "w", encoding="utf-8") as f:
                     f.write("\n".join(self.generated_passwords))
+                self._restrict_file_permissions(path)
                 self.last_saved_password_path = path
                 self.encrypt_shred_btn.config(state=tk.NORMAL)
                 messagebox.showinfo("Saved", f"Saved to:\n{path}")
@@ -1725,6 +1748,7 @@ class PasswordUtilityApp:
             enc_path = path + ".enc"
             with open(enc_path, "w", encoding="ascii") as f:
                 f.write(base64.b64encode(combined).decode("ascii"))
+            self._restrict_file_permissions(enc_path)
 
             # Verify: the encrypted file must decrypt back to the exact original bytes
             # before the plaintext is destroyed.
@@ -1874,6 +1898,7 @@ class PasswordUtilityApp:
             try:
                 with open(path, "w", encoding="ascii") as f:
                     f.write(self.last_encrypted_b64)
+                self._restrict_file_permissions(path)
                 self.enc_status.config(text=f"Saved: {path}", fg=self.theme["success"])
                 messagebox.showinfo("Saved", f"Encrypted file saved.\n\n{path}")
             except Exception as e:
@@ -1906,6 +1931,7 @@ class PasswordUtilityApp:
             if out_path:
                 with open(out_path, "wb") as f:
                     f.write(plain)
+                self._restrict_file_permissions(out_path)
                 self.dec_status.config(text=f"Saved: {out_path}", fg=self.theme["success"])
                 messagebox.showinfo("Success", f"File decrypted and saved.\n\n{out_path}")
         except Exception:
@@ -2001,6 +2027,40 @@ class PasswordUtilityApp:
             raise RuntimeError(f"File {action} but could not be removed: {e}")
 
         return "secure" if overwrite_ok else "fallback"
+
+    # ---------- Clean shutdown ----------
+    def on_close(self):
+        """Best-effort cleanup when the window is closed: cancel any pending
+        auto-clear timers, wipe passphrase/password fields still held in
+        memory, and clear the clipboard so nothing sensitive lingers after
+        the app exits. Never blocks exit even if a step fails."""
+        for after_id_attr in ("_autoclear_after_id", "_enc_pwd_clear_after_id", "_dec_pwd_clear_after_id"):
+            after_id = getattr(self, after_id_attr, None)
+            if after_id:
+                try:
+                    self.root.after_cancel(after_id)
+                except Exception:
+                    pass
+                setattr(self, after_id_attr, None)
+
+        for var_attr in ("enc_pwd_var", "dec_pwd_var"):
+            var = getattr(self, var_attr, None)
+            if var is not None:
+                try:
+                    var.set("")
+                except Exception:
+                    pass
+
+        self.current_values["enc_pwd"] = ""
+        self.current_values["dec_pwd"] = ""
+        self.last_encrypted_b64 = None
+
+        try:
+            self.clear_clipboard()
+        except Exception:
+            pass
+
+        self.root.destroy()
 
 
 def main():
