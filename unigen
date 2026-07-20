@@ -222,6 +222,9 @@ class PasswordUtilityApp:
             "autoclear_enabled": True,
             "autoclear_seconds": 20,
             "linux_try_exclusion": False,
+            "enc_pwd_autoclear": True,
+            "dec_pwd_autoclear": True,
+            "pwd_autoclear_seconds": 30,
         }
         self.active_tab = "gen"
         self.generated_passwords = []
@@ -232,6 +235,8 @@ class PasswordUtilityApp:
         self._autoclear_after_id = None
         self._autoclear_pending_text = None
         self._syncing_autoclear = False
+        self._enc_pwd_clear_after_id = None
+        self._dec_pwd_clear_after_id = None
 
         # No scrollable canvas — the layout below is built to fit one screen.
         self.root.columnconfigure(0, weight=1)
@@ -1333,6 +1338,18 @@ class PasswordUtilityApp:
         ).pack(fill=tk.X, padx=16, pady=5, ipady=5)
         self.enc_pwd_var.trace_add("write", lambda *args: self.on_enc_pwd_change())
 
+        self.enc_pwd_autoclear_var = tk.BooleanVar(value=self.current_values["enc_pwd_autoclear"])
+        enc_pwd_autoclear_cb = tk.Checkbutton(
+            enc_card,
+            text=f"Clear passphrase from memory after {self.current_values['pwd_autoclear_seconds']}s of inactivity",
+            variable=self.enc_pwd_autoclear_var,
+            bg=self.theme["surface"], fg=self.theme["text_secondary"],
+            selectcolor=self.theme["accent"], activebackground=self.theme["surface"],
+            font=(self.font_family, 9),
+            command=lambda: self._on_pwd_autoclear_toggle("enc")
+        )
+        enc_pwd_autoclear_cb.pack(anchor=tk.W, padx=16, pady=(2, 0))
+
         self.shred_after_enc_var = tk.BooleanVar(value=self.current_values["shred_after"])
         shred_cb = tk.Checkbutton(
             enc_card, text="Verify, then securely shred the original after encryption",
@@ -1413,6 +1430,18 @@ class PasswordUtilityApp:
             font=(self.font_family, 10), bd=0, insertbackground=self.theme["input_fg"]
         ).pack(fill=tk.X, padx=16, pady=5, ipady=5)
         self.dec_pwd_var.trace_add("write", lambda *args: self.on_dec_pwd_change())
+
+        self.dec_pwd_autoclear_var = tk.BooleanVar(value=self.current_values["dec_pwd_autoclear"])
+        dec_pwd_autoclear_cb = tk.Checkbutton(
+            dec_card,
+            text=f"Clear passphrase from memory after {self.current_values['pwd_autoclear_seconds']}s of inactivity",
+            variable=self.dec_pwd_autoclear_var,
+            bg=self.theme["surface"], fg=self.theme["text_secondary"],
+            selectcolor=self.theme["accent"], activebackground=self.theme["surface"],
+            font=(self.font_family, 9),
+            command=lambda: self._on_pwd_autoclear_toggle("dec")
+        )
+        dec_pwd_autoclear_cb.pack(anchor=tk.W, padx=16, pady=(2, 0))
 
         self.dec_btn = self.make_button(dec_card, "Decrypt & Save", kind="success")
         self.dec_btn.config(command=self.decrypt_file, state=tk.DISABLED, font=(self.font_family, 11, "bold"))
@@ -1496,10 +1525,61 @@ class PasswordUtilityApp:
     def on_enc_pwd_change(self):
         self.current_values["enc_pwd"] = self.enc_pwd_var.get()
         self.check_enc_ready()
+        self._reset_pwd_autoclear_timer("enc")
 
     def on_dec_pwd_change(self):
         self.current_values["dec_pwd"] = self.dec_pwd_var.get()
         self.check_dec_ready()
+        self._reset_pwd_autoclear_timer("dec")
+
+    # ---------- Passphrase auto-clear ----------
+    def _on_pwd_autoclear_toggle(self, which):
+        """Called when the enc/dec 'clear passphrase after Ns' checkbox is toggled."""
+        var = getattr(self, f"{which}_pwd_autoclear_var")
+        self.current_values[f"{which}_pwd_autoclear"] = var.get()
+        self._reset_pwd_autoclear_timer(which)
+
+    def _reset_pwd_autoclear_timer(self, which):
+        """(Re)start the inactivity countdown that clears the enc/dec passphrase
+        field from memory. Called on every keystroke, so typing resets the clock;
+        the field is only cleared after N seconds with no further changes."""
+        attr = f"_{which}_pwd_clear_after_id"
+        pending_id = getattr(self, attr, None)
+        if pending_id:
+            try:
+                self.root.after_cancel(pending_id)
+            except Exception:
+                pass
+            setattr(self, attr, None)
+
+        enabled_var = getattr(self, f"{which}_pwd_autoclear_var", None)
+        if enabled_var is None or not enabled_var.get():
+            return
+
+        pwd_var = getattr(self, f"{which}_pwd_var", None)
+        if pwd_var is None or not pwd_var.get():
+            return
+
+        seconds = int(self.current_values.get("pwd_autoclear_seconds", 30))
+        new_id = self.root.after(seconds * 1000, lambda: self._clear_pwd_field(which))
+        setattr(self, attr, new_id)
+
+    def _clear_pwd_field(self, which):
+        """Wipe the enc/dec passphrase Entry's backing StringVar from memory."""
+        setattr(self, f"_{which}_pwd_clear_after_id", None)
+        pwd_var = getattr(self, f"{which}_pwd_var", None)
+        if pwd_var is None or not pwd_var.get():
+            return
+        pwd_var.set("")
+        status_label = getattr(self, f"{which}_status", None)
+        if status_label is not None:
+            try:
+                status_label.config(
+                    text=f"Passphrase cleared from memory after {self.current_values.get('pwd_autoclear_seconds', 30)}s of inactivity.",
+                    fg=self.theme["text_secondary"]
+                )
+            except Exception:
+                pass
 
     def get_active_pool(self):
         pool = ""
