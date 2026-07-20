@@ -235,6 +235,7 @@ class PasswordUtilityApp:
         self.theme_name = "dark"
         self.theme = THEMES["dark"]
         self.root.configure(bg=self.theme["bg"])
+        self._rebuilding = False
 
         self.font_family = "Segoe UI" if sys.platform == "win32" else "Helvetica"
         self.mono_family = "Consolas" if sys.platform == "win32" else (
@@ -927,6 +928,10 @@ class PasswordUtilityApp:
 
     # ---------- Theme switch ----------
     def switch_theme(self):
+        self._rebuilding = True
+        self.root.config(cursor="watch")
+        self.root.update_idletasks()
+
         new_theme = "light" if self.theme_name == "dark" else "dark"
         self.theme_name = new_theme
         self.theme = THEMES[new_theme]
@@ -976,11 +981,13 @@ class PasswordUtilityApp:
         if hasattr(self, "gen_clip_status"):
             self.gen_clip_status.config(text=saved_gen_clip_status)
 
+        self._rebuilding = False
         self.update_pool_stats()
         self.show_tab(self.active_tab)
         self.check_enc_ready()
         self.check_dec_ready()
         self.check_shred_ready()
+        self.root.config(cursor="")
 
     # ---------- UI helpers ----------
     def _configure_styles(self):
@@ -1560,6 +1567,8 @@ class PasswordUtilityApp:
             elif v > 128:
                 self.len_var.set(128)
             self.current_values["length"] = self.len_var.get()
+            if not self._rebuilding and getattr(self, "stat_cards", None):
+                self.update_pool_stats()
         except Exception:
             pass
 
@@ -1666,25 +1675,35 @@ class PasswordUtilityApp:
         return "".join(result)
 
     def update_pool_stats(self):
-        pool = self.get_active_pool()
         try:
-            length = self.len_var.get()
-        except Exception:
-            length = 20
-        pool_size = len(pool)
+            cards = self.stat_cards
+            if not cards or any(not lbl.winfo_exists() for lbl in cards.values()):
+                return
 
-        self.stat_cards["pool"].config(text=f"{pool_size:,}")
-        entropy = calculate_entropy(length, pool_size)
-        self.stat_cards["entropy"].config(text=f"{entropy:.1f} bits")
-        rating, color_key = rate_entropy(entropy)
-        self.stat_cards["strength"].config(text=rating, fg=self.theme[color_key])
+            pool = self.get_active_pool()
+            try:
+                length = self.len_var.get()
+            except Exception:
+                length = 20
+            pool_size = len(pool)
 
-        if pool_size == 0:
-            self.warn_label.pack(anchor=tk.W, padx=16, pady=(0, 6))
-            self.gen_btn.config(state=tk.DISABLED)
-        else:
-            self.warn_label.pack_forget()
-            self.gen_btn.config(state=tk.NORMAL)
+            cards["pool"].config(text=f"{pool_size:,}")
+            entropy = calculate_entropy(length, pool_size)
+            cards["entropy"].config(text=f"{entropy:.1f} bits")
+            rating, color_key = rate_entropy(entropy)
+            cards["strength"].config(text=rating, fg=self.theme[color_key])
+
+            if pool_size == 0:
+                self.warn_label.pack(anchor=tk.W, padx=16, pady=(0, 6))
+                self.gen_btn.config(state=tk.DISABLED)
+            else:
+                self.warn_label.pack_forget()
+                self.gen_btn.config(state=tk.NORMAL)
+        except (tk.TclError, AttributeError, KeyError):
+            # Widgets mid-teardown/rebuild (e.g. theme switch) — ignore, the
+            # explicit update_pool_stats() call at the end of switch_theme()
+            # will refresh everything once the new widgets exist.
+            pass
 
     def generate_passwords(self):
         if self.gen_running:
