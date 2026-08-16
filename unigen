@@ -21,6 +21,7 @@ import shutil
 import time
 import hashlib
 import threading
+import unicodedata
 from pathlib import Path
 
 try:
@@ -52,14 +53,28 @@ def load_self_source_chars():
     happens to already exclude control/format characters, but "happens to"
     isn't the same guarantee as an explicit allowlist). This instead checks
     each character's Unicode general category against an explicit allowed
-    set — letters, digits, marks, punctuation, symbols — so a character
-    added to the file later can't silently sneak into a generated password
-    just because some future Python version classifies it as printable."""
+    set — letters, digits, punctuation, symbols — so a character added to
+    the file later can't silently sneak into a generated password just
+    because some future Python version classifies it as printable.
+
+    Audit fix: category "M" (combining marks — Mn/Mc/Me) is deliberately
+    NOT in the allowed set, even though it's part of "printable" Unicode.
+    A combining mark has no width of its own; it visually attaches to
+    whatever character precedes it (or renders as an isolated dotted
+    circle if it's first). A password built from secrets.choice() over a
+    pool that includes these could end up with marks stacked on a single
+    base character, or a mark as the very first character with nothing to
+    attach to — both unreadable and, worse, subject to Unicode canonical-
+    equivalence surprises (the same visual password could normalize to
+    different underlying text on different systems). Letters, digits,
+    punctuation, and symbols all have their own display width and don't
+    have this problem."""
     import unicodedata
-    _ALLOWED_CATEGORY_PREFIXES = ("L", "N", "M", "P", "S")  # Letter, Number,
-    # Mark, Punctuation, Symbol — explicitly excludes C (control/format/
-    # surrogate/private-use/unassigned), Z (separators/spaces), and any
-    # future category not in this list.
+    _ALLOWED_CATEGORY_PREFIXES = ("L", "N", "P", "S")  # Letter, Number,
+    # Punctuation, Symbol — explicitly excludes C (control/format/
+    # surrogate/private-use/unassigned), M (combining marks — see
+    # docstring above), Z (separators/spaces), and any future category
+    # not in this list.
     try:
         src_path = os.path.abspath(__file__)
         with open(src_path, "r", encoding="utf-8", errors="ignore") as f:
@@ -202,15 +217,76 @@ def rate_entropy(bits):
         return "Very strong", "success"
 
 
+# Audit fix: a small set of catastrophically common passwords/patterns that
+# the character-class-pool model below would otherwise score as "Strong"
+# purely because they happen to mix letters/digits/symbols (e.g.
+# "Password1!" hits all four ASCII classes). This isn't meant to be a real
+# breach-corpus check (that would need a bundled wordlist) — it's a cheap
+# floor that catches the handful of choices real users reach for most
+# often, so at least those don't show a falsely reassuring rating.
+_COMMON_WEAK_PASSPHRASES = {
+    "password", "password1", "password123", "12345678", "123456789",
+    "1234567890", "qwerty123", "qwertyuiop", "letmein", "admin123",
+    "welcome1", "iloveyou", "abc123456", "changeme", "trustno1",
+    "passw0rd", "p@ssword", "p@ssw0rd", "correcthorsebatterystaple",
+}
+
+
+def _looks_like_low_diversity(passphrase):
+    """True if the passphrase is dominated by repetition or a simple
+    sequential run (e.g. "aaaaaaaa", "11111111", "abcdefgh", "12345678")
+    — patterns the class-pool model can't see because they still use a
+    "valid" character class, but that are trivial to guess."""
+    n = len(passphrase)
+    if n < 4:
+        return False
+    unique_ratio = len(set(passphrase)) / n
+    if unique_ratio <= 0.35:
+        return True
+    # Longest run of strictly ascending or descending consecutive
+    # codepoints (e.g. "abcd", "4321").
+    longest_run = 1
+    run = 1
+    for i in range(1, n):
+        delta = ord(passphrase[i]) - ord(passphrase[i - 1])
+        if delta in (1, -1):
+            run += 1
+            longest_run = max(longest_run, run)
+        else:
+            run = 1
+    return longest_run >= min(6, n)
+
+
 def estimate_passphrase_entropy(passphrase):
     """Rough entropy estimate for a user-typed passphrase: infer the likely
     character pool from which classes are present (lower/upper/digit/symbol/
     other-unicode), then treat it as length * log2(pool) — the same
     conservative model used elsewhere in this app for generated passwords.
-    This intentionally does NOT try to detect dictionary words or patterns;
-    it is a floor estimate, not a substitute for a real strength library."""
+
+    This intentionally does NOT try to detect dictionary words or patterns
+    in general (that needs a real wordlist/zxcvbn-style library, which this
+    app doesn't bundle) — it remains a floor estimate, not a substitute for
+    one. It DOES apply two cheap, high-value corrections so the number
+    shown for an encryption passphrase isn't actively misleading:
+
+      1. An exact/near-exact match against a short list of catastrophically
+         common passwords is clamped to ~0 bits ("Very weak"), since the
+         class-pool model alone would score e.g. "Password1!" as strong
+         purely for touching four character classes.
+      2. Low character diversity or an obvious sequential run (e.g.
+         "aaaaaaaa", "abcdefgh") is penalized, since repeating/sequential
+         characters from an "allowed" class don't carry that class's full
+         entropy per character.
+
+    Still not a substitute for a real strength library — just meant to stop
+    the meter from being confidently wrong about the most common cases."""
     if not passphrase:
         return 0.0
+
+    normalized = passphrase.strip().lower()
+    if normalized in _COMMON_WEAK_PASSPHRASES:
+        return 1.0  # effectively "Very weak" regardless of raw length/pool
+
     pool = 0
     if any(c.islower() for c in passphrase):
         pool += 26
@@ -224,7 +300,18 @@ def estimate_passphrase_entropy(passphrase):
         pool += 300  # broad allowance for any non-ASCII/Unicode character used
     if pool == 0:
         pool = 1
-    return calculate_entropy(len(passphrase), pool)
+
+    bits = calculate_entropy(len(passphrase), pool)
+
+    if _looks_like_low_diversity(passphrase):
+        # Fall back to counting entropy by actual unique characters used
+        # rather than the theoretical class pool, which is a much closer
+        # (and far more conservative) estimate for repetitive/sequential
+        # input.
+        unique_count = max(2, len(set(passphrase)))
+        bits = min(bits, calculate_entropy(len(passphrase), unique_count))
+
+    return bits
 
 
 def generate_password(length, pool):
@@ -235,6 +322,15 @@ def generate_password(length, pool):
 
 MAX_PASSPHRASE_LEN = 1024  # guards against a huge pasted passphrase making
                             # PBKDF2/Argon2 pathologically slow
+
+# Audit fix: 8 characters was the only hard floor for a file-encryption
+# passphrase. Combined with the strength meter's rough estimate (which,
+# even after the corrections above, can't catch every weak real-world
+# choice), 8 was low enough that a plausible user passphrase could land
+# well under 50 bits of actual entropy. 12 is still short enough not to be
+# annoying but rules out the shortest/weakest tier outright; the strength
+# meter remains the primary signal for anything longer.
+MIN_PASSPHRASE_LEN = 12
 
 
 # --- Best-effort secure memory handling (audit items #1, #2) -------------
@@ -1554,7 +1650,7 @@ class PasswordUtilityApp:
         browse_btn.config(command=self.browse_encrypt_file, font=(self.font_family, 9, "bold"), padx=12, pady=5)
         browse_btn.pack(side=tk.RIGHT, padx=(8, 0))
 
-        tk.Label(enc_card, text="Passphrase (min 8 characters)", font=(self.font_family, 9, "bold"),
+        tk.Label(enc_card, text="Passphrase (min 12 characters)", font=(self.font_family, 9, "bold"),
                  bg=self.theme["surface"], fg=self.theme["text"]).pack(anchor=tk.W, padx=16, pady=(10, 0))
         self.enc_pwd_var = tk.StringVar(value=self.current_values["enc_pwd"])
         tk.Entry(
@@ -1967,6 +2063,65 @@ class PasswordUtilityApp:
             pass
 
     @staticmethod
+    def _open_tmp_owner_only(tmp_path):
+        """Open (create) `tmp_path` for exclusive binary writing with owner
+        -only permissions applied AT CREATION TIME, not after the fact.
+
+        Audit finding: writing via plain open(path, "wb") and only calling
+        _restrict_file_permissions() afterward leaves a window — however
+        short — where the file exists on disk with the default umask
+        permissions (often world/group-readable). For files that hold
+        plaintext passwords or decrypted content, that window is a real
+        local-multiuser information disclosure risk. On POSIX, os.open()
+        with an explicit mode plus O_EXCL closes that window: the file
+        never exists with any permissions other than 0o600. On Windows,
+        POSIX modes are largely irrelevant (no umask), so we just create
+        normally and rely on the existing icacls-based
+        _restrict_file_permissions() call the caller makes afterward."""
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_BINARY"):
+            flags |= os.O_BINARY
+        fd = os.open(tmp_path, flags, 0o600)
+        return os.fdopen(fd, "wb")
+
+    def _atomic_write_sensitive(self, path, data):
+        """Write `data` (bytes) to `path` atomically and with owner-only
+        permissions from the moment the file is created, then fsync the
+        file and its parent directory. Used for any output that may
+        contain plaintext (passwords, decrypted files) or that must never
+        be left half-written (ciphertext containers).
+
+        Pattern: create <path>.tmp with a mode that's restrictive from
+        birth (see _open_tmp_owner_only) -> write -> flush -> fsync file ->
+        os.replace() into place -> fsync directory. A crash at any point
+        leaves either nothing, the old file untouched, or the complete new
+        file — never a partial one, and never one with looser-than-owner
+        permissions."""
+        tmp_path = path + ".tmp"
+        try:
+            if os.path.exists(tmp_path):
+                # Leftover from a previous crashed run — safe to remove
+                # since nothing ever pointed to it as a finished file.
+                os.remove(tmp_path)
+        except Exception:
+            pass
+        try:
+            with self._open_tmp_owner_only(tmp_path) as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+        except Exception:
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
+            raise
+        os.replace(tmp_path, path)
+        self._fsync_dir(path)
+        self._restrict_file_permissions(path)
+
+    @staticmethod
     def _restrict_file_permissions(path):
         """Best-effort: restrict a just-written sensitive file to owner-only
         read/write (chmod 600 on POSIX; ACL reset to the current user on
@@ -2028,24 +2183,12 @@ class PasswordUtilityApp:
         )
         if path:
             try:
-                tmp_path = path + ".tmp"
-                with open(tmp_path, "w", encoding="utf-8") as f:
-                    f.write("\n".join(self.generated_passwords))
-                    f.flush()
-                    os.fsync(f.fileno())
-                self._restrict_file_permissions(tmp_path)
-                os.replace(tmp_path, path)
-                self._fsync_dir(path)
-                self._restrict_file_permissions(path)
+                data = "\n".join(self.generated_passwords).encode("utf-8")
+                self._atomic_write_sensitive(path, data)
                 self.last_saved_password_path = path
                 self.encrypt_shred_btn.config(state=tk.NORMAL)
                 messagebox.showinfo("Saved", f"Saved to:\n{path}")
             except Exception as e:
-                try:
-                    if os.path.exists(tmp_path):
-                        os.remove(tmp_path)
-                except Exception:
-                    pass
                 messagebox.showerror("Error", str(e))
 
     # ---------- One-click: encrypt the saved password list, then shred original ----------
@@ -2065,12 +2208,12 @@ class PasswordUtilityApp:
 
         pwd = simpledialog.askstring(
             "Encryption Passphrase",
-            "Enter a passphrase (min 8 characters) to protect this password file:",
+            "Enter a passphrase (min 12 characters) to protect this password file:",
             show="•", parent=self.root
         )
-        if not pwd or len(pwd) < 8:
+        if not pwd or len(pwd) < MIN_PASSPHRASE_LEN:
             if pwd is not None:
-                messagebox.showwarning("Too short", "Passphrase must be at least 8 characters.")
+                messagebox.showwarning("Too short", f"Passphrase must be at least {MIN_PASSPHRASE_LEN} characters.")
             return
 
         try:
@@ -2080,9 +2223,18 @@ class PasswordUtilityApp:
             combined = self._encrypt_blob(pwd, original_data)
 
             enc_path = path + ".enc"
-            with open(enc_path, "w", encoding="ascii") as f:
-                f.write(base64.b64encode(combined).decode("ascii"))
-            self._restrict_file_permissions(enc_path)
+            # Audit fix: this used to write enc_path with a plain open()
+            # and no fsync, then go on to permanently shred the plaintext
+            # original once the readback verified. Without an fsync, the OS
+            # is free to keep enc_path's bytes in its page cache
+            # indefinitely — a crash or power loss after the shred but
+            # before that cache is flushed could destroy both the
+            # plaintext (already shredded) and the "encrypted" copy
+            # (never actually made durable), losing the passwords for
+            # good. Using the same atomic+fsync helper as save_passwords
+            # closes that window: enc_path is only ever visible on disk
+            # once it's completely and durably written.
+            self._atomic_write_sensitive(enc_path, base64.b64encode(combined))
 
             # Verify: the encrypted file must decrypt back to the exact original bytes
             # before the plaintext is destroyed.
@@ -2154,7 +2306,7 @@ class PasswordUtilityApp:
 
     def check_enc_ready(self):
         pwd_len = len(self.enc_pwd_var.get())
-        ready = bool(self.enc_file_path.get() and 8 <= pwd_len <= MAX_PASSPHRASE_LEN)
+        ready = bool(self.enc_file_path.get() and MIN_PASSPHRASE_LEN <= pwd_len <= MAX_PASSPHRASE_LEN)
         self.enc_btn.config(state=tk.NORMAL if ready else tk.DISABLED)
 
     def check_dec_ready(self):
@@ -2181,6 +2333,24 @@ class PasswordUtilityApp:
             )
         if kdf_id is None:
             kdf_id = KDF_ARGON2ID if ARGON2_AVAILABLE else KDF_PBKDF2
+
+        # Audit fix: normalize to NFC before encoding. Without this, the
+        # *same* passphrase typed on two different systems/input methods
+        # (e.g. a precomposed "ó" vs. "o" + combining acute accent — both
+        # look and sound identical) encodes to different UTF-8 bytes, so
+        # they'd derive different keys and decryption would fail with a
+        # confusing "wrong password" for a password the user is certain
+        # they typed correctly. NFC is the form most text editors, browsers,
+        # and OS input methods already normalize to by default, so this
+        # matches the common case.
+        #
+        # Known trade-off: this does NOT retroactively fix files encrypted
+        # by a version of this app from before this change using a
+        # non-ASCII passphrase that happened to arrive in decomposed (NFD)
+        # form — decrypting those may require entering the passphrase in
+        # the exact form originally used. Purely-ASCII passphrases are
+        # entirely unaffected (NFC/NFD are identical for ASCII).
+        password = unicodedata.normalize("NFC", password)
 
         pwd_buf = bytearray(password.encode("utf-8"))
         locked = try_mlock(pwd_buf)
@@ -2339,6 +2509,11 @@ class PasswordUtilityApp:
         if out_path is not None and os.path.abspath(in_path) == os.path.abspath(out_path):
             raise ValueError("Input and output paths must be different")
         tmp_path = (out_path + ".tmp") if out_path else None
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
         try:
             hexdigest = self._stream_decrypt_file_inner(in_path, tmp_path, password, progress_cb)
         except Exception:
@@ -2371,7 +2546,7 @@ class PasswordUtilityApp:
             locked = try_mlock(key)
             hasher = hashlib.sha256()
             total = os.path.getsize(in_path)
-            fout = open(tmp_path, "wb") if tmp_path else None
+            fout = self._open_tmp_owner_only(tmp_path) if tmp_path else None
             try:
                 aesgcm = AESGCM(bytes(key))
                 counter = 0
@@ -2523,7 +2698,7 @@ class PasswordUtilityApp:
     def encrypt_file(self):
         path = self.enc_file_path.get()
         pwd = self.enc_pwd_var.get()
-        if not path or len(pwd) < 8:
+        if not path or len(pwd) < MIN_PASSPHRASE_LEN:
             return
 
         self.enc_status.config(text="Encrypting\u2026", fg=self.theme["accent"])
@@ -2736,9 +2911,7 @@ class PasswordUtilityApp:
         )
         if path:
             try:
-                with open(path, "w", encoding="ascii") as f:
-                    f.write(self.last_encrypted_b64)
-                self._restrict_file_permissions(path)
+                self._atomic_write_sensitive(path, self.last_encrypted_b64.encode("ascii"))
                 self.enc_status.config(text=f"Saved: {path}", fg=self.theme["success"])
                 messagebox.showinfo("Saved", f"Encrypted file saved.\n\n{path}")
             except Exception as e:
@@ -2804,26 +2977,12 @@ class PasswordUtilityApp:
                 defaultextension="", filetypes=[("All files", "*.*")], initialfile=Path(path).stem
             )
             if out_path:
-                # M-1: write atomically (.tmp -> fsync -> os.replace -> fsync
-                # dir), same pattern as the streaming encrypt path, so a
-                # crash mid-write can't leave a partial plaintext file sitting
-                # at out_path under a name that looks like a finished decrypt.
-                tmp_path = out_path + ".tmp"
-                try:
-                    with open(tmp_path, "wb") as f:
-                        f.write(plain)
-                        f.flush()
-                        os.fsync(f.fileno())
-                    os.replace(tmp_path, out_path)
-                    self._fsync_dir(out_path)
-                except Exception:
-                    try:
-                        if os.path.exists(tmp_path):
-                            os.remove(tmp_path)
-                    except Exception:
-                        pass
-                    raise
-                self._restrict_file_permissions(out_path)
+                # Atomic + owner-only-from-creation write (see
+                # _atomic_write_sensitive), so a crash mid-write can't leave
+                # a partial plaintext file at out_path, and the plaintext
+                # is never briefly world/group-readable before permissions
+                # are tightened.
+                self._atomic_write_sensitive(out_path, plain)
                 self.dec_status.config(text=f"Saved: {out_path}", fg=self.theme["success"])
                 messagebox.showinfo("Success", f"File decrypted and saved.\n\n{out_path}")
         except Exception:
