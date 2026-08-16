@@ -19,6 +19,7 @@ import base64
 import subprocess
 import shutil
 import time
+import hashlib
 from pathlib import Path
 
 try:
@@ -29,12 +30,35 @@ try:
 except ImportError:
     CRYPTO_AVAILABLE = False
 
+try:
+    from cryptography.hazmat.primitives.kdf.argon2 import Argon2id
+    ARGON2_AVAILABLE = True
+except ImportError:
+    # Argon2id was added to `cryptography` in version 42.0 (2024). On older
+    # installs we transparently fall back to PBKDF2-SHA256 for new
+    # encryptions too (decryption of Argon2-encrypted files just won't work
+    # on such an old install; the app will say so explicitly if that happens).
+    ARGON2_AVAILABLE = False
+
 
 # ---------- Self-source character set ----------
 def load_self_source_chars():
     """Read this script's own source file and return its unique, printable,
     non-whitespace characters. Kept dynamic (rather than hard-coded) so the
-    character set always matches whatever this file actually contains."""
+    character set always matches whatever this file actually contains.
+
+    Audit item #11: filtering on isprintable() alone is a blacklist (it
+    happens to already exclude control/format characters, but "happens to"
+    isn't the same guarantee as an explicit allowlist). This instead checks
+    each character's Unicode general category against an explicit allowed
+    set — letters, digits, marks, punctuation, symbols — so a character
+    added to the file later can't silently sneak into a generated password
+    just because some future Python version classifies it as printable."""
+    import unicodedata
+    _ALLOWED_CATEGORY_PREFIXES = ("L", "N", "M", "P", "S")  # Letter, Number,
+    # Mark, Punctuation, Symbol — explicitly excludes C (control/format/
+    # surrogate/private-use/unassigned), Z (separators/spaces), and any
+    # future category not in this list.
     try:
         src_path = os.path.abspath(__file__)
         with open(src_path, "r", encoding="utf-8", errors="ignore") as f:
@@ -47,6 +71,8 @@ def load_self_source_chars():
         if ch in ("\n", "\r", "\t", " "):
             continue
         if not ch.isprintable():
+            continue
+        if not unicodedata.category(ch).startswith(_ALLOWED_CATEGORY_PREFIXES):
             continue
         if ch not in seen:
             seen.add(ch)
@@ -204,6 +230,117 @@ def generate_password(length, pool):
     if not pool or length <= 0:
         return ""
     return "".join(secrets.choice(pool) for _ in range(length))
+
+
+MAX_PASSPHRASE_LEN = 1024  # guards against a huge pasted passphrase making
+                            # PBKDF2/Argon2 pathologically slow
+
+
+# --- Best-effort secure memory handling (audit items #1, #2) -------------
+# Pure Python cannot guarantee a secret is wiped from RAM: `str` is
+# immutable (an old value can linger in freed memory until reused, and may
+# already have been paged to swap), and CPython gives no portable way to
+# mlock() an arbitrary object. What we *can* do, and do here:
+#   - Do crypto-relevant secret handling on `bytearray` instead of `str`
+#     wherever the value doesn't need to stay a Tk-displayable string, so it
+#     can be explicitly overwritten with zeros the moment it's no longer
+#     needed (secure_zero()).
+#   - Best-effort mlock()/VirtualLock() that bytearray's backing buffer via
+#     ctypes, so the OS is less likely to swap it out. This can silently
+#     fail (missing privilege, platform without the call) — it is
+#     defense-in-depth, not a guarantee, and every call site treats it that
+#     way.
+# The passphrase *entry field* itself must still be a Tk StringVar (Tkinter
+# has no secure-string Entry backing), so the immutable-string exposure
+# described in the audit is not eliminated for that field — it's reduced by
+# converting to bytearray immediately at each point of use and zeroing that
+# copy afterward, and by proactively clearing the StringVar (see
+# _reset_pwd_autoclear_timer / on_close) rather than leaving it populated
+# for the life of the app.
+
+def secure_zero(buf):
+    """Best-effort in-place zero of a mutable byte buffer. No-op / safe on
+    anything that isn't a bytearray/memoryview-over-mutable-buffer."""
+    if buf is None:
+        return
+    try:
+        if isinstance(buf, bytearray):
+            for i in range(len(buf)):
+                buf[i] = 0
+        elif isinstance(buf, memoryview) and not buf.readonly:
+            buf[:] = b"\x00" * len(buf)
+    except Exception:
+        pass
+
+
+def try_mlock(buf):
+    """Best-effort: ask the OS to keep `buf` (a bytearray) out of swap.
+    Returns True if the call reports success, False otherwise (including
+    "not supported here") — callers must not depend on this succeeding."""
+    try:
+        import ctypes
+        addr = (ctypes.c_char * len(buf)).from_buffer(buf)
+        ptr = ctypes.addressof(addr)
+        if sys.platform == "win32":
+            ctypes.windll.kernel32.VirtualLock.restype = ctypes.c_int
+            return bool(ctypes.windll.kernel32.VirtualLock(ptr, len(buf)))
+        else:
+            libc = ctypes.CDLL(None)
+            return libc.mlock(ctypes.c_void_p(ptr), ctypes.c_size_t(len(buf))) == 0
+    except Exception:
+        return False
+
+
+def try_munlock(buf):
+    try:
+        import ctypes
+        addr = (ctypes.c_char * len(buf)).from_buffer(buf)
+        ptr = ctypes.addressof(addr)
+        if sys.platform == "win32":
+            ctypes.windll.kernel32.VirtualUnlock(ptr, len(buf))
+        else:
+            libc = ctypes.CDLL(None)
+            libc.munlock(ctypes.c_void_p(ptr), ctypes.c_size_t(len(buf)))
+    except Exception:
+        pass
+
+# --- .enc container format ---
+# New files:    MAGIC(4) + KDF_ID(1) + salt(16) + iv(12) + ciphertext
+# Legacy files (no MAGIC prefix): salt(16) + iv(12) + ciphertext, always PBKDF2.
+# The magic bytes let decrypt_file() tell the two apart; a random 16-byte
+# salt matching MAGIC by chance is negligible (2^-32).
+ENC_MAGIC = b"UG2\x00"
+KDF_PBKDF2 = 1
+KDF_ARGON2ID = 2
+
+# Argon2id parameters (OWASP-recommended baseline for interactive use):
+# 64 MiB memory, 3 iterations, 4 parallel lanes.
+ARGON2_MEMORY_KIB = 64 * 1024
+ARGON2_TIME_COST = 3
+ARGON2_LANES = 4
+
+PBKDF2_ITERATIONS = 600_000
+
+# --- Streaming file format (audit item #3) --------------------------------
+# encrypt_file()/decrypt_file() historically read the whole file into RAM
+# (f.read()), which OOMs or hangs the UI on very large files. Files above
+# STREAM_SIZE_THRESHOLD now go through a chunked format instead: the file
+# is processed STREAM_CHUNK_SIZE bytes at a time, each chunk independently
+# authenticated with AES-GCM under its own nonce (base_nonce XOR a 4-byte
+# big-endian counter) and an AAD that binds the chunk's position and
+# whether it's the final chunk — so chunks can't be reordered, dropped, or
+# have extra chunks appended without detection. Smaller files keep using
+# the existing single-shot _encrypt_blob()/_decrypt_blob() container
+# (base64 text), since that's what enables the clipboard copy/paste flow.
+STREAM_MAGIC = b"UG3S"
+STREAM_CHUNK_SIZE = 4 * 1024 * 1024      # 4 MiB plaintext per chunk
+STREAM_SIZE_THRESHOLD = 20 * 1024 * 1024  # switch to streaming above 20 MiB
+
+
+class OverwriteFailedError(RuntimeError):
+    """Raised by shred_file() when the secure multi-pass overwrite failed
+    and the caller did not opt into deleting the file anyway."""
+    pass
 
 
 SSD_SHRED_CAVEAT = (
@@ -1600,7 +1737,13 @@ class PasswordUtilityApp:
         bits = estimate_passphrase_entropy(pwd)
         rating, color_key = rate_entropy(bits)
         note = ""
-        if len(pwd) < 12:
+        if any(not c.isascii() for c in pwd):
+            # Audit item #8: the non-ASCII pool-size allowance (+300) is a
+            # deliberately conservative floor, not a real estimate of e.g.
+            # CJK entropy — make that visible rather than implying
+            # precision the number doesn't have.
+            note = "  (floor estimate \u2014 non-Latin text may be less random than this suggests)"
+        elif len(pwd) < 12:
             note = "  (12+ characters recommended regardless of rating)"
         label.config(
             text=f"Estimated strength: {rating} (~{bits:.0f} bits){note}",
@@ -1767,11 +1910,35 @@ class PasswordUtilityApp:
         try:
             if sys.platform == "win32":
                 try:
-                    subprocess.run(
+                    # Prefer os.getlogin() (reads the session's actual logged
+                    # -on user from the OS) over the USERNAME environment
+                    # variable, which any process in the same session can
+                    # override before launching this app (audit item #7:
+                    # trusting a spoofable env var here could grant "Full
+                    # control" to the wrong account name). Only fall back to
+                    # the env var if getlogin() itself fails (e.g. running
+                    # under some service contexts without a session).
+                    try:
+                        username = os.getlogin()
+                    except OSError:
+                        username = os.environ.get("USERNAME")
+                    if not username:
+                        return
+                    result = subprocess.run(
                         ["icacls", str(path), "/inheritance:r", "/grant:r",
-                         f"{os.environ.get('USERNAME', os.getlogin())}:F"],
+                         f"{username}:F"],
                         capture_output=True, timeout=3.0, check=False
                     )
+                    # icacls is run with check=False deliberately (never
+                    # raise on failure — this stays best-effort), but we no
+                    # longer swallow a failed exit code completely silently:
+                    # surfacing it costs nothing and helps diagnose "why is
+                    # this file not actually restricted" reports.
+                    if result.returncode != 0:
+                        sys.stderr.write(
+                            f"[unigen] warning: icacls could not restrict "
+                            f"permissions on {path}: {result.stderr.decode(errors='replace').strip()}\n"
+                        )
                 except Exception:
                     pass
             else:
@@ -1834,12 +2001,7 @@ class PasswordUtilityApp:
             with open(path, "rb") as f:
                 original_data = f.read()
 
-            salt = os.urandom(16)
-            iv = os.urandom(12)
-            key = self.derive_key(pwd, salt)
-            aesgcm = AESGCM(key)
-            ct = aesgcm.encrypt(iv, original_data, None)
-            combined = salt + iv + ct
+            combined = self._encrypt_blob(pwd, original_data)
 
             enc_path = path + ".enc"
             with open(enc_path, "w", encoding="ascii") as f:
@@ -1851,12 +2013,29 @@ class PasswordUtilityApp:
             with open(enc_path, "r", encoding="ascii") as f:
                 check_b64 = f.read().strip()
             check_combined = base64.b64decode(check_b64)
-            check_salt, check_iv, check_ct = check_combined[:16], check_combined[16:28], check_combined[28:]
-            check_key = self.derive_key(pwd, check_salt)
-            decrypted_back = AESGCM(check_key).decrypt(check_iv, check_ct, None)
+            decrypted_back = self._decrypt_blob(pwd, check_combined)
 
             if decrypted_back == original_data:
-                result = self.shred_file(path)
+                try:
+                    result = self.shred_file(path)
+                except OverwriteFailedError:
+                    delete_anyway = messagebox.askyesno(
+                        "Secure overwrite failed",
+                        f"Encrypted to:\n{enc_path}\n\n"
+                        "The original plaintext file's secure overwrite failed, so it was "
+                        "left in place rather than deleted unverified.\n\n"
+                        "Delete the original anyway WITHOUT a secure overwrite?"
+                    )
+                    if not delete_anyway:
+                        messagebox.showinfo(
+                            "Original kept",
+                            f"Encrypted to:\n{enc_path}\n\nOriginal plaintext was NOT deleted:\n{path}"
+                        )
+                        self.last_saved_password_path = None
+                        self.encrypt_shred_btn.config(state=tk.DISABLED)
+                        return
+                    result = self.shred_file(path, delete_on_overwrite_failure=True)
+
                 if result == "fallback":
                     messagebox.showwarning(
                         "Encrypted, deletion not fully verified",
@@ -1898,16 +2077,240 @@ class PasswordUtilityApp:
             self.check_dec_ready()
 
     def check_enc_ready(self):
-        ready = bool(self.enc_file_path.get() and len(self.enc_pwd_var.get()) >= 8)
+        pwd_len = len(self.enc_pwd_var.get())
+        ready = bool(self.enc_file_path.get() and 8 <= pwd_len <= MAX_PASSPHRASE_LEN)
         self.enc_btn.config(state=tk.NORMAL if ready else tk.DISABLED)
 
     def check_dec_ready(self):
         ready = bool(self.dec_file_path.get() and self.dec_pwd_var.get())
         self.dec_btn.config(state=tk.NORMAL if ready else tk.DISABLED)
 
-    def derive_key(self, password, salt):
-        kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=600_000)
-        return kdf.derive(password.encode("utf-8"))
+    def derive_key(self, password, salt, kdf_id=None):
+        """Derive a 32-byte AES-256 key from a password + salt.
+
+        kdf_id selects the KDF: KDF_ARGON2ID (default for new encryptions,
+        when available) or KDF_PBKDF2 (used to decrypt files produced by
+        older versions of this app, or as a fallback if Argon2id isn't
+        available in the installed `cryptography` version).
+
+        The password is converted to a bytearray and mlock()'d/zeroed
+        best-effort around the derive() call (see secure_zero/try_mlock
+        above) rather than left as an immutable Python str for longer than
+        necessary."""
+        if len(password) > MAX_PASSPHRASE_LEN:
+            raise ValueError(
+                f"Passphrase too long ({len(password)} chars). "
+                f"Maximum is {MAX_PASSPHRASE_LEN} characters."
+            )
+        if kdf_id is None:
+            kdf_id = KDF_ARGON2ID if ARGON2_AVAILABLE else KDF_PBKDF2
+
+        pwd_buf = bytearray(password.encode("utf-8"))
+        locked = try_mlock(pwd_buf)
+        try:
+            if kdf_id == KDF_ARGON2ID:
+                if not ARGON2_AVAILABLE:
+                    raise ValueError(
+                        "This file was encrypted with Argon2id, but the installed "
+                        "'cryptography' package (< 42.0) doesn't support it. "
+                        "Upgrade with: pip install -U cryptography"
+                    )
+                kdf = Argon2id(
+                    salt=salt, length=32,
+                    iterations=ARGON2_TIME_COST, lanes=ARGON2_LANES,
+                    memory_cost=ARGON2_MEMORY_KIB,
+                )
+                return kdf.derive(bytes(pwd_buf))
+            elif kdf_id == KDF_PBKDF2:
+                kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt,
+                                  iterations=PBKDF2_ITERATIONS)
+                return kdf.derive(bytes(pwd_buf))
+            else:
+                raise ValueError(f"Unknown KDF id: {kdf_id}")
+        finally:
+            secure_zero(pwd_buf)
+            if locked:
+                try_munlock(pwd_buf)
+
+    def _encrypt_blob(self, password, data):
+        """Encrypt bytes with the current default KDF (Argon2id, falling
+        back to PBKDF2 if Argon2id isn't available). Returns the full
+        container: MAGIC + kdf_id + salt + iv + ciphertext."""
+        kdf_id = KDF_ARGON2ID if ARGON2_AVAILABLE else KDF_PBKDF2
+        salt = os.urandom(16)
+        iv = os.urandom(12)
+        key = bytearray(self.derive_key(password, salt, kdf_id))
+        locked = try_mlock(key)
+        try:
+            ct = AESGCM(bytes(key)).encrypt(iv, data, None)
+        finally:
+            secure_zero(key)
+            if locked:
+                try_munlock(key)
+        return ENC_MAGIC + bytes([kdf_id]) + salt + iv + ct
+
+    def _decrypt_blob(self, password, combined):
+        """Decrypt a container produced by _encrypt_blob(), or a legacy
+        (pre-Argon2) container with no magic header. Returns plaintext bytes."""
+        if combined.startswith(ENC_MAGIC):
+            header_len = len(ENC_MAGIC)
+            kdf_id = combined[header_len]
+            rest = combined[header_len + 1:]
+            if len(rest) < 28:
+                raise ValueError("Invalid file format")
+            salt, iv, ct = rest[:16], rest[16:28], rest[28:]
+        else:
+            # Legacy format: no magic, no kdf_id byte -> always PBKDF2.
+            if len(combined) < 28:
+                raise ValueError("Invalid file format")
+            kdf_id = KDF_PBKDF2
+            salt, iv, ct = combined[:16], combined[16:28], combined[28:]
+
+        key = bytearray(self.derive_key(password, salt, kdf_id))
+        locked = try_mlock(key)
+        try:
+            return AESGCM(bytes(key)).decrypt(iv, ct, None)
+        finally:
+            secure_zero(key)
+            if locked:
+                try_munlock(key)
+
+    # ---------- Streaming file encryption (audit item #3) ----------
+    def _stream_encrypt_file(self, in_path, out_path, password, progress_cb=None):
+        """Chunk-encrypt in_path -> out_path without loading the whole file
+        into memory. Returns the sha256 hexdigest of the plaintext (computed
+        on the fly) so it can be compared post-decrypt for verification
+        instead of re-reading the (potentially huge) original into RAM."""
+        kdf_id = KDF_ARGON2ID if ARGON2_AVAILABLE else KDF_PBKDF2
+        salt = os.urandom(16)
+        base_nonce = os.urandom(8)
+        key = bytearray(self.derive_key(password, salt, kdf_id))
+        locked = try_mlock(key)
+        hasher = hashlib.sha256()
+        total = os.path.getsize(in_path)
+        done = 0
+        try:
+            aesgcm = AESGCM(bytes(key))
+            with open(in_path, "rb") as fin, open(out_path, "wb") as fout:
+                fout.write(STREAM_MAGIC)
+                fout.write(bytes([kdf_id]))
+                fout.write(salt)
+                fout.write(base_nonce)
+                counter = 0
+                chunk = fin.read(STREAM_CHUNK_SIZE)
+                hasher.update(chunk)
+                while True:
+                    next_chunk = fin.read(STREAM_CHUNK_SIZE)
+                    is_final = (len(next_chunk) == 0)
+                    if not is_final:
+                        hasher.update(next_chunk)
+                    nonce = base_nonce + counter.to_bytes(4, "big")
+                    aad = counter.to_bytes(8, "big") + (b"\x01" if is_final else b"\x00")
+                    ct = aesgcm.encrypt(nonce, chunk, aad)
+                    fout.write(len(ct).to_bytes(4, "big"))
+                    fout.write(ct)
+                    done += len(chunk)
+                    if progress_cb:
+                        progress_cb(done, total)
+                    counter += 1
+                    if is_final:
+                        break
+                    chunk = next_chunk
+        finally:
+            secure_zero(key)
+            if locked:
+                try_munlock(key)
+        return hasher.hexdigest()
+
+    def _stream_decrypt_file(self, in_path, out_path, password, progress_cb=None):
+        """Chunk-decrypt in_path -> out_path (or hash-only if out_path is
+        None) without loading the whole file into memory. Returns the
+        sha256 hexdigest of the recovered plaintext."""
+        with open(in_path, "rb") as fin:
+            magic = fin.read(len(STREAM_MAGIC))
+            if magic != STREAM_MAGIC:
+                raise ValueError("Not a streamed-format encrypted file")
+            kdf_id = fin.read(1)[0]
+            salt = fin.read(16)
+            base_nonce = fin.read(8)
+            if len(salt) != 16 or len(base_nonce) != 8:
+                raise ValueError("Invalid file format")
+
+            key = bytearray(self.derive_key(password, salt, kdf_id))
+            locked = try_mlock(key)
+            hasher = hashlib.sha256()
+            total = os.path.getsize(in_path)
+            fout = open(out_path, "wb") if out_path else None
+            try:
+                aesgcm = AESGCM(bytes(key))
+                counter = 0
+                while True:
+                    len_bytes = fin.read(4)
+                    if len(len_bytes) < 4:
+                        raise ValueError("Truncated encrypted file")
+                    ct_len = int.from_bytes(len_bytes, "big")
+                    ct = fin.read(ct_len)
+                    if len(ct) < ct_len:
+                        raise ValueError("Truncated encrypted file")
+
+                    # Lookahead: are we at the last chunk? Must match how
+                    # is_final was decided during encryption (see above).
+                    pos_before_next = fin.tell()
+                    next_len_bytes = fin.read(4)
+                    is_final = (len(next_len_bytes) == 0)
+                    if not is_final:
+                        fin.seek(pos_before_next)
+
+                    nonce = base_nonce + counter.to_bytes(4, "big")
+                    aad = counter.to_bytes(8, "big") + (b"\x01" if is_final else b"\x00")
+                    plain = aesgcm.decrypt(nonce, ct, aad)
+                    hasher.update(plain)
+                    if fout:
+                        fout.write(plain)
+                    if progress_cb:
+                        progress_cb(fin.tell(), total)
+                    counter += 1
+                    if is_final:
+                        break
+            finally:
+                secure_zero(key)
+                if locked:
+                    try_munlock(key)
+                if fout:
+                    fout.close()
+        return hasher.hexdigest()
+
+    def _shred_original_after_verified_encrypt(self, path):
+        """Shred `path` (the just-encrypted original) after the caller has
+        already verified the ciphertext decrypts back correctly. Returns
+        (status_msg, status_fg, warning_shown) — never raises; on a secure-
+        overwrite failure it asks the user whether to delete anyway."""
+        try:
+            result = self.shred_file(path)
+        except OverwriteFailedError:
+            delete_anyway = messagebox.askyesno(
+                "Secure overwrite failed",
+                "The original file's secure overwrite failed, so it was left "
+                "in place rather than deleted unverified.\n\n"
+                "Delete the original anyway WITHOUT a secure overwrite?"
+            )
+            if not delete_anyway:
+                return ("Encrypted & verified. Original kept (secure overwrite failed).",
+                        self.theme["warning"], False)
+            result = self.shred_file(path, delete_on_overwrite_failure=True)
+
+        if result == "fallback":
+            messagebox.showwarning(
+                "Deletion not fully verified",
+                "The original file was removed, but the secure multi-pass overwrite "
+                "could not be confirmed. Consider a dedicated secure-erase tool for "
+                "highly sensitive data."
+            )
+            return ("Encrypted & verified. Original deleted (overwrite could not be confirmed).",
+                    self.theme["warning"], True)
+        return ("Encryption complete. Original securely shredded after verification. "
+                "(Overwrite isn't guaranteed on SSDs/COW filesystems.)",
+                self.theme["success"], False)
 
     def encrypt_file(self):
         path = self.enc_file_path.get()
@@ -1919,15 +2322,16 @@ class PasswordUtilityApp:
         self.root.update()
 
         try:
+            size = os.path.getsize(path)
+
+            if size > STREAM_SIZE_THRESHOLD:
+                self._encrypt_file_streaming(path, pwd)
+                return
+
             with open(path, "rb") as f:
                 data = f.read()
 
-            salt = os.urandom(16)
-            iv = os.urandom(12)
-            key = self.derive_key(pwd, salt)
-            aesgcm = AESGCM(key)
-            ct = aesgcm.encrypt(iv, data, None)
-            combined = salt + iv + ct
+            combined = self._encrypt_blob(pwd, data)
             b64 = base64.b64encode(combined).decode("ascii")
 
             self.last_encrypted_b64 = b64
@@ -1950,22 +2354,9 @@ class PasswordUtilityApp:
             if self.shred_after_enc_var.get():
                 try:
                     # Verify the ciphertext actually decrypts back before touching the original.
-                    verify_key = self.derive_key(pwd, salt)
-                    decrypted_back = AESGCM(verify_key).decrypt(iv, ct, None)
+                    decrypted_back = self._decrypt_blob(pwd, combined)
                     if decrypted_back == data:
-                        result = self.shred_file(path)
-                        if result == "fallback":
-                            status_msg = "Encrypted & verified. Original deleted (overwrite could not be confirmed)."
-                            status_fg = self.theme["warning"]
-                            messagebox.showwarning(
-                                "Deletion not fully verified",
-                                "The original file was removed, but the secure multi-pass overwrite "
-                                "could not be confirmed. Consider a dedicated secure-erase tool for "
-                                "highly sensitive data."
-                            )
-                        else:
-                            status_msg = ("Encryption complete. Original securely shredded after verification. "
-                                          "(Overwrite isn't guaranteed on SSDs/COW filesystems.)")
+                        status_msg, status_fg, _ = self._shred_original_after_verified_encrypt(path)
                     else:
                         status_msg = "Encrypted, but verification failed \u2014 original was NOT deleted."
                         status_fg = self.theme["danger"]
@@ -1974,6 +2365,67 @@ class PasswordUtilityApp:
                     status_fg = self.theme["warning"]
 
             self.enc_status.config(text=status_msg, fg=status_fg)
+        except Exception as e:
+            self.enc_status.config(text=f"Error: {str(e)}", fg=self.theme["danger"])
+            messagebox.showerror("Error", str(e))
+
+    def _encrypt_file_streaming(self, path, pwd):
+        """Large-file path (audit item #3): encrypts chunk-by-chunk straight
+        to disk, so the plaintext is never fully materialized in RAM. No
+        clipboard-copy preview is offered here (there's nothing sane to
+        preview/copy for a multi-hundred-MB blob) — the output is written
+        directly to a file the user picks."""
+        out_path = filedialog.asksaveasfilename(
+            title="Save encrypted file (large file \u2014 streamed)",
+            defaultextension=".enc",
+            filetypes=[("Encrypted files", "*.enc"), ("All files", "*.*")],
+            initialfile=Path(path).name + ".enc"
+        )
+        if not out_path:
+            self.enc_status.config(text="Cancelled.", fg=self.theme["text_secondary"])
+            return
+
+        self.last_encrypted_b64 = None
+        self.last_encrypted_filename = None
+        self.enc_copy_btn.config(state=tk.DISABLED)
+        self.enc_save_btn.config(state=tk.DISABLED)
+        self.enc_result_text.config(state=tk.NORMAL)
+        self.enc_result_text.delete(1.0, tk.END)
+        self.enc_result_text.insert(
+            tk.END,
+            f"[File is {os.path.getsize(path):,} bytes \u2014 encrypted via streaming, "
+            f"too large to preview or copy. Written directly to:\n{out_path}]\n"
+        )
+        self.enc_result_text.config(state=tk.DISABLED)
+
+        try:
+            self.enc_status.config(text="Encrypting (streaming)\u2026", fg=self.theme["accent"])
+            self.root.update()
+            original_hash = self._stream_encrypt_file(path, out_path, pwd)
+            self._restrict_file_permissions(out_path)
+
+            status_msg = f"Encrypted (streamed). Saved: {out_path}"
+            status_fg = self.theme["success"]
+
+            if self.shred_after_enc_var.get():
+                self.enc_status.config(text="Verifying before shred\u2026", fg=self.theme["accent"])
+                self.root.update()
+                try:
+                    # Memory-safe verification: stream-decrypt and hash
+                    # rather than loading the whole plaintext back into RAM.
+                    check_hash = self._stream_decrypt_file(out_path, None, pwd)
+                    if check_hash == original_hash:
+                        status_msg, status_fg, _ = self._shred_original_after_verified_encrypt(path)
+                        status_msg = f"Encrypted (streamed) to {out_path}. {status_msg}"
+                    else:
+                        status_msg = "Encrypted, but verification failed \u2014 original was NOT deleted."
+                        status_fg = self.theme["danger"]
+                except Exception as e:
+                    status_msg = f"Encrypted, but shred step failed: {e}"
+                    status_fg = self.theme["warning"]
+
+            self.enc_status.config(text=status_msg, fg=status_fg)
+            messagebox.showinfo("Done", status_msg)
         except Exception as e:
             self.enc_status.config(text=f"Error: {str(e)}", fg=self.theme["danger"])
             messagebox.showerror("Error", str(e))
@@ -2007,20 +2459,37 @@ class PasswordUtilityApp:
         if not path or not pwd:
             return
 
+        if not path.lower().endswith(".enc"):
+            if not messagebox.askyesno(
+                "Unexpected extension",
+                "This file doesn't end in .enc, so it may not be a file this app "
+                "produced. Try to decrypt it anyway?"
+            ):
+                return
+
         self.dec_status.config(text="Decrypting\u2026", fg=self.theme["accent"])
         self.root.update()
 
         try:
+            with open(path, "rb") as f:
+                head = f.read(len(STREAM_MAGIC))
+            if head == STREAM_MAGIC:
+                self._decrypt_file_streaming(path, pwd)
+                return
+
             with open(path, "r", encoding="ascii") as f:
                 b64 = f.read().strip()
 
             combined = base64.b64decode(b64)
-            if len(combined) < 28:
-                raise ValueError("Invalid file format")
-
-            salt, iv, ct = combined[:16], combined[16:28], combined[28:]
-            key = self.derive_key(pwd, salt)
-            plain = AESGCM(key).decrypt(iv, ct, None)
+            try:
+                plain = self._decrypt_blob(pwd, combined)
+            except ValueError as e:
+                # Passphrase-length guard or missing-Argon2 guard from
+                # derive_key() — distinct, user-actionable errors, not
+                # "wrong password or corrupt file".
+                self.dec_status.config(text=f"Error: {e}", fg=self.theme["danger"])
+                messagebox.showerror("Error", str(e))
+                return
 
             out_path = filedialog.asksaveasfilename(
                 defaultextension="", filetypes=[("All files", "*.*")], initialfile=Path(path).stem
@@ -2034,6 +2503,40 @@ class PasswordUtilityApp:
         except Exception:
             self.dec_status.config(text="Error: wrong password or corrupt file", fg=self.theme["danger"])
             messagebox.showerror("Error", "Decryption failed. Wrong password or corrupt file.")
+
+    def _decrypt_file_streaming(self, path, pwd):
+        """Large-file counterpart to _encrypt_file_streaming: decrypts
+        chunk-by-chunk straight to the chosen output file."""
+        default_name = Path(path).stem if Path(path).suffix.lower() == ".enc" else Path(path).name
+        out_path = filedialog.asksaveasfilename(
+            title="Save decrypted file (large file \u2014 streamed)",
+            defaultextension="", filetypes=[("All files", "*.*")], initialfile=default_name
+        )
+        if not out_path:
+            self.dec_status.config(text="Cancelled.", fg=self.theme["text_secondary"])
+            return
+        try:
+            self.dec_status.config(text="Decrypting (streaming)\u2026", fg=self.theme["accent"])
+            self.root.update()
+            self._stream_decrypt_file(path, out_path, pwd)
+            self._restrict_file_permissions(out_path)
+            self.dec_status.config(text=f"Saved: {out_path}", fg=self.theme["success"])
+            messagebox.showinfo("Success", f"File decrypted and saved.\n\n{out_path}")
+        except ValueError as e:
+            self.dec_status.config(text=f"Error: {e}", fg=self.theme["danger"])
+            messagebox.showerror("Error", str(e))
+        except Exception:
+            # Includes AESGCM auth failures (wrong password / corrupted/
+            # tampered chunk) — don't leave a partially-written output file
+            # around implying success.
+            try:
+                if os.path.exists(out_path):
+                    os.remove(out_path)
+            except Exception:
+                pass
+            self.dec_status.config(text="Error: wrong password or corrupt file", fg=self.theme["danger"])
+            messagebox.showerror("Error", "Decryption failed. Wrong password or corrupt file.")
+
 
     # ---------- Manual shred ----------
     def browse_shred_file(self):
@@ -2055,7 +2558,25 @@ class PasswordUtilityApp:
         self.shred_status.config(text="Shredding\u2026", fg=self.theme["accent"])
         self.root.update()
         try:
-            result = self.shred_file(path)
+            try:
+                result = self.shred_file(path)
+            except OverwriteFailedError:
+                delete_anyway = messagebox.askyesno(
+                    "Secure overwrite failed",
+                    "The multi-pass overwrite could not be completed (e.g. read-only "
+                    "filesystem or permissions issue), so the file was left in place "
+                    "rather than deleted unverified.\n\n"
+                    "Delete it anyway WITHOUT a secure overwrite? The data may remain "
+                    "recoverable on disk if you choose this."
+                )
+                if not delete_anyway:
+                    self.shred_status.config(
+                        text="Not deleted \u2014 secure overwrite failed.",
+                        fg=self.theme["danger"]
+                    )
+                    return
+                result = self.shred_file(path, delete_on_overwrite_failure=True)
+
             if result == "fallback":
                 self.shred_status.config(
                     text="Deleted, but secure overwrite could not be confirmed.",
@@ -2075,8 +2596,18 @@ class PasswordUtilityApp:
             self.shred_status.config(text=f"Error: {str(e)}", fg=self.theme["danger"])
             messagebox.showerror("Error", str(e))
 
-    def shred_file(self, path, passes=3):
-        """Securely shred a file. Returns 'secure' or 'fallback'."""
+    def shred_file(self, path, passes=3, delete_on_overwrite_failure=False):
+        """Securely shred a file: multi-pass random overwrite + zero pass,
+        then delete. Returns 'secure' on success.
+
+        If the overwrite step fails (read-only FS, permissions, I/O error),
+        the file is left in place and OverwriteFailedError is raised instead
+        of being deleted unverified-secure — deleting a file whose secure
+        overwrite could not be confirmed is a silent downgrade to a plain
+        `rm`, not a shred, and callers should decide (typically by asking
+        the user) whether that's acceptable rather than have it happen
+        implicitly. Pass delete_on_overwrite_failure=True to opt into a
+        plain delete after a failed overwrite (returns 'fallback')."""
         if not os.path.exists(path):
             raise FileNotFoundError(f"File not found: {path}")
         if os.path.isdir(path):
@@ -2084,6 +2615,7 @@ class PasswordUtilityApp:
 
         size = os.path.getsize(path)
         overwrite_ok = True
+        overwrite_error = None
 
         if size > 0:
             try:
@@ -2112,8 +2644,16 @@ class PasswordUtilityApp:
                         os.fsync(f.fileno())
                     except OSError:
                         pass
-            except Exception:
+            except Exception as e:
                 overwrite_ok = False
+                overwrite_error = e
+
+        if not overwrite_ok and not delete_on_overwrite_failure:
+            # Do NOT delete: the file may still contain recoverable
+            # plaintext/key material. Leave it for the caller to handle.
+            raise OverwriteFailedError(
+                f"Secure overwrite failed ({overwrite_error}); file left in place: {path}"
+            )
 
         try:
             if sys.platform == "win32":
