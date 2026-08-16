@@ -9,12 +9,14 @@ Everything happens in two tabs: **Password Generator** and **File Protector**.
 ✨ **Key Features**
 
 1. **High-Entropy Generation** — Generate 1 to 10,000 passwords at once, 8–128 characters long, drawn from a pool of 400+ unique Unicode characters across Latin, Latin Extended, Cyrillic, CJK & Kana, Greek, Math & Symbols, and Box Drawing sets — plus a bonus **"Source Code (this file)"** set built live from every unique character in the script itself.
-2. **Live Strength Feedback** — Pool size, Shannon entropy (bits), and a strength rating update in real time as you toggle character sets and adjust length.
-3. **Authenticated File Encryption** — AES-256-GCM (via the `cryptography` library's AEAD primitive) with a key derived by PBKDF2-HMAC-SHA256 at 600,000 iterations, a fresh 16-byte salt and 12-byte nonce per file. Output is a portable Base64-encoded `.enc` file.
-4. **One-Click "Encrypt & Shred"** — From the Generator tab, save your password list, encrypt it with a passphrase, and — only *after* the ciphertext is verified to decrypt back to the exact original bytes — securely shred the plaintext copy.
-5. **General File Protector** — Encrypt or decrypt *any* file, not just password lists, with an optional "verify, then shred the original" checkbox.
-6. **Secure Shredding, No External Tools Required** — A pure Python multi-pass overwrite (3 random-data passes + 1 zero pass, `fsync`'d between each) followed by deletion. Works identically on Windows/Linux/macOS with no dependency on the Unix `shred` binary, and reports whether the overwrite was verified ("secure") or only the delete could be confirmed ("fallback").
-7. **Clipboard Security**
+2. **Live Strength Feedback** — Pool size, Shannon entropy (bits), and a strength rating update in real time as you toggle character sets and adjust length. Passphrases you type in for encryption get the same live entropy estimate, inferred from which character classes (lower/upper/digit/symbol/Unicode) are present.
+3. **Authenticated File Encryption** — AES-256-GCM (via the `cryptography` library's AEAD primitive). Keys are derived with **Argon2id by default** (64 MiB memory, 3 iterations, 4 lanes — OWASP's interactive baseline), automatically falling back to PBKDF2-HMAC-SHA256 at 600,000 iterations on older installs of `cryptography` that don't have Argon2id. A fresh random salt and nonce are generated per file, and the app transparently decrypts older files that were encrypted with PBKDF2. Output is a portable Base64-encoded `.enc` file.
+4. **Streaming Encryption for Large Files** — Files above 20 MB are encrypted/decrypted in 4 MiB chunks instead of being loaded into RAM whole, so large files don't stall the UI or risk an out-of-memory error. Each chunk is independently authenticated (its own nonce plus AAD binding its position and whether it's the final chunk), so chunks can't be reordered, dropped, or appended to without detection. Smaller files still use the original single-shot container that also backs the clipboard copy/paste flow.
+5. **One-Click "Encrypt & Shred"** — From the Generator tab, save your password list, encrypt it with a passphrase, and — only *after* the ciphertext is verified to decrypt back to the exact original bytes — securely shred the plaintext copy.
+6. **General File Protector** — Encrypt or decrypt *any* file, not just password lists, with an optional "verify, then shred the original" checkbox.
+7. **Secure Shredding, No External Tools Required** — A pure Python multi-pass overwrite (3 random-data passes + 1 zero pass, `fsync`'d between each) followed by deletion. Works identically on Windows/Linux/macOS with no dependency on the Unix `shred` binary, and reports whether the overwrite was verified ("secure") or only the delete could be confirmed ("fallback").
+8. **Best-Effort Secure Memory Handling** — Sensitive values (passphrases, key material) are handled as mutable `bytearray`s rather than immutable `str`s wherever possible, so they can be explicitly zeroed the moment they're no longer needed. The app also attempts to `mlock()`/`VirtualLock()` those buffers so the OS is less likely to swap them to disk. Both are defense-in-depth, not guarantees — Tkinter's own password entry field is still backed by an ordinary string internally, though it's cleared proactively (auto-clear timers, app close) rather than left populated.
+9. **Clipboard Security**
 
 UNIGEN implements platform-native clipboard exclusion to prevent passwords and encrypted data from being stored by clipboard-history tools:
 
@@ -30,10 +32,7 @@ UNIGEN implements platform-native clipboard exclusion to prevent passwords and e
 Enable **Auto-clear clipboard after N seconds** on either tab to automatically wipe the clipboard after a configurable delay (5–300s). The timer only clears content that still matches what UNIGEN copied — if you copy something else in the meantime, it is left untouched.
 
 ### Manual Wipe
-Click **Clear Clipboard** on either tab to immediately wipe the system clipboard through Tkinter *and* OS-native fallbacks (`EmptyClipboard` on Windows, `pbcopy` on macOS, `xclip`/`xsel`/`wl-copy` on Linux), plus clearing any text selection in the app window.
-This is best-effort — there's no single cross-desktop standard, so e.g. plain GNOME clipboard extensions will still see it — but it degrades gracefully to a normal copy everywhere, and the status line tells you honestly whether exclusion succeeded.
-
-**One-Click Clipboard Wipe** — A "Clear Clipboard" button on both tabs clears the OS clipboard through Tkinter *and* a native fallback (`EmptyClipboard` via ctypes on Windows, `pbcopy` on macOS, `xclip`/`xsel`/`wl-copy` on Linux) so nothing lingers after you're done.
+Click **Clear Clipboard** on either tab to immediately wipe the system clipboard through Tkinter *and* OS-native fallbacks (`EmptyClipboard` on Windows, `pbcopy` on macOS, `xclip`/`xsel`/`wl-copy` on Linux), plus clearing any text selection in the app window. This is best-effort — there's no single cross-desktop standard, so e.g. plain GNOME clipboard extensions will still see it — but it degrades gracefully to a normal copy everywhere, and the status line tells you honestly whether exclusion succeeded.
 
 ### **Dark / Light Theme**
 
@@ -47,7 +46,7 @@ This is best-effort — there's no single cross-desktop standard, so e.g. plain 
   sudo apt install python3-tk      # Debian/Ubuntu
   sudo dnf install python3-tkinter # Fedora
   ```
-- The `cryptography` library (only needed for the File Protector tab — the Password Generator tab works without it).
+- The `cryptography` library (only needed for the File Protector tab — the Password Generator tab works without it). Version 42.0+ enables Argon2id key derivation; older versions transparently fall back to PBKDF2-HMAC-SHA256 for new encryptions.
 - *(Optional, Linux only)* `xclip` for full clipboard-manager exclusion when copying passwords; `xsel` or `wl-copy` also work as plain-copy fallbacks but don't support the exclusion hint.
 
 🚀 **Installation**
@@ -82,15 +81,16 @@ This opens the UNIGEN window, sized to fit your screen without scrolling.
    - **Clear Clipboard** — wipes the clipboard immediately.
 
 **File Protector tab**
-- **Encrypt File** (left) — browse to any file, enter a passphrase (min 8 characters), optionally check "verify, then securely shred the original after encryption", and click **Encrypt**. The result is shown as Base64 and can be copied or saved as a `.enc` file.
-- **Decrypt File** (top right) — browse to a `.enc` file, enter the passphrase, and click **Decrypt & Save** to restore the original bytes to a location you choose.
+- **Encrypt File** (left) — browse to any file, enter a passphrase (min 8 characters, live entropy estimate shown), optionally check "verify, then securely shred the original after encryption", and click **Encrypt**. Small files are shown as Base64 and can be copied or saved as a `.enc` file; files over 20 MB are streamed straight to the output file. The KDF used (Argon2id or PBKDF2) is recorded in the file header, so both are always readable later.
+- **Decrypt File** (top right) — browse to a `.enc` file, enter the passphrase, and click **Decrypt & Save** to restore the original bytes to a location you choose. Works for files produced by either KDF, including legacy files from older versions of the app.
 - **Manual Secure Shred** (bottom right) — browse to any file and permanently destroy it with the same multi-pass overwrite used elsewhere, independent of encryption.
 - **Clear Clipboard** is also available here.
 
 🔒 **Security Notes**
 
-- **Passphrase strength is everything.** UNIGEN enforces only a minimum length (8 characters); the real security of an encrypted file rests entirely on how strong and unique your passphrase is.
-- **Encryption**: AES-256-GCM gives you authenticated encryption (confidentiality *and* integrity — tampering with the ciphertext causes decryption to fail rather than silently returning corrupted data). Keys are derived per-file with PBKDF2-HMAC-SHA256 at 600,000 iterations and a random 16-byte salt, so the same passphrase never produces the same key twice.
+- **Passphrase strength is everything.** UNIGEN enforces only a minimum length (8 characters) and shows a live entropy estimate as you type; the real security of an encrypted file rests entirely on how strong and unique your passphrase is.
+- **Encryption**: AES-256-GCM gives you authenticated encryption (confidentiality *and* integrity — tampering with the ciphertext causes decryption to fail rather than silently returning corrupted data). Keys are derived per-file with Argon2id (64 MiB, 3 iterations, 4 lanes) when available, or PBKDF2-HMAC-SHA256 at 600,000 iterations otherwise, always with a fresh random salt — so the same passphrase never produces the same key twice. Large files are encrypted in independently-authenticated 4 MiB chunks so nothing can be reordered or truncated undetected.
+- **Memory handling**: passphrases and key material are kept in zeroable `bytearray`s and best-effort locked out of swap where the OS allows it, rather than lingering as ordinary Python strings. This reduces, but — given Tkinter and CPython's constraints — cannot fully eliminate, the window in which secrets could be recovered from memory or swap.
 - **Shredding**: the multi-pass overwrite makes recovery via standard file-recovery tools impractical on traditional storage, but on SSDs, copy-on-write filesystems (Btrfs, ZFS, APFS), or filesystems with snapshots/journaling, overwritten data can persist elsewhere on the device regardless of what any application does. Treat shredding as a strong best-effort, not an absolute guarantee — for maximum assurance, use full-disk encryption as your baseline.
 
 📄 **License**
