@@ -31,12 +31,15 @@ Enable **Auto-clear clipboard after N seconds** on either tab to automatically w
 
 ### Manual Wipe
 Click **Clear Clipboard** on either tab to immediately wipe the system clipboard through Tkinter *and* OS-native fallbacks (`EmptyClipboard` on Windows, `pbcopy` on macOS, `xclip`/`xsel`/`wl-copy` on Linux), plus clearing any text selection in the app window.
+This is best-effort — there's no single cross-desktop standard, so e.g. plain GNOME clipboard extensions will still see it — but it degrades gracefully to a normal copy everywhere, and the status line tells you honestly whether exclusion succeeded.
 
-   This is best-effort — there's no single cross-desktop standard, so e.g. plain GNOME clipboard extensions will still see it — but it degrades gracefully to a normal copy everywhere, and the status line tells you honestly whether exclusion succeeded.
-8. **One-Click Clipboard Wipe** — A "Clear Clipboard" button on both tabs clears the OS clipboard through Tkinter *and* a native fallback (`EmptyClipboard` via ctypes on Windows, `pbcopy` on macOS, `xclip`/`xsel`/`wl-copy` on Linux) so nothing lingers after you're done.
-9. **Dark / Light Theme** — Toggle in the header; the whole UI (including scrollbars and progress bars) re-themes instantly.
+**One-Click Clipboard Wipe** — A "Clear Clipboard" button on both tabs clears the OS clipboard through Tkinter *and* a native fallback (`EmptyClipboard` via ctypes on Windows, `pbcopy` on macOS, `xclip`/`xsel`/`wl-copy` on Linux) so nothing lingers after you're done.
 
-🛠 **Prerequisites**
+### **Dark / Light Theme**
+
+- Toggle in the header; the whole UI (including scrollbars and progress bars) re-themes instantly.
+
+### 🛠 **Prerequisites**
 
 - Python 3.8+
 - Tkinter — bundled with the standard Python installer on Windows and macOS. On Linux it's often a separate package:
