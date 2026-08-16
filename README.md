@@ -46,7 +46,17 @@ Click **Clear Clipboard** on either tab to immediately wipe the system clipboard
   sudo apt install python3-tk      # Debian/Ubuntu
   sudo dnf install python3-tkinter # Fedora
   ```
-- The `cryptography` library (only needed for the File Protector tab — the Password Generator tab works without it). Version 42.0+ enables Argon2id key derivation; older versions transparently fall back to PBKDF2-HMAC-SHA256 for new encryptions.
+- The `cryptography` library (only needed for the File Protector tab — the Password Generator tab works without it). **Version 42.0+ is required for Argon2id key derivation** — that's the release Argon2id was added to the library (implemented in its Rust backend, so no separate system package like `libargon2-dev` is needed on Linux). Older versions transparently fall back to PBKDF2-HMAC-SHA256 for new encryptions.
+
+  Check your installed version:
+  ```
+  python3 -c "import cryptography; print(cryptography.__version__)"
+  ```
+  Upgrade if needed:
+  ```
+  pip install --upgrade cryptography
+  ```
+  Once `cryptography>=42.0` is installed, UNIGEN detects it automatically and uses Argon2id by default for all new encryptions, while still being able to decrypt older `.enc` files that were encrypted with PBKDF2.
 - *(Optional, Linux only)* `xclip` for full clipboard-manager exclusion when copying passwords; `xsel` or `wl-copy` also work as plain-copy fallbacks but don't support the exclusion hint.
 
 🚀 **Installation**
