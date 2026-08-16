@@ -20,6 +20,7 @@ import subprocess
 import shutil
 import time
 import hashlib
+import threading
 from pathlib import Path
 
 try:
@@ -411,6 +412,7 @@ class PasswordUtilityApp:
         self.active_tab = "gen"
         self.generated_passwords = []
         self.gen_running = False
+        self._busy_ops = set()  # M-3: guards against double-triggering the
         self.last_encrypted_b64 = None
         self.last_encrypted_filename = None
         self.last_saved_password_path = None
@@ -837,7 +839,23 @@ class PasswordUtilityApp:
                 )
                 return True, ""
             except Exception:
-                pass
+                # L-3: not every xclip build/version accepts a comma-joined
+                # multi-target list (it's not part of xclip's documented,
+                # stable interface — some versions only honour the first
+                # target given via -t). Rather than silently dropping to
+                # xsel/wl-copy (losing the exclusion hint entirely even on
+                # a KDE system where it would have worked), retry with a
+                # single plain UTF8_STRING target, which every xclip build
+                # supports. This still copies correctly; it just won't be
+                # hidden from clipboard history on this particular build.
+                try:
+                    subprocess.run(
+                        ["xclip", "-selection", "clipboard", "-t", "UTF8_STRING", "-in"],
+                        input=data, check=True, timeout=2.0
+                    )
+                    return True, "xclip didn't accept the multi-target list \u2014 copied without the exclusion hint."
+                except Exception:
+                    pass
 
         # xsel has no multi-target flag, so it can only offer plain text —
         # still copies correctly, just without the exclusion hint.
@@ -908,7 +926,7 @@ class PasswordUtilityApp:
             except Exception as e:
                 errors.append(f"pbcopy: {e}")
         else:  # Linux / *BSD
-            # Try xclip first, then xsel
+            # Try xclip first, then xsel, for the CLIPBOARD selection.
             cleared = False
             for cmd in (["xclip", "-selection", "clipboard", "-in"],
                         ["xsel", "--clipboard", "--input"]):
@@ -919,6 +937,21 @@ class PasswordUtilityApp:
                         break
                     except Exception as e:
                         errors.append(f"{cmd[0]}: {e}")
+
+            # self.root.selection_clear() above only clears Tkinter's own
+            # notion of the PRIMARY selection, not the X server's, so a
+            # password copied earlier can still be pasted with middle-click
+            # even after this. Explicitly overwrite PRIMARY too via
+            # xclip/xsel so middle-click paste can't leak it.
+            for cmd in (["xclip", "-selection", "primary", "-in"],
+                        ["xsel", "--primary", "--input"]):
+                if shutil.which(cmd[0]):
+                    try:
+                        subprocess.run(cmd, input=b"", check=True, timeout=2.0)
+                    except Exception as e:
+                        errors.append(f"{cmd[0]} (primary): {e}")
+                    break
+
             if not cleared:
                 # Last resort: try wl-copy (Wayland)
                 if shutil.which("wl-copy"):
@@ -1880,7 +1913,7 @@ class PasswordUtilityApp:
         if count > 100:
             self.progress.pack(fill=tk.X, pady=(8, 3))
             self.prog_label.pack(anchor=tk.W)
-            self.root.update()
+            self.root.update_idletasks()
 
         self.generated_passwords = []
         chunk = max(1, count // 100)
@@ -1913,6 +1946,25 @@ class PasswordUtilityApp:
             return
         text = "\n".join(self.generated_passwords)
         self.copy_to_clipboard(text, status_label=self.gen_copy_status)
+
+    @staticmethod
+    def _fsync_dir(path):
+        """Best-effort: fsync the parent directory of `path`. os.fsync() on
+        the file itself only guarantees the file's *data* is durable;
+        without also fsyncing the directory, the file's directory-entry
+        (name -> inode mapping) can still be lost on a crash right after
+        creation, leaving the file missing or the rename not applied. No-op
+        on platforms/filesystems that don't support it (e.g. Windows) or on
+        any other failure — this is defense-in-depth, not a guarantee."""
+        try:
+            dir_path = os.path.dirname(os.path.abspath(path)) or "."
+            fd = os.open(dir_path, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        except Exception:
+            pass
 
     @staticmethod
     def _restrict_file_permissions(path):
@@ -1976,13 +2028,24 @@ class PasswordUtilityApp:
         )
         if path:
             try:
-                with open(path, "w", encoding="utf-8") as f:
+                tmp_path = path + ".tmp"
+                with open(tmp_path, "w", encoding="utf-8") as f:
                     f.write("\n".join(self.generated_passwords))
+                    f.flush()
+                    os.fsync(f.fileno())
+                self._restrict_file_permissions(tmp_path)
+                os.replace(tmp_path, path)
+                self._fsync_dir(path)
                 self._restrict_file_permissions(path)
                 self.last_saved_password_path = path
                 self.encrypt_shred_btn.config(state=tk.NORMAL)
                 messagebox.showinfo("Saved", f"Saved to:\n{path}")
             except Exception as e:
+                try:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                except Exception:
+                    pass
                 messagebox.showerror("Error", str(e))
 
     # ---------- One-click: encrypt the saved password list, then shred original ----------
@@ -2203,7 +2266,17 @@ class PasswordUtilityApp:
         """Chunk-encrypt in_path -> out_path without loading the whole file
         into memory. Returns the sha256 hexdigest of the plaintext (computed
         on the fly) so it can be compared post-decrypt for verification
-        instead of re-reading the (potentially huge) original into RAM."""
+        instead of re-reading the (potentially huge) original into RAM.
+
+        Writes to a `.tmp` sibling of out_path and os.replace()s it into
+        place only once the whole ciphertext is flushed and fsynced, so a
+        crash or power loss mid-write can never leave a truncated/corrupt
+        file sitting at out_path — either the old out_path (if any) survives
+        untouched, or the complete new file does. The parent directory is
+        then fsynced too, since fsyncing the file alone doesn't guarantee
+        the rename itself survives a crash."""
+        if out_path is not None and os.path.abspath(in_path) == os.path.abspath(out_path):
+            raise ValueError("Input and output paths must be different")
         kdf_id = KDF_ARGON2ID if ARGON2_AVAILABLE else KDF_PBKDF2
         salt = os.urandom(16)
         base_nonce = os.urandom(8)
@@ -2212,9 +2285,10 @@ class PasswordUtilityApp:
         hasher = hashlib.sha256()
         total = os.path.getsize(in_path)
         done = 0
+        tmp_path = out_path + ".tmp"
         try:
             aesgcm = AESGCM(bytes(key))
-            with open(in_path, "rb") as fin, open(out_path, "wb") as fout:
+            with open(in_path, "rb") as fin, open(tmp_path, "wb") as fout:
                 fout.write(STREAM_MAGIC)
                 fout.write(bytes([kdf_id]))
                 fout.write(salt)
@@ -2243,6 +2317,15 @@ class PasswordUtilityApp:
                     chunk = next_chunk
                 fout.flush()
                 os.fsync(fout.fileno())
+            os.replace(tmp_path, out_path)
+            self._fsync_dir(out_path)
+        except Exception:
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
+            raise
         finally:
             secure_zero(key)
             if locked:
@@ -2253,6 +2336,24 @@ class PasswordUtilityApp:
         """Chunk-decrypt in_path -> out_path (or hash-only if out_path is
         None) without loading the whole file into memory. Returns the
         sha256 hexdigest of the recovered plaintext."""
+        if out_path is not None and os.path.abspath(in_path) == os.path.abspath(out_path):
+            raise ValueError("Input and output paths must be different")
+        tmp_path = (out_path + ".tmp") if out_path else None
+        try:
+            hexdigest = self._stream_decrypt_file_inner(in_path, tmp_path, password, progress_cb)
+        except Exception:
+            try:
+                if tmp_path and os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
+            raise
+        if tmp_path:
+            os.replace(tmp_path, out_path)
+            self._fsync_dir(out_path)
+        return hexdigest
+
+    def _stream_decrypt_file_inner(self, in_path, tmp_path, password, progress_cb=None):
         with open(in_path, "rb") as fin:
             magic = fin.read(len(STREAM_MAGIC))
             if magic != STREAM_MAGIC:
@@ -2270,7 +2371,7 @@ class PasswordUtilityApp:
             locked = try_mlock(key)
             hasher = hashlib.sha256()
             total = os.path.getsize(in_path)
-            fout = open(out_path, "wb") if out_path else None
+            fout = open(tmp_path, "wb") if tmp_path else None
             try:
                 aesgcm = AESGCM(bytes(key))
                 counter = 0
@@ -2293,8 +2394,17 @@ class PasswordUtilityApp:
 
                     # Lookahead: are we at the last chunk? Must match how
                     # is_final was decided during encryption (see above).
+                    # next_len_bytes should be exactly 0 bytes (clean EOF —
+                    # this was the final chunk) or exactly 4 bytes (a real
+                    # next length header). Anything in between (1-3 bytes)
+                    # means the file is truncated right at a chunk boundary;
+                    # reject it explicitly here rather than seeking back and
+                    # letting the next loop iteration's read/length checks
+                    # eventually trip on the leftover partial bytes.
                     pos_before_next = fin.tell()
                     next_len_bytes = fin.read(4)
+                    if len(next_len_bytes) not in (0, 4):
+                        raise ValueError("Truncated encrypted file (partial chunk header)")
                     is_final = (len(next_len_bytes) == 0)
                     if not is_final:
                         fin.seek(pos_before_next)
@@ -2353,6 +2463,63 @@ class PasswordUtilityApp:
                 "(Overwrite isn't guaranteed on SSDs/COW filesystems.)",
                 self.theme["success"], False)
 
+    def _shred_original_after_verified_encrypt_async(self, path, on_done):
+        """Async counterpart to _shred_original_after_verified_encrypt: runs
+        shred_file() on a background thread so shredding a large original
+        file doesn't freeze the UI. Calls on_done(status_msg, status_fg,
+        warning_shown) back on the main thread. The confirmation dialog on
+        an overwrite failure still runs on the main thread (Tk dialogs must
+        be shown from the main thread); only the blocking shred I/O is
+        offloaded."""
+        def do_shred():
+            return self.shred_file(path)
+
+        def on_success(result):
+            self._finish_async_shred_result(result, on_done)
+
+        def on_error(e):
+            if not isinstance(e, OverwriteFailedError):
+                on_done(f"Encrypted, but shred step failed: {e}", self.theme["warning"], False)
+                return
+            delete_anyway = messagebox.askyesno(
+                "Secure overwrite failed",
+                "The original file's secure overwrite failed, so it was left "
+                "in place rather than deleted unverified.\n\n"
+                "Delete the original anyway WITHOUT a secure overwrite?"
+            )
+            if not delete_anyway:
+                on_done("Encrypted & verified. Original kept (secure overwrite failed).",
+                        self.theme["warning"], False)
+                return
+
+            def do_shred2():
+                return self.shred_file(path, delete_on_overwrite_failure=True)
+
+            def on_success2(result2):
+                self._finish_async_shred_result(result2, on_done)
+
+            def on_error2(e2):
+                on_done(f"Encrypted, but shred step failed: {e2}", self.theme["warning"], False)
+
+            self._run_async(do_shred2, on_success2, on_error2)
+
+        self._run_async(do_shred, on_success, on_error)
+
+    def _finish_async_shred_result(self, result, on_done):
+        if result == "fallback":
+            messagebox.showwarning(
+                "Deletion not fully verified",
+                "The original file was removed, but the secure multi-pass overwrite "
+                "could not be confirmed. Consider a dedicated secure-erase tool for "
+                "highly sensitive data."
+            )
+            on_done("Encrypted & verified. Original deleted (overwrite could not be confirmed).",
+                    self.theme["warning"], True)
+        else:
+            on_done("Encryption complete. Original securely shredded after verification. "
+                    "(Overwrite isn't guaranteed on SSDs/COW filesystems.)",
+                    self.theme["success"], False)
+
     def encrypt_file(self):
         path = self.enc_file_path.get()
         pwd = self.enc_pwd_var.get()
@@ -2360,7 +2527,7 @@ class PasswordUtilityApp:
             return
 
         self.enc_status.config(text="Encrypting\u2026", fg=self.theme["accent"])
-        self.root.update()
+        self.root.update_idletasks()
 
         try:
             size = os.path.getsize(path)
@@ -2398,17 +2565,36 @@ class PasswordUtilityApp:
             status_fg = self.theme["success"]
 
             if self.shred_after_enc_var.get():
+                # Verify the ciphertext actually decrypts back before touching the original.
                 try:
-                    # Verify the ciphertext actually decrypts back before touching the original.
                     decrypted_back = self._decrypt_blob(pwd, combined)
-                    if decrypted_back == data:
-                        status_msg, status_fg, _ = self._shred_original_after_verified_encrypt(path)
-                    else:
-                        status_msg = "Encrypted, but verification failed \u2014 original was NOT deleted."
-                        status_fg = self.theme["danger"]
                 except Exception as e:
-                    status_msg = f"Encrypted, but shred step failed: {e}"
-                    status_fg = self.theme["warning"]
+                    self.enc_status.config(text=f"Encrypted, but shred step failed: {e}",
+                                            fg=self.theme["warning"])
+                    return
+                if decrypted_back != data:
+                    self.enc_status.config(
+                        text="Encrypted, but verification failed \u2014 original was NOT deleted.",
+                        fg=self.theme["danger"])
+                    return
+
+                # Audit item #7: even for a small file, the multi-pass
+                # overwrite in shred_file() is blocking disk I/O and can
+                # briefly freeze the UI (worse on a slow/loaded disk right
+                # at the streaming-threshold boundary). Run it off the main
+                # thread like the streaming path already does, instead of
+                # calling the synchronous _shred_original_after_verified_encrypt
+                # here.
+                if not self._busy_start("encrypt_flow_small_shred"):
+                    return
+
+                def on_shred_done(shred_msg, shred_fg, _warned):
+                    self._busy_end("encrypt_flow_small_shred")
+                    self.enc_status.config(text=shred_msg, fg=shred_fg)
+
+                self.enc_status.config(text="Shredding original\u2026", fg=self.theme["accent"])
+                self._shred_original_after_verified_encrypt_async(path, on_shred_done)
+                return
 
             self.enc_status.config(text=status_msg, fg=status_fg)
         except Exception as e:
@@ -2420,7 +2606,13 @@ class PasswordUtilityApp:
         to disk, so the plaintext is never fully materialized in RAM. No
         clipboard-copy preview is offered here (there's nothing sane to
         preview/copy for a multi-hundred-MB blob) — the output is written
-        directly to a file the user picks."""
+        directly to a file the user picks.
+
+        The actual encrypt/verify/shred work runs on a background thread
+        (see _run_async) so a large file doesn't freeze the UI for the
+        whole operation — this was flagged in review since KDF derivation,
+        multi-GB streaming I/O, and a multi-pass shred of the original can
+        together take a long time."""
         out_path = filedialog.asksaveasfilename(
             title="Save encrypted file (large file \u2014 streamed)",
             defaultextension=".enc",
@@ -2430,6 +2622,9 @@ class PasswordUtilityApp:
         if not out_path:
             self.enc_status.config(text="Cancelled.", fg=self.theme["text_secondary"])
             return
+
+        if not self._busy_start("encrypt_flow"):
+            return  # an encrypt is already in flight; ignore the extra click
 
         self.last_encrypted_b64 = None
         self.last_encrypted_filename = None
@@ -2444,38 +2639,87 @@ class PasswordUtilityApp:
         )
         self.enc_result_text.config(state=tk.DISABLED)
 
-        try:
-            self.enc_status.config(text="Encrypting (streaming)\u2026", fg=self.theme["accent"])
-            self.root.update()
-            original_hash = self._stream_encrypt_file(path, out_path, pwd)
-            self._restrict_file_permissions(out_path)
+        # Audit item #10: _stream_encrypt_file accepts progress_cb but it was
+        # never wired up here, so a multi-GB file just showed a static
+        # "Encrypting (streaming)..." label with no indication of progress.
+        # progress_cb runs on the background thread, so it must not touch
+        # Tk widgets directly — hop back to the main thread via root.after.
+        last_pct = {"value": -1}
 
+        def on_progress(done, total):
+            if not total:
+                return
+            pct = int(done * 100 / total)
+            if pct == last_pct["value"]:
+                return
+            last_pct["value"] = pct
+
+            def update_label():
+                try:
+                    self.enc_status.config(text=f"Encrypting (streaming)\u2026 {pct}%")
+                except Exception:
+                    pass
+            self.root.after(0, update_label)
+
+        def do_encrypt():
+            h = self._stream_encrypt_file(path, out_path, pwd, progress_cb=on_progress)
+            self._restrict_file_permissions(out_path)
+            return h
+
+        def on_encrypt_error(e):
+            self._busy_end("encrypt_flow")
+            self.enc_status.config(text=f"Error: {str(e)}", fg=self.theme["danger"])
+            messagebox.showerror("Error", str(e))
+
+        def on_encrypted(original_hash):
             kdf_used = "Argon2id" if ARGON2_AVAILABLE else "PBKDF2-SHA256 (Argon2id unavailable \u2014 upgrade cryptography\u226542.0 for a stronger KDF)"
             status_msg = f"Encrypted (streamed, KDF: {kdf_used}). Saved: {out_path}"
             status_fg = self.theme["success"]
 
-            if self.shred_after_enc_var.get():
-                self.enc_status.config(text="Verifying before shred\u2026", fg=self.theme["accent"])
-                self.root.update()
-                try:
-                    # Memory-safe verification: stream-decrypt and hash
-                    # rather than loading the whole plaintext back into RAM.
-                    check_hash = self._stream_decrypt_file(out_path, None, pwd)
-                    if check_hash == original_hash:
-                        status_msg, status_fg, _ = self._shred_original_after_verified_encrypt(path)
-                        status_msg = f"Encrypted (streamed) to {out_path}. {status_msg}"
-                    else:
-                        status_msg = "Encrypted, but verification failed \u2014 original was NOT deleted."
-                        status_fg = self.theme["danger"]
-                except Exception as e:
-                    status_msg = f"Encrypted, but shred step failed: {e}"
-                    status_fg = self.theme["warning"]
+            if not self.shred_after_enc_var.get():
+                self._busy_end("encrypt_flow")
+                self.enc_status.config(text=status_msg, fg=status_fg)
+                messagebox.showinfo("Done", status_msg)
+                return
 
-            self.enc_status.config(text=status_msg, fg=status_fg)
-            messagebox.showinfo("Done", status_msg)
-        except Exception as e:
-            self.enc_status.config(text=f"Error: {str(e)}", fg=self.theme["danger"])
-            messagebox.showerror("Error", str(e))
+            def do_verify():
+                # Memory-safe verification: stream-decrypt and hash rather
+                # than loading the whole plaintext back into RAM.
+                return self._stream_decrypt_file(out_path, None, pwd)
+
+            def on_verify_error(e):
+                self._busy_end("encrypt_flow")
+                msg = f"Encrypted, but shred step failed: {e}"
+                self.enc_status.config(text=msg, fg=self.theme["warning"])
+                messagebox.showinfo("Done", msg)
+
+            def on_verified(check_hash):
+                if check_hash != original_hash:
+                    self._busy_end("encrypt_flow")
+                    msg = "Encrypted, but verification failed \u2014 original was NOT deleted."
+                    self.enc_status.config(text=msg, fg=self.theme["danger"])
+                    messagebox.showinfo("Done", msg)
+                    return
+
+                def on_shred_done(shred_msg, shred_fg, _warned):
+                    self._busy_end("encrypt_flow")
+                    final_msg = f"Encrypted (streamed) to {out_path}. {shred_msg}"
+                    self.enc_status.config(text=final_msg, fg=shred_fg)
+                    messagebox.showinfo("Done", final_msg)
+
+                self.enc_status.config(text="Shredding original\u2026", fg=self.theme["accent"])
+                self._shred_original_after_verified_encrypt_async(path, on_shred_done)
+
+            self.enc_status.config(text="Verifying before shred\u2026", fg=self.theme["accent"])
+            self._run_async(do_verify, on_verified, on_verify_error)
+
+        self._run_async(
+            do_encrypt, on_encrypted, on_encrypt_error,
+            busy_widgets=[self.enc_btn],
+            status_label=self.enc_status, busy_text="Encrypting (streaming)\u2026",
+        )
+
+
 
     def copy_encrypted(self):
         if not self.last_encrypted_b64:
@@ -2515,13 +2759,31 @@ class PasswordUtilityApp:
                 return
 
         self.dec_status.config(text="Decrypting\u2026", fg=self.theme["accent"])
-        self.root.update()
+        self.root.update_idletasks()
 
         try:
             with open(path, "rb") as f:
                 head = f.read(len(STREAM_MAGIC))
             if head == STREAM_MAGIC:
                 self._decrypt_file_streaming(path, pwd)
+                return
+
+            # M-2: guard against OOM on a large legacy (pre-streaming,
+            # base64) .enc file. Only files written by the streaming path
+            # (checked above via STREAM_MAGIC) are meant to be big; a
+            # legacy-format file above the streaming threshold would try to
+            # f.read() the whole base64 blob into RAM here, which can hang
+            # or crash the UI on a multi-hundred-MB file.
+            size = os.path.getsize(path)
+            if size > STREAM_SIZE_THRESHOLD:
+                msg = (
+                    f"This file is {size:,} bytes and isn't in the streamed "
+                    f"format this app expects for large files. Decrypting it "
+                    f"would try to load the whole thing into memory. Refusing "
+                    f"to avoid an out-of-memory crash."
+                )
+                self.dec_status.config(text="Error: legacy large file rejected", fg=self.theme["danger"])
+                messagebox.showerror("File too large for this format", msg)
                 return
 
             with open(path, "r", encoding="ascii") as f:
@@ -2542,8 +2804,25 @@ class PasswordUtilityApp:
                 defaultextension="", filetypes=[("All files", "*.*")], initialfile=Path(path).stem
             )
             if out_path:
-                with open(out_path, "wb") as f:
-                    f.write(plain)
+                # M-1: write atomically (.tmp -> fsync -> os.replace -> fsync
+                # dir), same pattern as the streaming encrypt path, so a
+                # crash mid-write can't leave a partial plaintext file sitting
+                # at out_path under a name that looks like a finished decrypt.
+                tmp_path = out_path + ".tmp"
+                try:
+                    with open(tmp_path, "wb") as f:
+                        f.write(plain)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    os.replace(tmp_path, out_path)
+                    self._fsync_dir(out_path)
+                except Exception:
+                    try:
+                        if os.path.exists(tmp_path):
+                            os.remove(tmp_path)
+                    except Exception:
+                        pass
+                    raise
                 self._restrict_file_permissions(out_path)
                 self.dec_status.config(text=f"Saved: {out_path}", fg=self.theme["success"])
                 messagebox.showinfo("Success", f"File decrypted and saved.\n\n{out_path}")
@@ -2553,7 +2832,9 @@ class PasswordUtilityApp:
 
     def _decrypt_file_streaming(self, path, pwd):
         """Large-file counterpart to _encrypt_file_streaming: decrypts
-        chunk-by-chunk straight to the chosen output file."""
+        chunk-by-chunk straight to the chosen output file. Runs on a
+        background thread (see _run_async) so decrypting a large file
+        doesn't freeze the UI."""
         default_name = Path(path).stem if Path(path).suffix.lower() == ".enc" else Path(path).name
         out_path = filedialog.asksaveasfilename(
             title="Save decrypted file (large file \u2014 streamed)",
@@ -2562,47 +2843,72 @@ class PasswordUtilityApp:
         if not out_path:
             self.dec_status.config(text="Cancelled.", fg=self.theme["text_secondary"])
             return
-        try:
-            self.dec_status.config(text="Decrypting (streaming)\u2026", fg=self.theme["accent"])
-            self.root.update()
+
+        if not self._busy_start("decrypt_flow"):
+            return  # a decrypt is already in flight; ignore the extra click
+
+        def do_decrypt():
             self._stream_decrypt_file(path, out_path, pwd)
             self._restrict_file_permissions(out_path)
+
+        def on_success(_result):
+            self._busy_end("decrypt_flow")
             self.dec_status.config(text=f"Saved: {out_path}", fg=self.theme["success"])
             messagebox.showinfo("Success", f"File decrypted and saved.\n\n{out_path}")
-        except ValueError as e:
-            self.dec_status.config(text=f"Error: {e}", fg=self.theme["danger"])
-            messagebox.showerror("Error", str(e))
-        except Exception:
+
+        def on_error(e):
+            if isinstance(e, ValueError):
+                self._busy_end("decrypt_flow")
+                self.dec_status.config(text=f"Error: {e}", fg=self.theme["danger"])
+                messagebox.showerror("Error", str(e))
+                return
             # Includes AESGCM auth failures (wrong password / corrupted/
             # tampered chunk) — don't leave a partially-written output file
             # around implying success. A failed AEAD chunk means whatever
             # was written before it is genuine (if partial) plaintext, so
-            # we try to shred it, not just delete it.
-            leftover_warning = None
-            try:
-                if os.path.exists(out_path):
-                    try:
-                        self.shred_file(out_path, delete_on_overwrite_failure=True)
-                    except Exception:
-                        # Best-effort overwrite failed too (locked file, no
-                        # permission, etc.) — last resort: plain delete.
+            # we try to shred it, not just delete it. This cleanup is also
+            # done off the main thread to avoid re-blocking the UI on a
+            # large partial file.
+            def do_cleanup():
+                leftover_warning = None
+                try:
+                    if os.path.exists(out_path):
                         try:
-                            os.remove(out_path)
+                            self.shred_file(out_path, delete_on_overwrite_failure=True)
                         except Exception:
-                            leftover_warning = out_path
-            except Exception:
-                leftover_warning = out_path
-            self.dec_status.config(text="Error: wrong password or corrupt file", fg=self.theme["danger"])
-            if leftover_warning:
-                messagebox.showerror(
-                    "Decryption failed \u2014 partial file left on disk",
-                    "Decryption failed (wrong password or corrupt file), and the "
-                    "partially-decrypted output could not be removed or shredded.\n\n"
-                    "It may contain sensitive plaintext. Please delete it manually:\n\n"
-                    f"{leftover_warning}"
-                )
-            else:
-                messagebox.showerror("Error", "Decryption failed. Wrong password or corrupt file.")
+                            try:
+                                os.remove(out_path)
+                            except Exception:
+                                leftover_warning = out_path
+                except Exception:
+                    leftover_warning = out_path
+                return leftover_warning
+
+            def on_cleanup_done(leftover_warning):
+                self._busy_end("decrypt_flow")
+                self.dec_status.config(text="Error: wrong password or corrupt file", fg=self.theme["danger"])
+                if leftover_warning:
+                    messagebox.showerror(
+                        "Decryption failed \u2014 partial file left on disk",
+                        "Decryption failed (wrong password or corrupt file), and the "
+                        "partially-decrypted output could not be removed or shredded.\n\n"
+                        "It may contain sensitive plaintext. Please delete it manually:\n\n"
+                        f"{leftover_warning}"
+                    )
+                else:
+                    messagebox.showerror("Error", "Decryption failed. Wrong password or corrupt file.")
+
+            def on_cleanup_error(_e):
+                on_cleanup_done(out_path)
+
+            self._run_async(do_cleanup, on_cleanup_done, on_cleanup_error)
+
+        self._run_async(
+            do_decrypt, on_success, on_error,
+            busy_widgets=[self.dec_btn],
+            status_label=self.dec_status, busy_text="Decrypting (streaming)\u2026",
+        )
+
 
 
     # ---------- Manual shred ----------
@@ -2616,52 +2922,158 @@ class PasswordUtilityApp:
         ready = bool(self.shred_file_path.get())
         self.shred_btn.config(state=tk.NORMAL if ready else tk.DISABLED)
 
+    # ---------- Background execution for long-running operations ----------
+    # ---------- Double-trigger guard (audit M-3) ----------
+    def _busy_start(self, key):
+        """Atomically claim `key` for an in-flight long-running operation
+        (encrypt/decrypt/shred). Returns False if that operation is already
+        running, in which case the caller should just no-op — this is a
+        stronger guard than disabling widgets alone, since it's checked
+        synchronously on the main thread before any async work starts, and
+        isn't subject to any lag between a click and a widget's disabled
+        state actually taking visual effect."""
+        if key in self._busy_ops:
+            return False
+        self._busy_ops.add(key)
+        return True
+
+    def _busy_end(self, key):
+        self._busy_ops.discard(key)
+
+    def _run_async(self, work, on_success, on_error=None, busy_widgets=None,
+                    status_label=None, busy_text="Working\u2026"):
+        """Run `work` (a zero-arg callable doing blocking I/O/crypto — shred,
+        streaming encrypt/decrypt) on a background thread so it doesn't
+        freeze the Tk main loop/UI for the duration.
+
+        Tk is not thread-safe: widgets must only be touched from the main
+        thread. So the worker thread does no UI work at all — it just calls
+        `work()` and hands the result (or exception) back via
+        `self.root.after(0, ...)`, which runs `on_success`/`on_error` on the
+        main thread exactly like a normal event-driven callback.
+
+        `busy_widgets` are disabled for the duration and restored to their
+        prior state afterward, so the user can't double-trigger the same
+        long operation (e.g. clicking Shred twice) while one is in flight."""
+        busy_widgets = busy_widgets or []
+        prev_states = {}
+        for w in busy_widgets:
+            try:
+                prev_states[w] = w.cget("state")
+                w.config(state=tk.DISABLED)
+            except Exception:
+                pass
+        if status_label is not None:
+            try:
+                status_label.config(text=busy_text, fg=self.theme["accent"])
+            except Exception:
+                pass
+
+        def restore():
+            for w, state in prev_states.items():
+                try:
+                    w.config(state=state)
+                except Exception:
+                    pass
+
+        def runner():
+            try:
+                result = work()
+            except Exception as e:
+                def done_err():
+                    restore()
+                    if on_error:
+                        on_error(e)
+                self.root.after(0, done_err)
+            else:
+                def done_ok():
+                    restore()
+                    on_success(result)
+                self.root.after(0, done_ok)
+
+        threading.Thread(target=runner, daemon=True).start()
+
     def shred_file_dialog(self):
         path = self.shred_file_path.get()
         if not path or not os.path.exists(path):
             return
         if not messagebox.askyesno("Confirm Shred", f"Permanently shred this file?\n\n{path}\n\nThis cannot be undone."):
             return
-        self.shred_status.config(text="Shredding\u2026", fg=self.theme["accent"])
-        self.root.update()
-        try:
-            try:
-                result = self.shred_file(path)
-            except OverwriteFailedError:
-                delete_anyway = messagebox.askyesno(
-                    "Secure overwrite failed",
-                    "The multi-pass overwrite could not be completed (e.g. read-only "
-                    "filesystem or permissions issue), so the file was left in place "
-                    "rather than deleted unverified.\n\n"
-                    "Delete it anyway WITHOUT a secure overwrite? The data may remain "
-                    "recoverable on disk if you choose this."
-                )
-                if not delete_anyway:
-                    self.shred_status.config(
-                        text="Not deleted \u2014 secure overwrite failed.",
-                        fg=self.theme["danger"]
-                    )
-                    return
-                result = self.shred_file(path, delete_on_overwrite_failure=True)
+        if not self._busy_start("shred_manual"):
+            return  # a shred is already in flight; ignore the extra click
 
-            if result == "fallback":
-                self.shred_status.config(
-                    text="Deleted, but secure overwrite could not be confirmed.",
-                    fg=self.theme["danger"]
-                )
-                messagebox.showwarning(
-                    "Deletion not fully verified",
-                    "The file was removed, but the secure multi-pass overwrite could not be "
-                    "confirmed. Consider a dedicated secure-erase tool for highly sensitive data."
-                )
+        def do_shred():
+            return self.shred_file(path)
+
+        def on_success(result):
+            self._busy_end("shred_manual")
+            self._shred_dialog_finish(path, result)
+
+        def on_error(e):
+            if isinstance(e, OverwriteFailedError):
+                self._shred_dialog_handle_overwrite_failure(path)
             else:
-                self.shred_status.config(text="File securely shredded.", fg=self.theme["success"])
-                self.shred_file_path.set("")
-                self.check_shred_ready()
-                messagebox.showinfo("Shred Complete", f"File has been securely deleted.\n\n{SSD_SHRED_CAVEAT}")
-        except Exception as e:
+                self._busy_end("shred_manual")
+                self.shred_status.config(text=f"Error: {str(e)}", fg=self.theme["danger"])
+                messagebox.showerror("Error", str(e))
+
+        self._run_async(
+            do_shred, on_success, on_error,
+            busy_widgets=[self.shred_btn], status_label=self.shred_status,
+            busy_text="Shredding\u2026",
+        )
+
+    def _shred_dialog_handle_overwrite_failure(self, path):
+        delete_anyway = messagebox.askyesno(
+            "Secure overwrite failed",
+            "The multi-pass overwrite could not be completed (e.g. read-only "
+            "filesystem or permissions issue), so the file was left in place "
+            "rather than deleted unverified.\n\n"
+            "Delete it anyway WITHOUT a secure overwrite? The data may remain "
+            "recoverable on disk if you choose this."
+        )
+        if not delete_anyway:
+            self._busy_end("shred_manual")
+            self.shred_status.config(
+                text="Not deleted \u2014 secure overwrite failed.",
+                fg=self.theme["danger"]
+            )
+            return
+
+        def do_shred():
+            return self.shred_file(path, delete_on_overwrite_failure=True)
+
+        def on_success(result):
+            self._busy_end("shred_manual")
+            self._shred_dialog_finish(path, result)
+
+        def on_error(e):
+            self._busy_end("shred_manual")
             self.shred_status.config(text=f"Error: {str(e)}", fg=self.theme["danger"])
             messagebox.showerror("Error", str(e))
+
+        self._run_async(
+            do_shred, on_success, on_error,
+            busy_widgets=[self.shred_btn], status_label=self.shred_status,
+            busy_text="Shredding\u2026",
+        )
+
+    def _shred_dialog_finish(self, path, result):
+        if result == "fallback":
+            self.shred_status.config(
+                text="Deleted, but secure overwrite could not be confirmed.",
+                fg=self.theme["danger"]
+            )
+            messagebox.showwarning(
+                "Deletion not fully verified",
+                "The file was removed, but the secure multi-pass overwrite could not be "
+                "confirmed. Consider a dedicated secure-erase tool for highly sensitive data."
+            )
+        else:
+            self.shred_status.config(text="File securely shredded.", fg=self.theme["success"])
+            self.shred_file_path.set("")
+            self.check_shred_ready()
+            messagebox.showinfo("Shred Complete", f"File has been securely deleted.\n\n{SSD_SHRED_CAVEAT}")
 
     def shred_file(self, path, passes=3, delete_on_overwrite_failure=False):
         """Securely shred a file: multi-pass random overwrite + zero pass,
@@ -2677,6 +3089,19 @@ class PasswordUtilityApp:
         plain delete after a failed overwrite (returns 'fallback')."""
         if not os.path.exists(path):
             raise FileNotFoundError(f"File not found: {path}")
+        if os.path.islink(path):
+            # Refuse to shred through a symlink. Without this check,
+            # open(path, "r+b") would silently overwrite whatever the link
+            # points to (not the link itself), while os.remove() at the end
+            # only deletes the link — the user believes they destroyed the
+            # target file, but a symlink swapped in between the two calls
+            # (or just present from the start) means a *different* file's
+            # contents get shredded instead. Ask the caller to pass the
+            # resolved path explicitly if that's really what they want.
+            raise ValueError(
+                f"Refusing to shred a symlink (would overwrite its target, not "
+                f"the link itself): {path}\nResolved target: {os.path.realpath(path)}"
+            )
         if os.path.isdir(path):
             raise IsADirectoryError(f"Cannot shred a directory: {path}")
 
@@ -2687,30 +3112,52 @@ class PasswordUtilityApp:
         if size > 0:
             try:
                 chunk_size = 1024 * 1024
-                with open(path, "r+b") as f:
-                    for _ in range(passes):
+                # Open by fd rather than path, with O_NOFOLLOW where the
+                # platform supports it, so a symlink swapped in for `path`
+                # between the checks above and this open() (TOCTOU) causes
+                # the open itself to fail instead of silently following the
+                # link to some other file. os.open()+fdopen() also lets us
+                # fstat the actual open file (not the path) to re-confirm
+                # it's a regular file before writing to it.
+                open_flags = os.O_RDWR
+                o_nofollow = getattr(os, "O_NOFOLLOW", None)
+                if o_nofollow is not None:
+                    open_flags |= o_nofollow
+                if hasattr(os, "O_BINARY"):
+                    open_flags |= os.O_BINARY
+                fd = os.open(path, open_flags)
+                try:
+                    st = os.fstat(fd)
+                    if not stat.S_ISREG(st.st_mode):
+                        raise ValueError(f"Refusing to shred a non-regular file: {path}")
+                    with os.fdopen(fd, "r+b", closefd=True) as f:
+                        fd = None  # ownership transferred to `f`
+                        for _ in range(passes):
+                            f.seek(0)
+                            written = 0
+                            while written < size:
+                                to_write = min(chunk_size, size - written)
+                                f.write(os.urandom(to_write))
+                                written += to_write
+                            f.flush()
+                            try:
+                                os.fsync(f.fileno())
+                            except OSError:
+                                pass
                         f.seek(0)
                         written = 0
                         while written < size:
                             to_write = min(chunk_size, size - written)
-                            f.write(os.urandom(to_write))
+                            f.write(b'\x00' * to_write)
                             written += to_write
                         f.flush()
                         try:
                             os.fsync(f.fileno())
                         except OSError:
                             pass
-                    f.seek(0)
-                    written = 0
-                    while written < size:
-                        to_write = min(chunk_size, size - written)
-                        f.write(b'\x00' * to_write)
-                        written += to_write
-                    f.flush()
-                    try:
-                        os.fsync(f.fileno())
-                    except OSError:
-                        pass
+                finally:
+                    if fd is not None:
+                        os.close(fd)
             except Exception as e:
                 overwrite_ok = False
                 overwrite_error = e
@@ -2726,6 +3173,7 @@ class PasswordUtilityApp:
             if sys.platform == "win32":
                 os.chmod(path, stat.S_IWRITE)
             os.remove(path)
+            self._fsync_dir(path)
         except Exception as e:
             action = "overwritten" if overwrite_ok else "overwrite failed"
             raise RuntimeError(f"File {action} but could not be removed: {e}")
@@ -2737,7 +3185,24 @@ class PasswordUtilityApp:
         """Best-effort cleanup when the window is closed: cancel any pending
         auto-clear timers, wipe passphrase/password fields still held in
         memory, and clear the clipboard so nothing sensitive lingers after
-        the app exits. Never blocks exit even if a step fails."""
+        the app exits. Never blocks exit even if a step fails.
+
+        Audit item #2: encrypt/decrypt/shred run on daemon threads (see
+        _run_async) so they can't block interpreter shutdown, but that also
+        means closing mid-operation kills the worker outright — possibly
+        leaving a half-written .tmp file or a partially-overwritten shred
+        target. If any tracked op is still in self._busy_ops, ask for
+        confirmation before proceeding so the user isn't surprised."""
+        if getattr(self, "_busy_ops", None):
+            proceed = messagebox.askyesno(
+                "Operation in progress",
+                "An encryption, decryption, or shred operation is still running.\n\n"
+                "Closing now may leave an incomplete temporary file or an "
+                "interrupted secure-delete. Close anyway?"
+            )
+            if not proceed:
+                return
+
         for after_id_attr in ("_autoclear_after_id", "_enc_pwd_clear_after_id", "_dec_pwd_clear_after_id"):
             after_id = getattr(self, after_id_attr, None)
             if after_id:
