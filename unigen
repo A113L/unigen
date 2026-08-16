@@ -276,7 +276,16 @@ def secure_zero(buf):
 def try_mlock(buf):
     """Best-effort: ask the OS to keep `buf` (a bytearray) out of swap.
     Returns True if the call reports success, False otherwise (including
-    "not supported here") — callers must not depend on this succeeding."""
+    "not supported here") — callers must not depend on this succeeding.
+
+    Caveat: `(ctypes.c_char * len(buf)).from_buffer(buf)` pins the
+    bytearray's *current* backing buffer. If `buf` were ever resized
+    (e.g. append/extend) while a pinning object from a prior call is still
+    alive, ctypes can raise BufferError. Every call site in this file only
+    ever creates a fixed-size bytearray and never resizes it afterward, so
+    this doesn't currently trigger — but keep it that way, or re-derive the
+    pinned view after any resize.
+    """
     try:
         import ctypes
         addr = (ctypes.c_char * len(buf)).from_buffer(buf)
@@ -743,18 +752,22 @@ class PasswordUtilityApp:
         except Exception as e:
             return False, f"WinAPI setup failed ({e})"
 
+        # Allocate the text buffer BEFORE touching the clipboard. If this
+        # allocation fails (low memory / WinAPI error), we bail out without
+        # having called EmptyClipboard(), so whatever was on the clipboard
+        # before this call is left untouched instead of being wiped and
+        # replaced with nothing.
+        buf = (text + "\0").encode("utf-16-le")
+        h_text = _alloc_bytes(buf)
+        if not h_text:
+            return False, "could not allocate clipboard text buffer"
+
         if not user32.OpenClipboard(None):
+            kernel32.GlobalFree(h_text)
             return False, "could not open clipboard"
         try:
             user32.EmptyClipboard()
-
-            # Real text, so paste keeps working normally everywhere.
-            buf = (text + "\0").encode("utf-16-le")
-            h_text = _alloc_bytes(buf)
-            if h_text:
-                user32.SetClipboardData(CF_UNICODETEXT, h_text)
-            else:
-                return False, "could not allocate clipboard text buffer"
+            user32.SetClipboardData(CF_UNICODETEXT, h_text)
 
             # Marker formats. Presence alone is what matters; DWORD 0 is
             # the documented "false" payload for the history/cloud flags.
@@ -2082,7 +2095,8 @@ class PasswordUtilityApp:
         self.enc_btn.config(state=tk.NORMAL if ready else tk.DISABLED)
 
     def check_dec_ready(self):
-        ready = bool(self.dec_file_path.get() and self.dec_pwd_var.get())
+        pwd_len = len(self.dec_pwd_var.get())
+        ready = bool(self.dec_file_path.get() and 0 < pwd_len <= MAX_PASSPHRASE_LEN)
         self.dec_btn.config(state=tk.NORMAL if ready else tk.DISABLED)
 
     def derive_key(self, password, salt, kdf_id=None):
@@ -2135,7 +2149,16 @@ class PasswordUtilityApp:
     def _encrypt_blob(self, password, data):
         """Encrypt bytes with the current default KDF (Argon2id, falling
         back to PBKDF2 if Argon2id isn't available). Returns the full
-        container: MAGIC + kdf_id + salt + iv + ciphertext."""
+        container: MAGIC + kdf_id + salt + iv + ciphertext.
+
+        Known limitation: `AESGCM()` requires an immutable `bytes` key, so
+        every call site here does `bytes(key)` on the mlock'd/zeroable
+        bytearray right before use. That conversion allocates a second,
+        immutable copy of the raw AES key that `secure_zero()` cannot wipe
+        and that isn't covered by `try_mlock()`; it lives until CPython's
+        GC reclaims it. This is a hard limitation of using pure-Python +
+        the `cryptography` library's public API (which only accepts
+        `bytes`) rather than something fixable in application code."""
         kdf_id = KDF_ARGON2ID if ARGON2_AVAILABLE else KDF_PBKDF2
         salt = os.urandom(16)
         iv = os.urandom(12)
@@ -2198,12 +2221,14 @@ class PasswordUtilityApp:
                 fout.write(base_nonce)
                 counter = 0
                 chunk = fin.read(STREAM_CHUNK_SIZE)
-                hasher.update(chunk)
                 while True:
+                    # Hash the chunk we're about to encrypt — one call,
+                    # right before it's used, rather than split across
+                    # iterations — so the hash always covers exactly the
+                    # bytes written and nothing more.
+                    hasher.update(chunk)
                     next_chunk = fin.read(STREAM_CHUNK_SIZE)
                     is_final = (len(next_chunk) == 0)
-                    if not is_final:
-                        hasher.update(next_chunk)
                     nonce = base_nonce + counter.to_bytes(4, "big")
                     aad = counter.to_bytes(8, "big") + (b"\x01" if is_final else b"\x00")
                     ct = aesgcm.encrypt(nonce, chunk, aad)
@@ -2216,6 +2241,8 @@ class PasswordUtilityApp:
                     if is_final:
                         break
                     chunk = next_chunk
+                fout.flush()
+                os.fsync(fout.fileno())
         finally:
             secure_zero(key)
             if locked:
@@ -2230,7 +2257,10 @@ class PasswordUtilityApp:
             magic = fin.read(len(STREAM_MAGIC))
             if magic != STREAM_MAGIC:
                 raise ValueError("Not a streamed-format encrypted file")
-            kdf_id = fin.read(1)[0]
+            kdf_id_bytes = fin.read(1)
+            if not kdf_id_bytes:
+                raise ValueError("Truncated encrypted file (missing KDF id)")
+            kdf_id = kdf_id_bytes[0]
             salt = fin.read(16)
             base_nonce = fin.read(8)
             if len(salt) != 16 or len(base_nonce) != 8:
@@ -2249,6 +2279,14 @@ class PasswordUtilityApp:
                     if len(len_bytes) < 4:
                         raise ValueError("Truncated encrypted file")
                     ct_len = int.from_bytes(len_bytes, "big")
+                    # ct_len is unauthenticated (it's plaintext metadata read
+                    # before the AEAD tag is checked), so a malicious/corrupt
+                    # file could claim an enormous length and force a huge
+                    # allocation via fin.read(). Bound it to what a real
+                    # chunk could ever be: one plaintext chunk plus the
+                    # 16-byte GCM tag, with a little headroom.
+                    if ct_len < 16 or ct_len > STREAM_CHUNK_SIZE + 64:
+                        raise ValueError("Corrupted or malicious chunk length")
                     ct = fin.read(ct_len)
                     if len(ct) < ct_len:
                         raise ValueError("Truncated encrypted file")
@@ -2272,6 +2310,9 @@ class PasswordUtilityApp:
                     counter += 1
                     if is_final:
                         break
+                if fout:
+                    fout.flush()
+                    os.fsync(fout.fileno())
             finally:
                 secure_zero(key)
                 if locked:
@@ -2333,12 +2374,17 @@ class PasswordUtilityApp:
 
             combined = self._encrypt_blob(pwd, data)
             b64 = base64.b64encode(combined).decode("ascii")
+            kdf_used = "Argon2id" if ARGON2_AVAILABLE else "PBKDF2-SHA256 (Argon2id unavailable \u2014 upgrade cryptography\u226542.0 for a stronger KDF)"
 
             self.last_encrypted_b64 = b64
             self.last_encrypted_filename = Path(path).name + ".enc"
 
             self.enc_result_text.config(state=tk.NORMAL)
             self.enc_result_text.delete(1.0, tk.END)
+            # Only insert a short preview into the Tk text widget, never the
+            # full Base64 blob — for a file just under STREAM_SIZE_THRESHOLD
+            # that's ~25MB of text and can noticeably stall the UI on insert.
+            # Copy/Save still operate on the full self.last_encrypted_b64.
             preview = b64[:1200] + "..." if len(b64) > 1200 else b64
             self.enc_result_text.insert(tk.END, preview + "\n")
             if len(b64) > 1200:
@@ -2348,7 +2394,7 @@ class PasswordUtilityApp:
             self.enc_copy_btn.config(state=tk.NORMAL)
             self.enc_save_btn.config(state=tk.NORMAL)
 
-            status_msg = "Encryption complete. Use Copy or Save below."
+            status_msg = f"Encryption complete (KDF: {kdf_used}). Use Copy or Save below."
             status_fg = self.theme["success"]
 
             if self.shred_after_enc_var.get():
@@ -2404,7 +2450,8 @@ class PasswordUtilityApp:
             original_hash = self._stream_encrypt_file(path, out_path, pwd)
             self._restrict_file_permissions(out_path)
 
-            status_msg = f"Encrypted (streamed). Saved: {out_path}"
+            kdf_used = "Argon2id" if ARGON2_AVAILABLE else "PBKDF2-SHA256 (Argon2id unavailable \u2014 upgrade cryptography\u226542.0 for a stronger KDF)"
+            status_msg = f"Encrypted (streamed, KDF: {kdf_used}). Saved: {out_path}"
             status_fg = self.theme["success"]
 
             if self.shred_after_enc_var.get():
@@ -2528,14 +2575,34 @@ class PasswordUtilityApp:
         except Exception:
             # Includes AESGCM auth failures (wrong password / corrupted/
             # tampered chunk) — don't leave a partially-written output file
-            # around implying success.
+            # around implying success. A failed AEAD chunk means whatever
+            # was written before it is genuine (if partial) plaintext, so
+            # we try to shred it, not just delete it.
+            leftover_warning = None
             try:
                 if os.path.exists(out_path):
-                    os.remove(out_path)
+                    try:
+                        self.shred_file(out_path, delete_on_overwrite_failure=True)
+                    except Exception:
+                        # Best-effort overwrite failed too (locked file, no
+                        # permission, etc.) — last resort: plain delete.
+                        try:
+                            os.remove(out_path)
+                        except Exception:
+                            leftover_warning = out_path
             except Exception:
-                pass
+                leftover_warning = out_path
             self.dec_status.config(text="Error: wrong password or corrupt file", fg=self.theme["danger"])
-            messagebox.showerror("Error", "Decryption failed. Wrong password or corrupt file.")
+            if leftover_warning:
+                messagebox.showerror(
+                    "Decryption failed \u2014 partial file left on disk",
+                    "Decryption failed (wrong password or corrupt file), and the "
+                    "partially-decrypted output could not be removed or shredded.\n\n"
+                    "It may contain sensitive plaintext. Please delete it manually:\n\n"
+                    f"{leftover_warning}"
+                )
+            else:
+                messagebox.showerror("Error", "Decryption failed. Wrong password or corrupt file.")
 
 
     # ---------- Manual shred ----------
