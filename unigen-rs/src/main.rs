@@ -518,7 +518,7 @@ impl UnigenApp {
             let tmp = crypto::unique_tmp_path(&enc_path);
             let text = crypto::encode_blob_text(&combined);
             std::fs::write(&tmp, text.as_bytes())?;
-            if let Err(e) = std::fs::rename(&tmp, &enc_path) {
+            if let Err(e) = crypto::replace_file(&tmp, &enc_path) {
                 let _ = std::fs::remove_file(&tmp);
                 return Err(e.into());
             }
@@ -807,7 +807,7 @@ impl UnigenApp {
             let text = crypto::encode_blob_text(&combined);
             let tmp = crypto::unique_tmp_path(&path);
             std::fs::write(&tmp, text.as_bytes())?;
-            if let Err(e) = std::fs::rename(&tmp, &path) {
+            if let Err(e) = crypto::replace_file(&tmp, &path) {
                 let _ = std::fs::remove_file(&tmp);
                 return Err(e.into());
             }
@@ -990,8 +990,17 @@ fn run_encrypt_job(
                 .map_err(|e| e.to_string())?;
 
             if shred_after {
-                let _ = tx.send(JobMsg::Progress(1.0, "Verifying before shred…".to_string()));
-                crypto::stream_decrypt_file(out, None, &pwd, None).map_err(|e| {
+                let tx_verify = tx.clone();
+                let cb = crypto::Progress {
+                    callback: Box::new(move |done, total| {
+                        let pct = if total > 0 { done as f32 / total as f32 } else { 0.0 };
+                        let _ = tx_verify.send(JobMsg::Progress(
+                            pct,
+                            format!("Verifying before shred… {:.0}%", pct * 100.0),
+                        ));
+                    }),
+                };
+                crypto::verify_stream_roundtrip(out, &in_path, &pwd, Some(cb)).map_err(|e| {
                     format!("Encrypted, but post-encrypt verification failed: {e}")
                 })?;
                 let _ = tx.send(JobMsg::Progress(1.0, "Shredding original…".to_string()));
@@ -1046,7 +1055,7 @@ fn run_encrypt_job(
             let tmp = crypto::unique_tmp_path(&save_path);
             let text = crypto::encode_blob_text(&combined);
             std::fs::write(&tmp, text.as_bytes()).map_err(|e| e.to_string())?;
-            if let Err(e) = std::fs::rename(&tmp, &save_path) {
+            if let Err(e) = crypto::replace_file(&tmp, &save_path) {
                 let _ = std::fs::remove_file(&tmp);
                 return Err(e.to_string());
             }
@@ -1118,7 +1127,7 @@ fn run_decrypt_job(
             let legacy_no_aad = crypto::is_legacy_no_aad_format(&combined);
             let tmp = crypto::unique_tmp_path(&out_path);
             std::fs::write(&tmp, &plain).map_err(|e| e.to_string())?;
-            if let Err(e) = std::fs::rename(&tmp, &out_path) {
+            if let Err(e) = crypto::replace_file(&tmp, &out_path) {
                 let _ = std::fs::remove_file(&tmp);
                 return Err(e.to_string());
             }
@@ -1449,7 +1458,7 @@ impl UnigenApp {
                             let content = self.generated.join("\n");
                             let tmp = crypto::unique_tmp_path(&path);
                             let ok = std::fs::write(&tmp, &content)
-                                .and_then(|_| std::fs::rename(&tmp, &path))
+                                .and_then(|_| crypto::replace_file(&tmp, &path))
                                 .is_ok();
                             if !ok {
                                 let _ = std::fs::remove_file(&tmp);
@@ -1481,6 +1490,7 @@ impl UnigenApp {
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut self.autoclear_enabled, "Auto-clear clipboard after");
                     ui.add(egui::DragValue::new(&mut self.autoclear_seconds).range(5..=300));
+                    ui.label("seconds (best-effort — paste can't be reliably detected)");
                 });
 
                 ui.horizontal(|ui| {
@@ -1856,8 +1866,7 @@ impl UnigenApp {
                                         egui::RichText::new(format!("{:>4}: {line}", line_no + 1))
                                             .font(egui::FontId::monospace(13.0)),
                                     )
-                                    .selectable(true)
-                                    .wrap_mode(egui::TextWrapMode::Extend),
+                                    .selectable(true),
                                 );
                             });
                         }
