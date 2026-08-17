@@ -416,6 +416,61 @@ fn fsync_dir(path: &Path) {
     }
 }
 
+/// Atomically (best-effort) replace `dest` with `tmp`.
+///
+/// `fs::rename` refuses to overwrite an existing destination file on
+/// Windows (it succeeds silently on Unix). This wraps the platform
+/// difference so callers get consistent "replace whatever is there"
+/// semantics on both. On Windows we use `MoveFileExW` with
+/// `MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH`, which is the
+/// standard way to get an overwriting, durable rename; if that's
+/// unavailable for some reason we fall back to remove-then-rename,
+/// which is not atomic but still correct outside of a crash window.
+pub fn replace_file(tmp: &Path, dest: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+
+        const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+        const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+
+        extern "system" {
+            fn MoveFileExW(
+                lpexistingfilename: *const u16,
+                lpnewfilename: *const u16,
+                dwflags: u32,
+            ) -> i32;
+        }
+
+        fn wide(p: &Path) -> Vec<u16> {
+            p.as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect()
+        }
+
+        let tmp_w = wide(tmp);
+        let dest_w = wide(dest);
+        let ok = unsafe {
+            MoveFileExW(
+                tmp_w.as_ptr(),
+                dest_w.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if ok != 0 {
+            return Ok(());
+        }
+        // Fall back to remove-then-rename (e.g. odd filesystem/ACL cases).
+        let _ = fs::remove_file(dest);
+        fs::rename(tmp, dest)
+    }
+    #[cfg(not(windows))]
+    {
+        fs::rename(tmp, dest)
+    }
+}
+
 #[cfg(unix)]
 pub fn restrict_permissions(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
@@ -532,7 +587,7 @@ pub fn stream_encrypt_file(
 
     match result {
         Ok(()) => {
-            fs::rename(&tmp_path, out_path)
+            replace_file(&tmp_path, out_path)
                 .with_context(|| format!("renaming {tmp_path:?} -> {out_path:?}"))?;
             fsync_dir(out_path);
             restrict_permissions(out_path);
@@ -665,6 +720,21 @@ pub fn stream_decrypt_file(
 
             counter += 1;
             if is_final {
+                // The final chunk must actually be the end of the stream.
+                // Without this check, an attacker (or a corrupted copy)
+                // could append extra chunk-framed bytes after a valid
+                // final chunk; those bytes would silently be ignored,
+                // even though the format is documented as detecting any
+                // appended/truncated data. Confirm there's nothing left
+                // to read.
+                let mut trailing = [0u8; 1];
+                match reader.read(&mut trailing) {
+                    Ok(0) => {}
+                    Ok(_) => bail!(
+                        "Corrupted or tampered encrypted file: trailing data after final chunk"
+                    ),
+                    Err(e) => return Err(e.into()),
+                }
                 break;
             }
         }
@@ -679,7 +749,7 @@ pub fn stream_decrypt_file(
     match result {
         Ok(()) => {
             if let (Some(tmp), Some(out)) = (&tmp_path, out_path) {
-                fs::rename(tmp, out)?;
+                replace_file(tmp, out)?;
                 fsync_dir(out);
                 restrict_permissions(out);
             }
@@ -692,6 +762,87 @@ pub fn stream_decrypt_file(
             Err(e)
         }
     }
+}
+
+/// Verify that `encrypted_path` decrypts, under `password`, to exactly the
+/// bytes of `original_path` — a true round-trip check, not just "did
+/// decryption not error".
+///
+/// This decrypts to a temporary file (so arbitrarily large streamed files
+/// don't need to be held in memory), then compares the decrypted output
+/// against the original byte-for-byte in fixed-size chunks. The temporary
+/// file is always removed before returning, whether verification succeeds
+/// or fails.
+///
+/// Used by the "verify, then shred original" flow: shredding must never
+/// proceed on the strength of "decryption succeeded" alone, since that
+/// only proves the ciphertext was authenticated, not that its plaintext
+/// actually matches the file about to be destroyed.
+pub fn verify_stream_roundtrip(
+    encrypted_path: &Path,
+    original_path: &Path,
+    password: &str,
+    mut on_progress: Option<Progress<'_>>,
+) -> Result<()> {
+    let decrypted_tmp = unique_tmp_path(original_path);
+
+    let decrypt_result = stream_decrypt_file(
+        encrypted_path,
+        Some(&decrypted_tmp),
+        password,
+        on_progress.take(),
+    );
+
+    let compare_result = decrypt_result.and_then(|()| {
+        let orig_len = fs::metadata(original_path)?.len();
+        let dec_len = fs::metadata(&decrypted_tmp)?.len();
+        if orig_len != dec_len {
+            bail!(
+                "Verification failed: decrypted size ({dec_len}) does not \
+                 match original size ({orig_len}) — original was NOT modified"
+            );
+        }
+
+        // `Read::read` is permitted to return short reads even when more
+        // data is available, so don't assume two independent readers stay
+        // in lock-step; fill each buffer fully (or to EOF) before
+        // comparing.
+        fn fill(r: &mut impl Read, buf: &mut [u8]) -> std::io::Result<usize> {
+            let mut filled = 0;
+            while filled < buf.len() {
+                match r.read(&mut buf[filled..])? {
+                    0 => break,
+                    n => filled += n,
+                }
+            }
+            Ok(filled)
+        }
+
+        let mut orig_reader = BufReader::with_capacity(STREAM_CHUNK_SIZE, File::open(original_path)?);
+        let mut dec_reader = BufReader::with_capacity(STREAM_CHUNK_SIZE, File::open(&decrypted_tmp)?);
+        let mut orig_buf = vec![0u8; STREAM_CHUNK_SIZE];
+        let mut dec_buf = vec![0u8; STREAM_CHUNK_SIZE];
+
+        loop {
+            let n1 = fill(&mut orig_reader, &mut orig_buf)?;
+            let n2 = fill(&mut dec_reader, &mut dec_buf)?;
+            if n1 != n2 || orig_buf[..n1] != dec_buf[..n2] {
+                bail!(
+                    "Verification failed: decrypted content does not match \
+                     the original byte-for-byte — original was NOT modified"
+                );
+            }
+            if n1 == 0 {
+                break;
+            }
+        }
+        Ok(())
+    });
+
+    // Always clean up the decrypted scratch copy, regardless of outcome.
+    let _ = fs::remove_file(&decrypted_tmp);
+
+    compare_result
 }
 
 #[cfg(test)]
