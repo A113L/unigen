@@ -1,6 +1,6 @@
 🔑 **Unicode Password Utility (UNIGEN)**
 
-[![unigen.jpg](https://i.postimg.cc/kg0KKsq1/unigen.jpg)](https://postimg.cc/87b7VhFM)
+<h2>Deprecated. Use the RUST edition instead. Files encrypted with Python scripts are compatible with Rust applications.</h2>
 
 UNIGEN is a cross-platform Python 3 **desktop app** (Tkinter) for generating cryptographically strong, high-entropy Unicode passwords and protecting sensitive files with authenticated encryption. It's a single script — no install step beyond `pip install cryptography` — and runs the same on Windows, Linux, and macOS.
 
