@@ -159,7 +159,7 @@ fn main() -> eframe::Result<()> {
         Box::new(|cc| {
             theme::apply(&cc.egui_ctx, true);
             load_custom_fonts(&cc.egui_ctx);
-            Box::new(UnigenApp::new())
+            Ok(Box::new(UnigenApp::new()))
         }),
     )
 }
@@ -1480,13 +1480,13 @@ impl UnigenApp {
 
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut self.autoclear_enabled, "Auto-clear clipboard after");
-                    ui.add(egui::DragValue::new(&mut self.autoclear_seconds).clamp_range(5..=300));
-                    ui.label("seconds (best-effort — paste can't be reliably detected)");
+                    ui.add(egui::DragValue::new(&mut self.autoclear_seconds).range(5..=300));
+                    ui.add(egui::DragValue::new(&mut self.pwd_autoclear_seconds).range(5..=600));
                 });
 
                 ui.horizontal(|ui| {
                     ui.label("Clear passphrase fields after");
-                    ui.add(egui::DragValue::new(&mut self.pwd_autoclear_seconds).clamp_range(5..=600));
+                    ui.add(egui::DragValue::new(&mut self.pwd_autoclear_seconds).range(5..=600));
                     ui.label("seconds of inactivity");
                 });
 
@@ -1858,7 +1858,7 @@ impl UnigenApp {
                                             .font(egui::FontId::monospace(13.0)),
                                     )
                                     .selectable(true)
-                                    .wrap(false),
+                                    .wrap_mode(egui::TextWrapMode::Extend),
                                 );
                             });
                         }
