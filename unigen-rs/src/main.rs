@@ -15,7 +15,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Exact hex palette from the Python original's `THEMES` dict, so the two
 /// versions render identically rather than falling back to egui's stock
@@ -348,6 +348,12 @@ struct UnigenApp {
     editor_original_content: String,
     editor_pwd: String,
     editor_kdf: u8,
+    /// KDF read from the opened file's own header (`None` for legacy
+    /// Python-format files, which have no discoverable KDF marker other
+    /// than "always PBKDF2" / a magic-tagged byte). Used to show the user
+    /// whether hitting Save will change the file's KDF from what it
+    /// currently has on disk.
+    editor_source_kdf: Option<u8>,
     editor_search: String,
     editor_status: String,
     editor_confirm_close: bool,
@@ -412,6 +418,7 @@ impl UnigenApp {
             editor_original_content: String::new(),
             editor_pwd: String::new(),
             editor_kdf: crypto::DEFAULT_KDF,
+            editor_source_kdf: None,
             editor_search: String::new(),
             editor_status: String::new(),
             editor_confirm_close: false,
@@ -436,16 +443,26 @@ impl UnigenApp {
         build_pool(&self.charset_enabled, &self.charsets)
     }
 
-    /// Copies `text` to the clipboard and unconditionally schedules it to
-    /// be wiped after 20 seconds — used for the password-search results
-    /// below, where lines are sensitive and should never linger for
-    /// longer regardless of the user's general auto-clear setting/timer.
+    /// Copies `text` to the clipboard and unconditionally schedules an
+    /// auto-clear — used for single-password/single-line copies (the
+    /// generated-password list and the editor's search results), where the
+    /// copied value is sensitive enough that it should always be cleared
+    /// regardless of the general `autoclear_enabled` toggle.
+    ///
+    /// BUG FIX: this used to hard-code a 20s clear delay, ignoring the
+    /// user's configured `autoclear_seconds` (e.g. setting the slider to
+    /// 60s had no effect on these particular "Copy" buttons, only on
+    /// "Copy All"). It now uses the same configured duration as
+    /// `copy_to_clipboard` — "always clears" and "clears using the
+    /// configured delay" are independent choices, and only the former is
+    /// intentional here.
     fn copy_to_clipboard_20s(&mut self, text: &str) {
         if let Some(cb) = self.clipboard.as_mut() {
             if cb.set_text(text.to_string()).is_ok() {
-                self.autoclear_deadline = Some(Instant::now() + Duration::from_secs(20));
+                self.autoclear_deadline =
+                    Some(Instant::now() + Duration::from_secs(self.autoclear_seconds as u64));
                 self.autoclear_expected = Some(text.to_string());
-                self.editor_status = "Copied line. Clipboard clears in 20s.".to_string();
+                self.editor_status = format!("Copied line. Clipboard clears in {}s.", self.autoclear_seconds);
                 return;
             }
         }
@@ -710,7 +727,7 @@ impl UnigenApp {
     /// lists), so this runs synchronously rather than on a background
     /// thread; Argon2id adds at most a fraction of a second.
     fn open_editor_decrypt(&mut self, path: PathBuf, pwd: String) {
-        let result = (|| -> anyhow::Result<String> {
+        let result = (|| -> anyhow::Result<(String, Option<u8>, bool)> {
             crypto::check_blob_file_size(&path)?;
             let file_contents = std::fs::read(&path)?;
             if &file_contents[..file_contents.len().min(4)] == crypto::STREAM_MAGIC {
@@ -723,18 +740,33 @@ impl UnigenApp {
             let plain = crypto::decrypt_blob_compat(&pwd, &combined)?;
             let text = String::from_utf8(plain)
                 .map_err(|_| anyhow::anyhow!("Decrypted content isn't valid UTF-8 text — not editable here."))?;
-            Ok(text)
+            Ok((text, crypto::peek_kdf_id(&combined), crypto::is_legacy_no_aad_format(&combined)))
         })();
 
         match result {
-            Ok(text) => {
+            Ok((text, source_kdf, legacy_no_aad)) => {
                 self.editor_source = Some(path);
                 self.editor_content = text.clone();
                 self.editor_original_content = text;
                 self.editor_pwd = pwd;
+                self.editor_source_kdf = source_kdf;
+                // Default the "will save as" KDF to whatever the file was
+                // already using, so hitting Save without touching the KDF
+                // selector preserves it rather than silently upgrading (or
+                // downgrading) the file's KDF. Falls back to the app
+                // default only when the source KDF couldn't be determined
+                // (legacy no-magic format).
+                self.editor_kdf = source_kdf.unwrap_or(crypto::DEFAULT_KDF);
                 self.editor_open = true;
                 self.editor_search.clear();
-                self.editor_status.clear();
+                self.editor_status = if legacy_no_aad {
+                    "Note: this file is in the legacy container format, which doesn't bind \
+                     an AAD to its ciphertext. Saving here will re-encrypt it into the \
+                     current AAD-bound format."
+                        .to_string()
+                } else {
+                    String::new()
+                };
                 self.editor_open_prompt = false;
                 self.editor_open_target = None;
                 zeroize_string(&mut self.editor_open_pwd);
@@ -748,13 +780,30 @@ impl UnigenApp {
     }
 
     /// Re-encrypts the edited content back over the original file: write to
-    /// a uniquely-named temp file, then atomically rename over the target
-    /// (same pattern as encrypt/decrypt elsewhere), so a crash mid-write
-    /// can never leave a corrupted or half-written `.enc` file.
+    /// a uniquely-named temp file, verify it decrypts back to exactly the
+    /// content we just encrypted (same "don't trust it until it round-trips"
+    /// pattern used by `run_encrypt_and_shred_password_file`), and only then
+    /// atomically rename over the target — so a crash mid-write, or a
+    /// silently-bad encryption, can never leave the on-disk file corrupted
+    /// or replaced with something that doesn't actually decrypt.
     fn save_editor(&mut self) {
         let Some(path) = self.editor_source.clone() else { return };
+        let expected = self.editor_content.clone();
         let result = (|| -> anyhow::Result<()> {
-            let combined = crypto::encrypt_blob(&self.editor_pwd, self.editor_content.as_bytes(), self.editor_kdf)?;
+            let combined = crypto::encrypt_blob(&self.editor_pwd, expected.as_bytes(), self.editor_kdf)?;
+
+            // Verify round-trip BEFORE touching the real file: decrypt the
+            // freshly-produced ciphertext with the same passphrase and
+            // confirm it matches exactly what we intended to save.
+            let verify = crypto::decrypt_blob(&self.editor_pwd, &combined)
+                .map_err(|e| anyhow::anyhow!("Verification failed after encrypting — original file left untouched: {e}"))?;
+            if verify != expected.as_bytes() {
+                anyhow::bail!(
+                    "Verification failed — the re-encrypted content did not round-trip; \
+                     original file left untouched."
+                );
+            }
+
             let text = crypto::encode_blob_text(&combined);
             let tmp = crypto::unique_tmp_path(&path);
             std::fs::write(&tmp, text.as_bytes())?;
@@ -768,7 +817,11 @@ impl UnigenApp {
         match result {
             Ok(()) => {
                 self.editor_original_content = self.editor_content.clone();
-                self.editor_status = format!("Saved & re-encrypted: {path:?}");
+                self.editor_source_kdf = Some(self.editor_kdf);
+                self.editor_status = format!(
+                    "Saved & re-encrypted ({}): {path:?}",
+                    crypto::kdf_name(self.editor_kdf)
+                );
             }
             Err(e) => self.editor_status = format!("Error saving: {e}"),
         }
@@ -785,10 +838,11 @@ impl UnigenApp {
         self.editor_search.clear();
         self.editor_status.clear();
         self.editor_source = None;
+        self.editor_source_kdf = None;
         self.editor_open = false;
         self.editor_confirm_close = false;
         // A line copied from the search view may still be sitting on the
-        // clipboard with its 20s auto-clear timer not yet elapsed — closing
+        // clipboard with its auto-clear timer not yet elapsed — closing
         // the editor shouldn't leave a decrypted passphrase reachable
         // indefinitely just because the user didn't wait it out. Clearing
         // here also cancels the pending timer (clear_clipboard resets
@@ -888,18 +942,20 @@ fn try_mlock_str(s: &str) {
 }
 
 fn zeroize_string(s: &mut String) {
-    // String doesn't implement Zeroize directly in a way that guarantees
-    // wiping a reallocated buffer, so we overwrite the bytes in place
-    // before clearing/truncating — matching the intent of the `zeroize`
-    // crate for the case where we still need a `String` for an egui
-    // TextEdit widget to bind to.
-    unsafe {
-        let bytes = s.as_bytes_mut();
-        for b in bytes.iter_mut() {
-            *b = 0;
-        }
-    }
-    s.clear();
+    // Route through a Vec<u8> so the actual byte-wiping happens inside the
+    // `zeroize` crate (which does it correctly, with a volatile write the
+    // optimizer can't elide) instead of via a hand-rolled `unsafe` block
+    // here. `String::into_bytes`/`String::from_utf8` are safe, zero-copy
+    // (no realloc) conversions, so this has the same performance and the
+    // same wipe-the-existing-buffer-in-place semantics as before — just
+    // without `unsafe` in this crate's own code.
+    let mut bytes = std::mem::take(s).into_bytes();
+    bytes.zeroize();
+    // `bytes` is now all zero, which is valid (empty) UTF-8 content-wise
+    // only if it's empty; we don't want zero-filled "garbage" text to
+    // reappear, so drop the zeroed capacity entirely and leave `s` empty.
+    drop(bytes);
+    *s = String::new();
 }
 
 fn run_encrypt_job(
@@ -1059,12 +1115,35 @@ fn run_decrypt_job(
             let file_contents = std::fs::read(&in_path).map_err(|e| e.to_string())?;
             let combined = crypto::decode_blob_text(&file_contents);
             let plain = crypto::decrypt_blob_compat(&pwd, &combined).map_err(|e| e.to_string())?;
+            let legacy_no_aad = crypto::is_legacy_no_aad_format(&combined);
             let tmp = crypto::unique_tmp_path(&out_path);
             std::fs::write(&tmp, &plain).map_err(|e| e.to_string())?;
             if let Err(e) = std::fs::rename(&tmp, &out_path) {
                 let _ = std::fs::remove_file(&tmp);
                 return Err(e.to_string());
             }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(m) = std::fs::metadata(&out_path) {
+                    let mut p = m.permissions();
+                    p.set_mode(0o600);
+                    let _ = std::fs::set_permissions(&out_path, p);
+                }
+            }
+            let msg = if legacy_no_aad {
+                format!(
+                    "Decrypted and saved: {out_path:?}\n\
+                     Note: this file was in the legacy (pre-Rust-port) container format, \
+                     which doesn't bind an AAD to its ciphertext — its authentication tag \
+                     only verifies the bytes weren't tampered with, not that this particular \
+                     ciphertext belongs with this particular format/version/KDF. Re-encrypting \
+                     it (Encrypt tab) will upgrade it to the current AAD-bound format."
+                )
+            } else {
+                format!("Decrypted and saved: {out_path:?}")
+            };
+            return Ok(msg);
         }
         #[cfg(unix)]
         {
@@ -1341,7 +1420,7 @@ impl UnigenApp {
                                     ui.horizontal(|ui| {
                                         if ui
                                             .button("Copy")
-                                            .on_hover_text("Copy just this password; auto-clears from the clipboard in 20s.")
+                                            .on_hover_text(format!("Copy just this password; auto-clears from the clipboard in {}s.", self.autoclear_seconds))
                                             .clicked()
                                         {
                                             to_copy = Some(pwd.clone());
@@ -1474,7 +1553,9 @@ impl UnigenApp {
                 if !self.enc_pwd.is_empty() {
                     let bits = estimate_passphrase_entropy(&self.enc_pwd);
                     let (rating, _) = rate_entropy(bits);
-                    ui.small(format!("Estimated strength: {rating} (~{bits:.0} bits)"));
+                    ui.small(format!(
+                        "Estimated strength: {rating} (~{bits:.0} bits, character-class estimate — not a true entropy measurement)"
+                    ));
                 }
                 ui.checkbox(
                     &mut self.enc_pwd_autoclear,
@@ -1686,6 +1767,34 @@ impl UnigenApp {
         });
 
         ui.horizontal(|ui| {
+            ui.label("Save with KDF:");
+            egui::ComboBox::from_id_source("editor_kdf_choice")
+                .selected_text(crypto::kdf_name(self.editor_kdf))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.editor_kdf, crypto::KDF_ARGON2ID, "Argon2id (recommended)");
+                    ui.selectable_value(&mut self.editor_kdf, crypto::KDF_PBKDF2, "PBKDF2-HMAC-SHA256 (legacy)");
+                });
+            match self.editor_source_kdf {
+                Some(source_kdf) if source_kdf != self.editor_kdf => {
+                    ui.colored_label(
+                        self.palette().warning,
+                        format!(
+                            "File is currently {}; saving will change it to {}.",
+                            crypto::kdf_name(source_kdf),
+                            crypto::kdf_name(self.editor_kdf)
+                        ),
+                    );
+                }
+                Some(source_kdf) => {
+                    ui.small(format!("Matches file's current KDF ({}).", crypto::kdf_name(source_kdf)));
+                }
+                None => {
+                    ui.small("File's KDF couldn't be read from its header (legacy format); saving will write it as shown above.");
+                }
+            }
+        });
+
+        ui.horizontal(|ui| {
             ui.label("Search:");
             ui.add(
                 egui::TextEdit::singleline(&mut self.editor_search)
@@ -1726,8 +1835,9 @@ impl UnigenApp {
                 .map(|(i, l)| (i, l.to_string()))
                 .collect();
             ui.small(format!(
-                "{} matching line(s) — clear search to edit the full file. Copied lines clear from the clipboard after 20s.",
-                matches.len()
+                "{} matching line(s) — clear search to edit the full file. Copied lines clear from the clipboard after {}s.",
+                matches.len(),
+                self.autoclear_seconds
             ));
             let mut to_copy: Option<String> = None;
             egui::ScrollArea::vertical()
@@ -1739,7 +1849,7 @@ impl UnigenApp {
                     } else {
                         for (line_no, line) in &matches {
                             ui.horizontal(|ui| {
-                                if ui.button("Copy").on_hover_text("Copy just the password (the first word on the line); auto-clears from the clipboard in 20s.").clicked() {
+                                if ui.button("Copy").on_hover_text(format!("Copy just the password (the first word on the line); auto-clears from the clipboard in {}s.", self.autoclear_seconds)).clicked() {
                                     to_copy = Some(password_part(line));
                                 }
                                 ui.add(
