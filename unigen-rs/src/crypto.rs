@@ -28,6 +28,7 @@ use aes_gcm::{Aes256Gcm, Key, Nonce};
 use anyhow::{anyhow, bail, Context, Result};
 use argon2::{Algorithm, Argon2, Params, Version};
 use pbkdf2::pbkdf2_hmac;
+use rand::rngs::OsRng;
 use rand::RngCore;
 use sha2::Sha256;
 use std::fs::{self, File};
@@ -86,6 +87,19 @@ pub fn kdf_name(id: u8) -> &'static str {
 /// Derive a 32-byte AES-256 key from a passphrase + salt using the given
 /// KDF. The passphrase bytes are held in a `Zeroizing` buffer for the
 /// duration and wiped on drop regardless of the return path.
+///
+/// NOTE on [`MIN_PASSPHRASE_LEN`]: this function deliberately does **not**
+/// enforce it. `derive_key` is also the decrypt-side codepath (blob,
+/// stream, and legacy-Python-format decryption all call it), and a strict
+/// length floor here would make it impossible to ever decrypt a file that
+/// was originally encrypted with a shorter passphrase — including files
+/// from the legacy Python format, which never enforced a minimum at all.
+/// The minimum is enforced instead at the *encryption* entry points
+/// ([`encrypt_blob`], [`stream_encrypt_file`]), where rejecting a weak new
+/// passphrase is safe because no existing ciphertext depends on it. Any
+/// other caller that derives a key for a brand-new encryption (rather than
+/// decrypting existing data) is responsible for checking
+/// `MIN_PASSPHRASE_LEN` itself before calling in here.
 fn derive_key(password: &str, salt: &[u8], kdf_id: u8) -> Result<Zeroizing<[u8; 32]>> {
     let char_count = password.chars().count();
     if char_count > MAX_PASSPHRASE_LEN {
@@ -115,6 +129,21 @@ fn derive_key(password: &str, salt: &[u8], kdf_id: u8) -> Result<Zeroizing<[u8; 
     Ok(key)
 }
 
+/// Enforce [`MIN_PASSPHRASE_LEN`] for a *new* encryption. Call this from
+/// every encrypt entry point (never from a decrypt path — see the note on
+/// `derive_key`).
+fn require_min_passphrase_len(password: &str) -> Result<()> {
+    let char_count = password.chars().count();
+    if char_count < MIN_PASSPHRASE_LEN {
+        bail!(
+            "Passphrase too short ({} chars). Minimum is {} characters.",
+            char_count,
+            MIN_PASSPHRASE_LEN
+        );
+    }
+    Ok(())
+}
+
 fn aead_for_key(key: &[u8; 32]) -> Aes256Gcm {
     Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key))
 }
@@ -141,6 +170,7 @@ fn blob_aad(kdf_id: u8, version: u8) -> [u8; 6] {
 /// Returns the full container: MAGIC || VERSION || kdf_id || salt(16) ||
 /// nonce(12) || ciphertext(+tag).
 pub fn encrypt_blob(password: &str, data: &[u8], kdf_id: u8) -> Result<Vec<u8>> {
+    require_min_passphrase_len(password)?;
     if data.len() > MAX_BLOB_SIZE {
         bail!(
             "Input too large for the in-memory blob format ({} bytes > {} MiB limit); \
@@ -151,8 +181,8 @@ pub fn encrypt_blob(password: &str, data: &[u8], kdf_id: u8) -> Result<Vec<u8>> 
     }
     let mut salt = [0u8; 16];
     let mut nonce_bytes = [0u8; 12];
-    rand::thread_rng().fill_bytes(&mut salt);
-    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    OsRng.fill_bytes(&mut salt);
+    OsRng.fill_bytes(&mut nonce_bytes);
 
     let key = derive_key(password, &salt, kdf_id)?;
     let cipher = aead_for_key(&key);
@@ -276,6 +306,34 @@ pub fn decrypt_blob_compat(password: &str, combined: &[u8]) -> Result<Vec<u8>> {
     decrypt_legacy_python_blob(password, combined)
 }
 
+/// Best-effort peek at the KDF a container's header claims to use, without
+/// deriving any key or decrypting anything. Returns `None` for the
+/// magic-less legacy Python format (its bytes are indistinguishable from
+/// noise without attempting a decrypt — it's *always* PBKDF2 by
+/// convention, but that's an assumption, not something read off the
+/// header) so callers can tell "no KDF marker to show" apart from "shown
+/// KDF is Argon2id/PBKDF2".
+pub fn peek_kdf_id(combined: &[u8]) -> Option<u8> {
+    if combined.starts_with(BLOB_MAGIC) && combined.len() > 5 {
+        return Some(combined[5]);
+    }
+    if combined.starts_with(PY_ENC_MAGIC) && combined.len() > 4 {
+        return Some(combined[4]);
+    }
+    None
+}
+
+/// True if `combined` will be (or was) decrypted via the legacy Python
+/// container path in [`decrypt_blob_compat`] — i.e. it does *not* start
+/// with this port's own [`BLOB_MAGIC`]. Both legacy sub-formats (with or
+/// without [`PY_ENC_MAGIC`]) bind no AAD to the ciphertext (see the module
+/// docs and [`decrypt_legacy_python_blob`]), so callers can use this to
+/// surface a "this file's format doesn't authenticate its context" notice
+/// after a successful legacy decrypt.
+pub fn is_legacy_no_aad_format(combined: &[u8]) -> bool {
+    !combined.starts_with(BLOB_MAGIC)
+}
+
 /// Base64-encode a blob container to ASCII text, matching the Python
 /// original's on-disk `.enc` representation (and enabling the same
 /// copy/paste-to-clipboard flow).
@@ -336,7 +394,7 @@ pub fn unique_tmp_path(final_path: &Path) -> PathBuf {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let mut rand_bytes = [0u8; 8];
-    rand::thread_rng().fill_bytes(&mut rand_bytes);
+    OsRng.fill_bytes(&mut rand_bytes);
     let rand_hex = hex::encode(rand_bytes);
     let file_name = final_path
         .file_name()
@@ -390,13 +448,14 @@ pub fn stream_encrypt_file(
     kdf_id: u8,
     mut on_progress: Option<Progress<'_>>,
 ) -> Result<()> {
+    require_min_passphrase_len(password)?;
     if in_path == out_path {
         bail!("Input and output paths must be different");
     }
     let mut salt = [0u8; 16];
     let mut base_nonce = [0u8; 4];
-    rand::thread_rng().fill_bytes(&mut salt);
-    rand::thread_rng().fill_bytes(&mut base_nonce);
+    OsRng.fill_bytes(&mut salt);
+    OsRng.fill_bytes(&mut base_nonce);
 
     let key = derive_key(password, &salt, kdf_id)?;
     let cipher = aead_for_key(&key);
@@ -632,5 +691,266 @@ pub fn stream_decrypt_file(
             }
             Err(e)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PWD: &str = "correct horse battery staple";
+
+    #[test]
+    fn blob_round_trip_argon2id() {
+        let data = b"hello world, this is a secret";
+        let combined = encrypt_blob(PWD, data, KDF_ARGON2ID).unwrap();
+        let plain = decrypt_blob(PWD, &combined).unwrap();
+        assert_eq!(plain, data);
+    }
+
+    #[test]
+    fn blob_round_trip_pbkdf2() {
+        let data = b"another secret payload";
+        let combined = encrypt_blob(PWD, data, KDF_PBKDF2).unwrap();
+        let plain = decrypt_blob(PWD, &combined).unwrap();
+        assert_eq!(plain, data);
+    }
+
+    #[test]
+    fn blob_round_trip_empty_input() {
+        let combined = encrypt_blob(PWD, b"", KDF_ARGON2ID).unwrap();
+        let plain = decrypt_blob(PWD, &combined).unwrap();
+        assert!(plain.is_empty());
+    }
+
+    #[test]
+    fn blob_wrong_password_fails() {
+        let combined = encrypt_blob(PWD, b"secret", KDF_ARGON2ID).unwrap();
+        assert!(decrypt_blob("wrong password entirely", &combined).is_err());
+    }
+
+    #[test]
+    fn blob_tampered_ciphertext_fails() {
+        let mut combined = encrypt_blob(PWD, b"secret data here", KDF_ARGON2ID).unwrap();
+        let last = combined.len() - 1;
+        combined[last] ^= 0xFF;
+        assert!(decrypt_blob(PWD, &combined).is_err());
+    }
+
+    #[test]
+    fn blob_header_layout_is_stable() {
+        // MAGIC(4) || VERSION(1) || kdf_id(1) || salt(16) || nonce(12) || ct(+tag)
+        let combined = encrypt_blob(PWD, b"x", KDF_ARGON2ID).unwrap();
+        assert_eq!(&combined[0..4], BLOB_MAGIC);
+        assert_eq!(combined[4], FORMAT_VERSION);
+        assert_eq!(combined[5], KDF_ARGON2ID);
+        assert!(combined.len() >= 4 + 1 + 1 + 16 + 12 + 1 + 16); // + tag
+    }
+
+    #[test]
+    fn blob_rejects_bad_magic() {
+        let mut combined = encrypt_blob(PWD, b"x", KDF_ARGON2ID).unwrap();
+        combined[0] = b'X';
+        assert!(decrypt_blob(PWD, &combined).is_err());
+    }
+
+    #[test]
+    fn blob_rejects_too_short() {
+        assert!(decrypt_blob(PWD, b"short").is_err());
+    }
+
+    #[test]
+    fn blob_rejects_oversized_input() {
+        // Cheaply construct something over MAX_BLOB_SIZE without actually
+        // allocating that much real data content.
+        let oversized = vec![0u8; MAX_BLOB_SIZE + 1];
+        assert!(decrypt_blob(PWD, &oversized).is_err());
+    }
+
+    #[test]
+    fn encrypt_blob_enforces_min_passphrase_len() {
+        let short = "short";
+        assert!(short.len() < MIN_PASSPHRASE_LEN);
+        assert!(encrypt_blob(short, b"data", KDF_ARGON2ID).is_err());
+    }
+
+    #[test]
+    fn encrypt_blob_enforces_max_passphrase_len() {
+        let long: String = "a".repeat(MAX_PASSPHRASE_LEN + 1);
+        assert!(encrypt_blob(&long, b"data", KDF_ARGON2ID).is_err());
+    }
+
+    #[test]
+    fn decrypt_blob_v1_aad_uses_stored_version_not_current_constant() {
+        // Regression test for the HIGH bug documented above blob_aad:
+        // decrypt must build the AAD from the version byte stored in the
+        // file, not from the current FORMAT_VERSION constant, or old
+        // (v1) files fail authentication even with the right passphrase.
+        let mut salt = [0u8; 16];
+        let mut nonce_bytes = [0u8; 12];
+        OsRng.fill_bytes(&mut salt);
+        OsRng.fill_bytes(&mut nonce_bytes);
+        let key = derive_key(PWD, &salt, KDF_ARGON2ID).unwrap();
+        let cipher = aead_for_key(&key);
+        let old_version: u8 = 1;
+        let aad = blob_aad(KDF_ARGON2ID, old_version);
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        let ct = cipher
+            .encrypt(nonce, Payload { msg: b"legacy-versioned data", aad: &aad })
+            .unwrap();
+
+        let mut combined = Vec::new();
+        combined.extend_from_slice(BLOB_MAGIC);
+        combined.push(old_version);
+        combined.push(KDF_ARGON2ID);
+        combined.extend_from_slice(&salt);
+        combined.extend_from_slice(&nonce_bytes);
+        combined.extend_from_slice(&ct);
+
+        let plain = decrypt_blob(PWD, &combined).unwrap();
+        assert_eq!(plain, b"legacy-versioned data");
+    }
+
+    #[test]
+    fn legacy_python_format_with_magic_round_trips() {
+        // New-style Python container: PY_ENC_MAGIC || kdf_id || salt(16) ||
+        // iv(12) || ct, no AAD.
+        let salt = [7u8; 16];
+        let iv = [9u8; 12];
+        let key = derive_key(PWD, &salt, KDF_PBKDF2).unwrap();
+        let cipher = aead_for_key(&key);
+        let nonce = Nonce::from_slice(&iv);
+        let ct = cipher
+            .encrypt(nonce, Payload { msg: b"old app data", aad: &[] })
+            .unwrap();
+
+        let mut combined = Vec::new();
+        combined.extend_from_slice(PY_ENC_MAGIC);
+        combined.push(KDF_PBKDF2);
+        combined.extend_from_slice(&salt);
+        combined.extend_from_slice(&iv);
+        combined.extend_from_slice(&ct);
+
+        let plain = decrypt_blob_compat(PWD, &combined).unwrap();
+        assert_eq!(plain, b"old app data");
+    }
+
+    #[test]
+    fn legacy_python_format_no_magic_round_trips() {
+        // Oldest-style Python container: salt(16) || iv(12) || ct, always
+        // PBKDF2, no magic byte, no AAD.
+        let salt = [3u8; 16];
+        let iv = [4u8; 12];
+        let key = derive_key(PWD, &salt, KDF_PBKDF2).unwrap();
+        let cipher = aead_for_key(&key);
+        let nonce = Nonce::from_slice(&iv);
+        let ct = cipher
+            .encrypt(nonce, Payload { msg: b"very old app data", aad: &[] })
+            .unwrap();
+
+        let mut combined = Vec::new();
+        combined.extend_from_slice(&salt);
+        combined.extend_from_slice(&iv);
+        combined.extend_from_slice(&ct);
+
+        let plain = decrypt_blob_compat(PWD, &combined).unwrap();
+        assert_eq!(plain, b"very old app data");
+    }
+
+    #[test]
+    fn blob_text_encode_decode_round_trips() {
+        let combined = encrypt_blob(PWD, b"round trip via base64 text", KDF_ARGON2ID).unwrap();
+        let text = encode_blob_text(&combined);
+        // Should be plain base64 ASCII, not raw binary.
+        assert!(text.is_ascii());
+        let decoded = decode_blob_text(text.as_bytes());
+        assert_eq!(decoded, combined);
+    }
+
+    #[test]
+    fn decode_blob_text_falls_back_to_raw_bytes() {
+        let combined = encrypt_blob(PWD, b"raw fallback", KDF_ARGON2ID).unwrap();
+        // Not base64 (contains raw binary), should fall back to identity.
+        let decoded = decode_blob_text(&combined);
+        assert_eq!(decoded, combined);
+    }
+
+    #[test]
+    fn stream_round_trip_small_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "unigen_test_{}_{}",
+            std::process::id(),
+            {
+                let mut n = [0u8; 8];
+                OsRng.fill_bytes(&mut n);
+                hex::encode(n)
+            }
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let in_path = dir.join("plain.bin");
+        let enc_path = dir.join("plain.enc");
+        let out_path = dir.join("plain.out");
+
+        let payload = vec![0x42u8; STREAM_CHUNK_SIZE + 12345]; // spans 2 chunks
+        fs::write(&in_path, &payload).unwrap();
+
+        stream_encrypt_file(&in_path, &enc_path, PWD, KDF_ARGON2ID, None).unwrap();
+        stream_decrypt_file(&enc_path, Some(&out_path), PWD, None).unwrap();
+
+        let round_tripped = fs::read(&out_path).unwrap();
+        assert_eq!(round_tripped, payload);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stream_wrong_password_fails() {
+        let dir = std::env::temp_dir().join(format!(
+            "unigen_test2_{}_{}",
+            std::process::id(),
+            {
+                let mut n = [0u8; 8];
+                OsRng.fill_bytes(&mut n);
+                hex::encode(n)
+            }
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let in_path = dir.join("plain.bin");
+        let enc_path = dir.join("plain.enc");
+
+        fs::write(&in_path, b"small stream payload").unwrap();
+        stream_encrypt_file(&in_path, &enc_path, PWD, KDF_ARGON2ID, None).unwrap();
+
+        let result = stream_decrypt_file(&enc_path, None, "totally wrong password", None);
+        assert!(result.is_err());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stream_encrypt_rejects_same_in_out_path() {
+        let p = std::env::temp_dir().join("unigen_same_path_test.bin");
+        assert!(stream_encrypt_file(&p, &p, PWD, KDF_ARGON2ID, None).is_err());
+    }
+
+    #[test]
+    fn stream_encrypt_enforces_min_passphrase_len() {
+        let dir = std::env::temp_dir().join(format!(
+            "unigen_test3_{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let in_path = dir.join("plain.bin");
+        let enc_path = dir.join("plain.enc");
+        fs::write(&in_path, b"data").unwrap();
+        assert!(stream_encrypt_file(&in_path, &enc_path, "short", KDF_ARGON2ID, None).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn kdf_name_covers_known_ids() {
+        assert_eq!(kdf_name(KDF_ARGON2ID), "Argon2id");
+        assert_eq!(kdf_name(KDF_PBKDF2), "PBKDF2-HMAC-SHA256");
+        assert_eq!(kdf_name(255), "unknown");
     }
 }
