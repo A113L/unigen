@@ -508,7 +508,7 @@ impl UnigenApp {
         let result = (|| -> anyhow::Result<String> {
             crypto::check_blob_file_size(&path)?;
             let original_identity = shred::file_identity(&path)?;
-            let original_data = std::fs::read(&path)?;
+            let original_data = Zeroizing::new(std::fs::read(&path)?);
             let combined = crypto::encrypt_blob(&pwd, &original_data, crypto::DEFAULT_KDF)?;
 
             let enc_path = {
@@ -529,7 +529,7 @@ impl UnigenApp {
             let check_contents = std::fs::read(&enc_path)?;
             let check_combined = crypto::decode_blob_text(&check_contents);
             let decrypted_back = crypto::decrypt_blob_compat(&pwd, &check_combined)?;
-            if decrypted_back != original_data {
+            if decrypted_back.as_slice() != original_data.as_slice() {
                 anyhow::bail!("Verification failed — the encrypted file did not round-trip; original was NOT deleted.");
             }
 
@@ -735,8 +735,8 @@ impl UnigenApp {
                 );
             }
             let combined = crypto::decode_blob_text(&file_contents);
-            let plain = crypto::decrypt_blob_compat(&pwd, &combined)?;
-            let text = String::from_utf8(plain)
+            let plain = Zeroizing::new(crypto::decrypt_blob_compat(&pwd, &combined)?);
+            let text = String::from_utf8(plain.as_slice().to_vec())
                 .map_err(|_| anyhow::anyhow!("Decrypted content isn't valid UTF-8 text — not editable here."))?;
             Ok((text, crypto::peek_kdf_id(&combined), crypto::is_legacy_no_aad_format(&combined)))
         })();
@@ -793,9 +793,11 @@ impl UnigenApp {
             // Verify round-trip BEFORE touching the real file: decrypt the
             // freshly-produced ciphertext with the same passphrase and
             // confirm it matches exactly what we intended to save.
-            let verify = crypto::decrypt_blob(&self.editor_pwd, &combined)
-                .map_err(|e| anyhow::anyhow!("Verification failed after encrypting — original file left untouched: {e}"))?;
-            if verify != expected.as_bytes() {
+            let verify = Zeroizing::new(
+                crypto::decrypt_blob(&self.editor_pwd, &combined)
+                    .map_err(|e| anyhow::anyhow!("Verification failed after encrypting — original file left untouched: {e}"))?
+            );
+            if verify.as_slice() != expected.as_bytes() {
                 anyhow::bail!(
                     "Verification failed — the re-encrypted content did not round-trip; \
                      original file left untouched."
@@ -1023,12 +1025,14 @@ fn run_encrypt_job(
             // Small-file, in-memory blob path.
             crypto::check_blob_file_size(&in_path).map_err(|e| e.to_string())?;
             let source_identity = shred::file_identity(&in_path).map_err(|e| e.to_string())?;
-            let data = std::fs::read(&in_path).map_err(|e| e.to_string())?;
+            let data = Zeroizing::new(std::fs::read(&in_path).map_err(|e| e.to_string())?);
             let combined = crypto::encrypt_blob(&pwd, &data, kdf_id).map_err(|e| e.to_string())?;
 
             // Verify round-trip before offering to shred.
-            let verify = crypto::decrypt_blob(&pwd, &combined).map_err(|e| e.to_string())?;
-            if verify != data {
+            let verify = Zeroizing::new(
+                crypto::decrypt_blob(&pwd, &combined).map_err(|e| e.to_string())?
+            );
+            if verify.as_slice() != data.as_slice() {
                 return Err("Verification failed — original was NOT modified.".to_string());
             }
 
@@ -1119,7 +1123,7 @@ fn run_decrypt_job(
             crypto::check_blob_file_size(&in_path).map_err(|e| e.to_string())?;
             let file_contents = std::fs::read(&in_path).map_err(|e| e.to_string())?;
             let combined = crypto::decode_blob_text(&file_contents);
-            let plain = crypto::decrypt_blob_compat(&pwd, &combined).map_err(|e| e.to_string())?;
+            let plain = Zeroizing::new(crypto::decrypt_blob_compat(&pwd, &combined).map_err(|e| e.to_string())?);
             let legacy_no_aad = crypto::is_legacy_no_aad_format(&combined);
             let tmp = crypto::unique_tmp_path(&out_path);
             crypto::write_durable(&tmp, &plain).map_err(|e| e.to_string())?;
@@ -1572,7 +1576,7 @@ impl UnigenApp {
                 if cfg!(target_os = "linux") {
                     ui.checkbox(
                         &mut self.linux_try_exclusion,
-                        "Best-effort: ask the OS to keep the passphrase/plaintext out of swap (mlock)",
+                        "Best-effort: ask the OS to keep the passphrase out of swap (mlock)",
                     );
                     ui.small("Best effort only — not a guarantee on every kernel/filesystem configuration.");
                 }
