@@ -190,7 +190,13 @@ pub fn encrypt_blob(password: &str, data: &[u8], kdf_id: u8) -> Result<Vec<u8>> 
     let nonce = Nonce::from_slice(&nonce_bytes);
 
     let ct = cipher
-        .encrypt(nonce, Payload { msg: data, aad: &aad })
+        .encrypt(
+            nonce,
+            Payload {
+                msg: data,
+                aad: &aad,
+            },
+        )
         .map_err(|_| anyhow!("encryption failed"))?;
 
     let mut out = Vec::with_capacity(4 + 1 + 1 + 16 + 12 + ct.len());
@@ -361,8 +367,6 @@ pub fn decode_blob_text(file_contents: &[u8]) -> Vec<u8> {
     file_contents.to_vec()
 }
 
-
-
 // Same bug/fix as blob_aad above: version must be a parameter (sourced from
 // FORMAT_VERSION on encrypt, from the file's own header byte on decrypt),
 // not always the current compile-time constant, or old-version files fail
@@ -437,10 +441,7 @@ pub fn create_private_file(path: &Path) -> std::io::Result<File> {
 
     #[cfg(not(unix))]
     {
-        OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
+        OpenOptions::new().write(true).create_new(true).open(path)
     }
 }
 
@@ -553,7 +554,8 @@ pub fn stream_encrypt_file(
     let result = (|| -> Result<()> {
         let fin = File::open(in_path).with_context(|| format!("opening {in_path:?}"))?;
         let mut reader = BufReader::with_capacity(STREAM_CHUNK_SIZE, fin);
-        let fout = create_private_file(&tmp_path).with_context(|| format!("creating private temporary file {tmp_path:?}"))?;
+        let fout = create_private_file(&tmp_path)
+            .with_context(|| format!("creating private temporary file {tmp_path:?}"))?;
         let mut writer = BufWriter::with_capacity(STREAM_CHUNK_SIZE + 4096, fout);
 
         writer.write_all(STREAM_MAGIC)?;
@@ -592,7 +594,10 @@ pub fn stream_encrypt_file(
             let ct = cipher
                 .encrypt(
                     nonce,
-                    Payload { msg: &chunk[..chunk_len], aad: &aad },
+                    Payload {
+                        msg: &chunk[..chunk_len],
+                        aad: &aad,
+                    },
                 )
                 .map_err(|_| anyhow!("chunk encryption failed"))?;
 
@@ -716,7 +721,7 @@ pub fn stream_decrypt_file(
             let mut len_bytes = [0u8; 4];
             reader.read_exact(&mut len_bytes)?;
             let ct_len = u32::from_be_bytes(len_bytes) as usize;
-            if ct_len < 16 || ct_len > STREAM_CHUNK_SIZE + 64 {
+            if !(16..=STREAM_CHUNK_SIZE + 64).contains(&ct_len) {
                 bail!("Corrupted or malicious chunk length");
             }
             let mut ct = vec![0u8; ct_len];
@@ -738,7 +743,13 @@ pub fn stream_decrypt_file(
             let aad = stream_chunk_aad(kdf_id, version, counter, is_final);
 
             let plain = cipher
-                .decrypt(nonce, Payload { msg: &ct, aad: &aad })
+                .decrypt(
+                    nonce,
+                    Payload {
+                        msg: &ct,
+                        aad: &aad,
+                    },
+                )
                 .map_err(|_| {
                     anyhow!("Decryption failed: wrong passphrase or corrupted/tampered file")
                 })?;
@@ -850,8 +861,10 @@ pub fn verify_stream_roundtrip(
             Ok(filled)
         }
 
-        let mut orig_reader = BufReader::with_capacity(STREAM_CHUNK_SIZE, File::open(original_path)?);
-        let mut dec_reader = BufReader::with_capacity(STREAM_CHUNK_SIZE, File::open(&decrypted_tmp)?);
+        let mut orig_reader =
+            BufReader::with_capacity(STREAM_CHUNK_SIZE, File::open(original_path)?);
+        let mut dec_reader =
+            BufReader::with_capacity(STREAM_CHUNK_SIZE, File::open(&decrypted_tmp)?);
         let mut orig_buf = vec![0u8; STREAM_CHUNK_SIZE];
         let mut dec_buf = vec![0u8; STREAM_CHUNK_SIZE];
 
@@ -979,7 +992,13 @@ mod tests {
         let aad = blob_aad(KDF_ARGON2ID, old_version);
         let nonce = Nonce::from_slice(&nonce_bytes);
         let ct = cipher
-            .encrypt(nonce, Payload { msg: b"legacy-versioned data", aad: &aad })
+            .encrypt(
+                nonce,
+                Payload {
+                    msg: b"legacy-versioned data",
+                    aad: &aad,
+                },
+            )
             .unwrap();
 
         let mut combined = Vec::new();
@@ -1004,7 +1023,13 @@ mod tests {
         let cipher = aead_for_key(&key);
         let nonce = Nonce::from_slice(&iv);
         let ct = cipher
-            .encrypt(nonce, Payload { msg: b"old app data", aad: &[] })
+            .encrypt(
+                nonce,
+                Payload {
+                    msg: b"old app data",
+                    aad: &[],
+                },
+            )
             .unwrap();
 
         let mut combined = Vec::new();
@@ -1028,7 +1053,13 @@ mod tests {
         let cipher = aead_for_key(&key);
         let nonce = Nonce::from_slice(&iv);
         let ct = cipher
-            .encrypt(nonce, Payload { msg: b"very old app data", aad: &[] })
+            .encrypt(
+                nonce,
+                Payload {
+                    msg: b"very old app data",
+                    aad: &[],
+                },
+            )
             .unwrap();
 
         let mut combined = Vec::new();
@@ -1060,15 +1091,11 @@ mod tests {
 
     #[test]
     fn stream_round_trip_small_file() {
-        let dir = std::env::temp_dir().join(format!(
-            "unigen_test_{}_{}",
-            std::process::id(),
-            {
-                let mut n = [0u8; 8];
-                OsRng.fill_bytes(&mut n);
-                hex::encode(n)
-            }
-        ));
+        let dir = std::env::temp_dir().join(format!("unigen_test_{}_{}", std::process::id(), {
+            let mut n = [0u8; 8];
+            OsRng.fill_bytes(&mut n);
+            hex::encode(n)
+        }));
         fs::create_dir_all(&dir).unwrap();
         let in_path = dir.join("plain.bin");
         let enc_path = dir.join("plain.enc");
@@ -1088,15 +1115,11 @@ mod tests {
 
     #[test]
     fn stream_wrong_password_fails() {
-        let dir = std::env::temp_dir().join(format!(
-            "unigen_test2_{}_{}",
-            std::process::id(),
-            {
-                let mut n = [0u8; 8];
-                OsRng.fill_bytes(&mut n);
-                hex::encode(n)
-            }
-        ));
+        let dir = std::env::temp_dir().join(format!("unigen_test2_{}_{}", std::process::id(), {
+            let mut n = [0u8; 8];
+            OsRng.fill_bytes(&mut n);
+            hex::encode(n)
+        }));
         fs::create_dir_all(&dir).unwrap();
         let in_path = dir.join("plain.bin");
         let enc_path = dir.join("plain.enc");
@@ -1118,10 +1141,7 @@ mod tests {
 
     #[test]
     fn stream_encrypt_enforces_min_passphrase_len() {
-        let dir = std::env::temp_dir().join(format!(
-            "unigen_test3_{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("unigen_test3_{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let in_path = dir.join("plain.bin");
         let enc_path = dir.join("plain.enc");
