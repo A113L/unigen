@@ -56,10 +56,24 @@ pub const MIN_PASSPHRASE_LEN: usize = 8;
 // ---- Container formats -------------------------------------------------
 pub const BLOB_MAGIC: &[u8; 4] = b"UGR1";
 pub const STREAM_MAGIC: &[u8; 4] = b"UGRS";
-pub const FORMAT_VERSION: u8 = 1;
+// MEDIUM-1 fix bumped this from 1 -> 2: the streaming container's
+// base_nonce shrank from 8 to 4 random bytes (freeing a full 8-byte,
+// non-truncated chunk counter) to eliminate a nonce-reuse risk on very
+// large files. Blob format (encrypt_blob/decrypt_blob) is unaffected by
+// this bump but shares the constant, so its on-disk layout is unchanged.
+pub const FORMAT_VERSION: u8 = 2;
 
 pub const STREAM_CHUNK_SIZE: usize = 4 * 1024 * 1024; // 4 MiB plaintext/chunk
 pub const STREAM_SIZE_THRESHOLD: u64 = 20 * 1024 * 1024; // switch above 20 MiB
+
+// MEDIUM-2 fix: encrypt_blob/decrypt_blob load their entire input into
+// memory (that's the whole point of the "small file" path — the streaming
+// path exists precisely for anything bigger). Without a cap, decrypt_blob
+// on an attacker-supplied or accidentally-huge file is an easy memory-DoS:
+// the file gets read fully into a Vec before any crypto check happens.
+// This is a generous ceiling for the intended use case (small text/password
+// files, clipboard contents) while still bounding worst-case memory use.
+pub const MAX_BLOB_SIZE: usize = 64 * 1024 * 1024; // 64 MiB
 
 pub fn kdf_name(id: u8) -> &'static str {
     match id {
@@ -105,10 +119,20 @@ fn aead_for_key(key: &[u8; 32]) -> Aes256Gcm {
     Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key))
 }
 
-fn blob_aad(kdf_id: u8) -> [u8; 6] {
+// BUG FIX: blob_aad used to always bake in the compile-time FORMAT_VERSION
+// constant. That's correct for encrypt_blob (always writes the current
+// version) but wrong for decrypt_blob once FORMAT_VERSION was bumped to 2:
+// a v1-encrypted blob has v1 baked into its AAD at encryption time, but
+// decrypt_blob was still building the AAD with the *current* constant (2),
+// so the AES-GCM auth tag would never verify for v1 files — decryption
+// failed outright (not "wrong plaintext", but an authentication failure
+// surfaced as "wrong passphrase or corrupted file"). Fix: pass the actual
+// version byte in, sourced from FORMAT_VERSION on encrypt and from the
+// file's own version field on decrypt.
+fn blob_aad(kdf_id: u8, version: u8) -> [u8; 6] {
     let mut aad = [0u8; 6];
     aad[0..4].copy_from_slice(BLOB_MAGIC);
-    aad[4] = FORMAT_VERSION;
+    aad[4] = version;
     aad[5] = kdf_id;
     aad
 }
@@ -117,6 +141,14 @@ fn blob_aad(kdf_id: u8) -> [u8; 6] {
 /// Returns the full container: MAGIC || VERSION || kdf_id || salt(16) ||
 /// nonce(12) || ciphertext(+tag).
 pub fn encrypt_blob(password: &str, data: &[u8], kdf_id: u8) -> Result<Vec<u8>> {
+    if data.len() > MAX_BLOB_SIZE {
+        bail!(
+            "Input too large for the in-memory blob format ({} bytes > {} MiB limit); \
+             use the streaming file encryption path instead",
+            data.len(),
+            MAX_BLOB_SIZE / (1024 * 1024)
+        );
+    }
     let mut salt = [0u8; 16];
     let mut nonce_bytes = [0u8; 12];
     rand::thread_rng().fill_bytes(&mut salt);
@@ -124,7 +156,7 @@ pub fn encrypt_blob(password: &str, data: &[u8], kdf_id: u8) -> Result<Vec<u8>> 
 
     let key = derive_key(password, &salt, kdf_id)?;
     let cipher = aead_for_key(&key);
-    let aad = blob_aad(kdf_id);
+    let aad = blob_aad(kdf_id, FORMAT_VERSION);
     let nonce = Nonce::from_slice(&nonce_bytes);
 
     let ct = cipher
@@ -141,8 +173,33 @@ pub fn encrypt_blob(password: &str, data: &[u8], kdf_id: u8) -> Result<Vec<u8>> 
     Ok(out)
 }
 
+/// Check a file's size against [`MAX_BLOB_SIZE`] *before* reading it fully
+/// into memory. Callers on the blob (small-file) path should call this
+/// ahead of `fs::read`, otherwise the size check inside `decrypt_blob`
+/// only rejects the file *after* the DoS-relevant allocation already
+/// happened.
+pub fn check_blob_file_size(path: &Path) -> Result<()> {
+    let len = fs::metadata(path)?.len();
+    if len > MAX_BLOB_SIZE as u64 {
+        bail!(
+            "File too large for the in-memory blob format ({len} bytes > {} MiB limit); \
+             use the streaming file encryption/decryption path instead",
+            MAX_BLOB_SIZE / (1024 * 1024)
+        );
+    }
+    Ok(())
+}
+
 /// Decrypt a container produced by [`encrypt_blob`].
 pub fn decrypt_blob(password: &str, combined: &[u8]) -> Result<Vec<u8>> {
+    if combined.len() > MAX_BLOB_SIZE {
+        bail!(
+            "File too large for the in-memory blob format ({} bytes > {} MiB limit); \
+             this doesn't look like a small-file UNIGEN blob",
+            combined.len(),
+            MAX_BLOB_SIZE / (1024 * 1024)
+        );
+    }
     if combined.len() < 4 + 1 + 1 + 16 + 12 {
         bail!("Invalid file format (too short)");
     }
@@ -150,7 +207,10 @@ pub fn decrypt_blob(password: &str, combined: &[u8]) -> Result<Vec<u8>> {
         bail!("Not a recognized UNIGEN encrypted blob (bad magic)");
     }
     let version = combined[4];
-    if version != FORMAT_VERSION {
+    // v1 and v2 share the exact same blob container layout — only the
+    // *streaming* format changed base_nonce size between v1 and v2 (see
+    // FORMAT_VERSION doc comment), so both are accepted here.
+    if version != 1 && version != FORMAT_VERSION {
         bail!("Unsupported format version: {version}");
     }
     let kdf_id = combined[5];
@@ -160,7 +220,7 @@ pub fn decrypt_blob(password: &str, combined: &[u8]) -> Result<Vec<u8>> {
 
     let key = derive_key(password, salt, kdf_id)?;
     let cipher = aead_for_key(&key);
-    let aad = blob_aad(kdf_id);
+    let aad = blob_aad(kdf_id, version);
     let nonce = Nonce::from_slice(nonce_bytes);
 
     cipher
@@ -245,10 +305,14 @@ pub fn decode_blob_text(file_contents: &[u8]) -> Vec<u8> {
 
 
 
-fn stream_chunk_aad(kdf_id: u8, counter: u64, is_final: bool) -> [u8; 15] {
+// Same bug/fix as blob_aad above: version must be a parameter (sourced from
+// FORMAT_VERSION on encrypt, from the file's own header byte on decrypt),
+// not always the current compile-time constant, or old-version files fail
+// AES-GCM authentication instead of decrypting.
+fn stream_chunk_aad(kdf_id: u8, version: u8, counter: u64, is_final: bool) -> [u8; 15] {
     let mut aad = [0u8; 15];
     aad[0..4].copy_from_slice(STREAM_MAGIC);
-    aad[4] = FORMAT_VERSION;
+    aad[4] = version;
     aad[5] = kdf_id;
     aad[6..14].copy_from_slice(&counter.to_be_bytes());
     aad[14] = if is_final { 1 } else { 0 };
@@ -330,7 +394,7 @@ pub fn stream_encrypt_file(
         bail!("Input and output paths must be different");
     }
     let mut salt = [0u8; 16];
-    let mut base_nonce = [0u8; 8];
+    let mut base_nonce = [0u8; 4];
     rand::thread_rng().fill_bytes(&mut salt);
     rand::thread_rng().fill_bytes(&mut base_nonce);
 
@@ -365,12 +429,20 @@ pub fn stream_encrypt_file(
             let next_len = read_full(&mut reader, &mut next_chunk)?;
             let is_final = next_len == 0;
 
+            // MEDIUM-1 fix: previously base_nonce was 8 random bytes and the
+            // remaining 4 bytes carried `counter as u32` — truncating a u64
+            // counter to 32 bits. After 2^32 chunks (with a small chunk size,
+            // reachable on a large file) the counter wraps and the exact
+            // same 12-byte nonce gets reused under the same key, breaking
+            // AES-GCM's confidentiality/integrity guarantees. Fix: shrink
+            // base_nonce to 4 random bytes and give the full 64-bit counter
+            // its own 8 bytes, so the nonce never repeats for the lifetime
+            // of a single key (2^64 chunks is unreachable in practice).
             let mut nonce_bytes = [0u8; 12];
-            nonce_bytes[..8].copy_from_slice(&base_nonce);
-            nonce_bytes[8..].copy_from_slice(&(counter as u32).to_be_bytes());
+            nonce_bytes[..4].copy_from_slice(&base_nonce);
+            nonce_bytes[4..].copy_from_slice(&counter.to_be_bytes());
             let nonce = Nonce::from_slice(&nonce_bytes);
-            let aad = stream_chunk_aad(kdf_id, counter, is_final);
-
+            let aad = stream_chunk_aad(kdf_id, FORMAT_VERSION, counter, is_final);
             let ct = cipher
                 .encrypt(
                     nonce,
@@ -453,13 +525,18 @@ pub fn stream_decrypt_file(
     let mut header = [0u8; 2];
     reader.read_exact(&mut header)?;
     let (version, kdf_id) = (header[0], header[1]);
-    if version != FORMAT_VERSION {
+    if version != 1 && version != FORMAT_VERSION {
         bail!("Unsupported format version: {version}");
     }
+    // v1 wrote an 8-byte base_nonce and truncated the per-chunk counter to
+    // u32; v2 (current) writes a 4-byte base_nonce and uses the full u64
+    // counter (see FORMAT_VERSION doc comment). Read the size matching the
+    // version so both old and new files remain decryptable.
+    let base_nonce_len: usize = if version == 1 { 8 } else { 4 };
     let mut salt = [0u8; 16];
     reader.read_exact(&mut salt)?;
     let mut base_nonce = [0u8; 8];
-    reader.read_exact(&mut base_nonce)?;
+    reader.read_exact(&mut base_nonce[..base_nonce_len])?;
 
     let key = derive_key(password, &salt, kdf_id)?;
     let cipher = aead_for_key(&key);
@@ -476,9 +553,9 @@ pub fn stream_decrypt_file(
 
         let mut counter: u64 = 0;
         // Header already consumed from `reader`: magic (4) + version/kdf (2)
-        // + salt (16) + base_nonce (8) = 30 bytes. Count them so `done`
+        // + salt (16) + base_nonce (base_nonce_len). Count them so `done`
         // stays in the same units as `total` (encrypted file size).
-        let mut done: u64 = 4 + 2 + 16 + 8;
+        let mut done: u64 = 4 + 2 + 16 + base_nonce_len as u64;
         loop {
             let mut final_byte = [0u8; 1];
             match reader.read_exact(&mut final_byte) {
@@ -504,10 +581,15 @@ pub fn stream_decrypt_file(
             done += 1 + 4 + ct_len as u64;
 
             let mut nonce_bytes = [0u8; 12];
-            nonce_bytes[..8].copy_from_slice(&base_nonce);
-            nonce_bytes[8..].copy_from_slice(&(counter as u32).to_be_bytes());
+            if version == 1 {
+                nonce_bytes[..8].copy_from_slice(&base_nonce[..8]);
+                nonce_bytes[8..].copy_from_slice(&(counter as u32).to_be_bytes());
+            } else {
+                nonce_bytes[..4].copy_from_slice(&base_nonce[..4]);
+                nonce_bytes[4..].copy_from_slice(&counter.to_be_bytes());
+            }
             let nonce = Nonce::from_slice(&nonce_bytes);
-            let aad = stream_chunk_aad(kdf_id, counter, is_final);
+            let aad = stream_chunk_aad(kdf_id, version, counter, is_final);
 
             let plain = cipher
                 .decrypt(nonce, Payload { msg: &ct, aad: &aad })
