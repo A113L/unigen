@@ -8,6 +8,113 @@ use rand::RngCore;
 use std::fs::{self, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
+#[cfg(not(unix))]
+use std::time::SystemTime;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileIdentity {
+    #[cfg(unix)]
+    pub dev: u64,
+    #[cfg(unix)]
+    pub ino: u64,
+    #[cfg(not(unix))]
+    pub len: u64,
+    #[cfg(not(unix))]
+    pub modified: Option<SystemTime>,
+}
+
+pub fn file_identity(path: &Path) -> Result<FileIdentity> {
+    let meta = fs::metadata(path).with_context(|| format!("stat {path:?}"))?;
+    if !meta.is_file() {
+        bail!("Refusing to identify a non-regular file: {path:?}");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(FileIdentity { dev: meta.dev(), ino: meta.ino() })
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(FileIdentity { len: meta.len(), modified: meta.modified().ok() })
+    }
+}
+
+fn file_identity_from_file(file: &fs::File) -> Result<FileIdentity> {
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        bail!("Refusing to shred a non-regular file");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(FileIdentity { dev: meta.dev(), ino: meta.ino() })
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(FileIdentity { len: meta.len(), modified: meta.modified().ok() })
+    }
+}
+
+/// Shred only the file whose identity was captured before verification.
+/// The file is opened first and compared by identity before any overwrite.
+/// If the pathname changed afterwards, the opened (verified) inode is still
+/// shredded, but the replacement at the pathname is never removed.
+pub fn shred_file_if_identity(
+    path: &Path,
+    expected: FileIdentity,
+    passes: u32,
+) -> Result<ShredOutcome> {
+    let mut opts = OpenOptions::new();
+    opts.read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc_o_nofollow());
+    }
+    let mut file = opts.open(path).with_context(|| format!("opening {path:?}"))?;
+    let actual = file_identity_from_file(&file)?;
+    if actual != expected {
+        bail!("File changed after verification; refusing to overwrite the replacement: {path:?}");
+    }
+
+    let size = file.metadata()?.len();
+    const CHUNK: usize = 1024 * 1024;
+    let mut buf = vec![0u8; CHUNK];
+    for _ in 0..passes {
+        file.seek(SeekFrom::Start(0))?;
+        let mut written = 0u64;
+        while written < size {
+            let n = std::cmp::min(CHUNK as u64, size - written) as usize;
+            OsRng.fill_bytes(&mut buf[..n]);
+            file.write_all(&buf[..n])?;
+            written += n as u64;
+        }
+        file.sync_all()?;
+    }
+    file.seek(SeekFrom::Start(0))?;
+    let zeros = vec![0u8; CHUNK];
+    let mut written = 0u64;
+    while written < size {
+        let n = std::cmp::min(CHUNK as u64, size - written) as usize;
+        file.write_all(&zeros[..n])?;
+        written += n as u64;
+    }
+    file.sync_all()?;
+    drop(file);
+
+    // Never remove a pathname that no longer names the verified file.
+    match file_identity(path) {
+        Ok(current) if current == expected => {
+            fs::remove_file(path).with_context(|| format!("removing {path:?} after overwrite"))?;
+            fsync_parent(path);
+            Ok(ShredOutcome::Secure)
+        }
+        Ok(_) | Err(_) => {
+            fsync_parent(path);
+            bail!("File name changed during shredding; verified file was overwritten but the current pathname was left untouched: {path:?}");
+        }
+    }
+}
 
 pub const SSD_SHRED_CAVEAT: &str =
     "Note: multi-pass overwrite reliably destroys data on traditional spinning \
