@@ -3,6 +3,7 @@
 //! TOCTOU/symlink defenses.
 
 use anyhow::{anyhow, bail, Context, Result};
+use rand::rngs::OsRng;
 use rand::RngCore;
 use std::fs::{self, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
@@ -73,7 +74,7 @@ pub fn shred_file(path: &Path, passes: u32, delete_on_overwrite_failure: bool) -
                 let mut written = 0u64;
                 while written < size {
                     let to_write = std::cmp::min(CHUNK as u64, size - written) as usize;
-                    rand::thread_rng().fill_bytes(&mut buf[..to_write]);
+                    OsRng.fill_bytes(&mut buf[..to_write]);
                     file.write_all(&buf[..to_write])?;
                     written += to_write as u64;
                 }
