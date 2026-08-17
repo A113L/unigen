@@ -15,6 +15,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
+use zeroize::Zeroizing;
 
 /// Exact hex palette from the Python original's `THEMES` dict, so the two
 /// versions render identically rather than falling back to egui's stock
@@ -486,8 +487,9 @@ impl UnigenApp {
             }
         };
 
-        let pwd = self.encrypt_shred_pwd.clone();
+        let pwd = Zeroizing::new(self.encrypt_shred_pwd.clone());
         let result = (|| -> anyhow::Result<String> {
+            crypto::check_blob_file_size(&path)?;
             let original_data = std::fs::read(&path)?;
             let combined = crypto::encrypt_blob(&pwd, &original_data, crypto::DEFAULT_KDF)?;
 
@@ -623,7 +625,7 @@ impl UnigenApp {
         }
 
         self.busy_ops.insert("encrypt");
-        let pwd = self.enc_pwd.clone();
+        let pwd = Zeroizing::new(self.enc_pwd.clone());
         let kdf_id = self.kdf_choice;
         let shred_after = self.shred_after;
         #[cfg(target_os = "linux")]
@@ -673,7 +675,7 @@ impl UnigenApp {
         };
 
         self.busy_ops.insert("decrypt");
-        let pwd = self.dec_pwd.clone();
+        let pwd = Zeroizing::new(self.dec_pwd.clone());
         let (tx, rx) = channel();
         self.decrypt_job = Some(BackgroundJob { rx, last_status: "Starting…".into(), progress: None });
 
@@ -709,6 +711,7 @@ impl UnigenApp {
     /// thread; Argon2id adds at most a fraction of a second.
     fn open_editor_decrypt(&mut self, path: PathBuf, pwd: String) {
         let result = (|| -> anyhow::Result<String> {
+            crypto::check_blob_file_size(&path)?;
             let file_contents = std::fs::read(&path)?;
             if &file_contents[..file_contents.len().min(4)] == crypto::STREAM_MAGIC {
                 anyhow::bail!(
@@ -899,7 +902,15 @@ fn zeroize_string(s: &mut String) {
 fn run_encrypt_job(
     in_path: PathBuf,
     out_path: Option<PathBuf>,
-    pwd: String,
+    // HIGH fix: this used to be a plain `String`. It's a *clone* of the
+    // UI-field passphrase moved into a background thread; the UI field
+    // itself gets zeroed via `zeroize_string`, but this clone previously
+    // just dropped as an ordinary String when the thread finished,
+    // leaving the passphrase bytes sitting in freed heap memory. Wrapping
+    // it in `Zeroizing<String>` guarantees the wipe on every return path
+    // (success, error, or panic-unwind), matching what `crypto.rs`
+    // already does internally.
+    pwd: Zeroizing<String>,
     kdf_id: u8,
     shred_after: bool,
     tx: Sender<JobMsg>,
@@ -944,6 +955,7 @@ fn run_encrypt_job(
             }
         } else {
             // Small-file, in-memory blob path.
+            crypto::check_blob_file_size(&in_path).map_err(|e| e.to_string())?;
             let data = std::fs::read(&in_path).map_err(|e| e.to_string())?;
             let combined = crypto::encrypt_blob(&pwd, &data, kdf_id).map_err(|e| e.to_string())?;
 
@@ -1022,7 +1034,9 @@ fn run_encrypt_job(
 fn run_decrypt_job(
     in_path: PathBuf,
     out_path: PathBuf,
-    pwd: String,
+    // HIGH fix: see the matching comment on `run_encrypt_job` — same
+    // never-zeroized-clone issue, same fix.
+    pwd: Zeroizing<String>,
     is_streaming: bool,
     tx: Sender<JobMsg>,
 ) {
@@ -1038,6 +1052,7 @@ fn run_decrypt_job(
             crypto::stream_decrypt_file(&in_path, Some(&out_path), &pwd, Some(cb))
                 .map_err(|e| e.to_string())?;
         } else {
+            crypto::check_blob_file_size(&in_path).map_err(|e| e.to_string())?;
             let file_contents = std::fs::read(&in_path).map_err(|e| e.to_string())?;
             let combined = crypto::decode_blob_text(&file_contents);
             let plain = crypto::decrypt_blob_compat(&pwd, &combined).map_err(|e| e.to_string())?;
@@ -1742,12 +1757,22 @@ impl UnigenApp {
     }
 }
 
+/// HIGH fix: previously used `rand::thread_rng()`. That's already a
+/// cryptographically secure generator (ChaCha12, seeded from the OS CSPRNG
+/// at startup and periodically reseeded) — not a "weak" PRNG — so this
+/// wasn't a real entropy defect. Switching to `OsRng` draws directly from
+/// the OS CSPRNG (`getrandom(2)`/`/dev/urandom` on Linux, `BCryptGenRandom`
+/// on Windows) on every single character, removing any dependency on
+/// `rand`'s internal generator/reseed state and any theoretical risk from
+/// thread-local RNG state (e.g. around unexpected `fork()`s). Password
+/// generation is a low-frequency operation, so the extra per-character
+/// syscall cost is irrelevant here.
 fn generate_password(length: usize, pool: &[char]) -> String {
+    use rand::rngs::OsRng;
     use rand::Rng;
     if pool.is_empty() || length == 0 {
         return String::new();
     }
-    let mut rng = rand::thread_rng();
+    let mut rng = OsRng;
     (0..length).map(|_| pool[rng.gen_range(0..pool.len())]).collect()
 }
-
