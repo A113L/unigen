@@ -714,9 +714,6 @@ impl UnigenApp {
             let result = shred::shred_file(&path, 3, false);
             let msg = match result {
                 Ok(shred::ShredOutcome::Secure) => Ok("File securely shredded.".to_string()),
-                Ok(shred::ShredOutcome::Fallback) => {
-                    Ok("Deleted, but secure overwrite could not be confirmed.".to_string())
-                }
                 Err(e) => Err(e.to_string()),
             };
             let _ = tx.send(JobMsg::Done(msg));
@@ -1015,9 +1012,6 @@ fn run_encrypt_job(
                         out,
                         shred::SSD_SHRED_CAVEAT
                     )),
-                    Ok(shred::ShredOutcome::Fallback) => Ok(format!(
-                        "Encrypted to {out:?}. Original deleted (overwrite could not be confirmed)."
-                    )),
                     Err(e) => Ok(format!(
                         "Encrypted to {out:?}, but shredding the original failed: {e}"
                     )),
@@ -1088,9 +1082,6 @@ fn run_encrypt_job(
                         crypto::kdf_name(kdf_id),
                         shred::SSD_SHRED_CAVEAT
                     )),
-                    Ok(shred::ShredOutcome::Fallback) => Ok(format!(
-                        "Encrypted to {save_path:?}. Original deleted (overwrite could not be confirmed)."
-                    )),
                     Err(e) => Ok(format!(
                         "Encrypted to {save_path:?}, but shredding the original failed: {e}"
                     )),
@@ -1131,7 +1122,7 @@ fn run_decrypt_job(
             let plain = crypto::decrypt_blob_compat(&pwd, &combined).map_err(|e| e.to_string())?;
             let legacy_no_aad = crypto::is_legacy_no_aad_format(&combined);
             let tmp = crypto::unique_tmp_path(&out_path);
-            std::fs::write(&tmp, &plain).map_err(|e| e.to_string())?;
+            crypto::write_durable(&tmp, &plain).map_err(|e| e.to_string())?;
             if let Err(e) = crypto::replace_file(&tmp, &out_path) {
                 let _ = std::fs::remove_file(&tmp);
                 return Err(e.to_string());
