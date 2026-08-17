@@ -129,7 +129,7 @@ pub fn estimate_passphrase_entropy(passphrase: &str) -> f64 {
     {
         pool += 33;
     }
-    if passphrase.chars().any(|c| !c.is_ascii()) {
+    if !passphrase.is_ascii() {
         pool += 300;
     }
     if pool == 0 {
