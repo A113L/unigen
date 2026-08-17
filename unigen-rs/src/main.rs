@@ -297,7 +297,7 @@ struct UnigenApp {
     charset_enabled: Vec<bool>,
     length: u32,
     count: u32,
-    generated: Vec<String>,
+    generated: Vec<Zeroizing<String>>,
     gen_status: String,
     last_saved_password_path: Option<PathBuf>,
     encrypt_shred_prompt_open: bool,
@@ -507,6 +507,7 @@ impl UnigenApp {
         let pwd = Zeroizing::new(self.encrypt_shred_pwd.clone());
         let result = (|| -> anyhow::Result<String> {
             crypto::check_blob_file_size(&path)?;
+            let original_identity = shred::file_identity(&path)?;
             let original_data = std::fs::read(&path)?;
             let combined = crypto::encrypt_blob(&pwd, &original_data, crypto::DEFAULT_KDF)?;
 
@@ -517,7 +518,7 @@ impl UnigenApp {
             };
             let tmp = crypto::unique_tmp_path(&enc_path);
             let text = crypto::encode_blob_text(&combined);
-            std::fs::write(&tmp, text.as_bytes())?;
+            crypto::write_durable(&tmp, text.as_bytes())?;
             if let Err(e) = crypto::replace_file(&tmp, &enc_path) {
                 let _ = std::fs::remove_file(&tmp);
                 return Err(e.into());
@@ -532,7 +533,7 @@ impl UnigenApp {
                 anyhow::bail!("Verification failed — the encrypted file did not round-trip; original was NOT deleted.");
             }
 
-            match shred::shred_file(&path, 3, false) {
+            match shred::shred_file_if_identity(&path, original_identity, 3) {
                 Ok(_) => Ok(format!("Encrypted to: {enc_path:?}\nOriginal plaintext securely shredded: {path:?}\n\n{}", shred::SSD_SHRED_CAVEAT)),
                 Err(e) => anyhow::bail!(
                     "Encrypted to: {enc_path:?}, but secure overwrite of the original failed and it was left in place: {e}"
@@ -646,8 +647,8 @@ impl UnigenApp {
         let kdf_id = self.kdf_choice;
         let shred_after = self.shred_after;
         #[cfg(target_os = "linux")]
-        if self.linux_try_exclusion {
-            try_mlock_str(&pwd);
+        if self.linux_try_exclusion && !try_mlock_str(&pwd) {
+            self.enc_status = "Warning: mlock() failed; passphrase remains subject to normal VM paging.".to_string();
         }
         let (tx, rx) = channel();
         self.encrypt_job = Some(BackgroundJob { rx, last_status: "Starting…".into(), progress: None });
@@ -806,7 +807,7 @@ impl UnigenApp {
 
             let text = crypto::encode_blob_text(&combined);
             let tmp = crypto::unique_tmp_path(&path);
-            std::fs::write(&tmp, text.as_bytes())?;
+            crypto::write_durable(&tmp, text.as_bytes())?;
             if let Err(e) = crypto::replace_file(&tmp, &path) {
                 let _ = std::fs::remove_file(&tmp);
                 return Err(e.into());
@@ -926,18 +927,18 @@ impl UnigenApp {
 
 /// Best-effort: ask the Linux kernel to keep `s`'s backing memory out of
 /// swap for as long as this process holds the lock (mirrors the Python
-/// original's `try_mlock`, which does the same via ctypes). Failure is
-/// silent and non-fatal — this is defense-in-depth, never relied upon.
+/// original's `try_mlock`, which does the same via ctypes). Returns false
+/// when the kernel refuses the lock; callers must treat it as best-effort.
 #[cfg(target_os = "linux")]
-fn try_mlock_str(s: &str) {
+fn try_mlock_str(s: &str) -> bool {
     extern "C" {
         fn mlock(addr: *const std::ffi::c_void, len: usize) -> i32;
     }
     if s.is_empty() {
-        return;
+        return true;
     }
     unsafe {
-        let _ = mlock(s.as_ptr() as *const std::ffi::c_void, s.len());
+        mlock(s.as_ptr() as *const std::ffi::c_void, s.len()) == 0
     }
 }
 
@@ -978,6 +979,9 @@ fn run_encrypt_job(
         let size = std::fs::metadata(&in_path).map_err(|e| e.to_string())?.len();
 
         if let Some(out) = &out_path {
+            // Capture the exact source identity before encryption. The later
+            // verify->shred step will refuse to touch a replacement file.
+            let source_identity = shred::file_identity(&in_path).map_err(|e| e.to_string())?;
             // Streaming path (large files).
             let tx_prog = tx.clone();
             let cb = crypto::Progress {
@@ -1004,7 +1008,7 @@ fn run_encrypt_job(
                     format!("Encrypted, but post-encrypt verification failed: {e}")
                 })?;
                 let _ = tx.send(JobMsg::Progress(1.0, "Shredding original…".to_string()));
-                match shred::shred_file(&in_path, 3, false) {
+                match shred::shred_file_if_identity(&in_path, source_identity, 3) {
                     Ok(shred::ShredOutcome::Secure) => Ok(format!(
                         "Encrypted (streamed, {}) to {:?}. Original securely shredded. {}",
                         crypto::kdf_name(kdf_id),
@@ -1024,6 +1028,7 @@ fn run_encrypt_job(
         } else {
             // Small-file, in-memory blob path.
             crypto::check_blob_file_size(&in_path).map_err(|e| e.to_string())?;
+            let source_identity = shred::file_identity(&in_path).map_err(|e| e.to_string())?;
             let data = std::fs::read(&in_path).map_err(|e| e.to_string())?;
             let combined = crypto::encrypt_blob(&pwd, &data, kdf_id).map_err(|e| e.to_string())?;
 
@@ -1054,7 +1059,7 @@ fn run_encrypt_job(
 
             let tmp = crypto::unique_tmp_path(&save_path);
             let text = crypto::encode_blob_text(&combined);
-            std::fs::write(&tmp, text.as_bytes()).map_err(|e| e.to_string())?;
+            crypto::write_durable(&tmp, text.as_bytes()).map_err(|e| e.to_string())?;
             if let Err(e) = crypto::replace_file(&tmp, &save_path) {
                 let _ = std::fs::remove_file(&tmp);
                 return Err(e.to_string());
@@ -1077,7 +1082,7 @@ fn run_encrypt_job(
             let _ = size;
 
             if shred_after {
-                match shred::shred_file(&in_path, 3, false) {
+                match shred::shred_file_if_identity(&in_path, source_identity, 3) {
                     Ok(shred::ShredOutcome::Secure) => Ok(format!(
                         "Encrypted ({}) to {save_path:?}. Original securely shredded. {}",
                         crypto::kdf_name(kdf_id),
@@ -1432,9 +1437,9 @@ impl UnigenApp {
                                             .on_hover_text(format!("Copy just this password; auto-clears from the clipboard in {}s.", self.autoclear_seconds))
                                             .clicked()
                                         {
-                                            to_copy = Some(pwd.clone());
+                                            to_copy = Some(pwd.as_str().to_owned());
                                         }
-                                        ui.monospace(format!("#{}: {}", i + 1, pwd));
+                                        ui.monospace(format!("#{}: {}", i + 1, pwd.as_str()));
                                     });
                                 }
                                 if let Some(pwd) = to_copy {
@@ -1446,7 +1451,7 @@ impl UnigenApp {
 
                 ui.horizontal(|ui| {
                     if ui.add_enabled(!self.generated.is_empty(), egui::Button::new("Copy All")).clicked() {
-                        let text = self.generated.join("\n");
+                        let text = Zeroizing::new(self.generated.iter().map(|p| p.as_str()).collect::<Vec<_>>().join("\n"));
                         self.copy_to_clipboard(&text);
                     }
                     if ui.add_enabled(!self.generated.is_empty(), egui::Button::new("Save to File")).clicked() {
@@ -1455,9 +1460,9 @@ impl UnigenApp {
                             .add_filter("Text files", &["txt"])
                             .save_file()
                         {
-                            let content = self.generated.join("\n");
+                            let content = Zeroizing::new(self.generated.iter().map(|p| p.as_str()).collect::<Vec<_>>().join("\n"));
                             let tmp = crypto::unique_tmp_path(&path);
-                            let ok = std::fs::write(&tmp, &content)
+                            let ok = crypto::write_durable(&tmp, content.as_bytes())
                                 .and_then(|_| crypto::replace_file(&tmp, &path))
                                 .is_ok();
                             if !ok {
@@ -1920,12 +1925,12 @@ fn password_part(line: &str) -> String {
 /// thread-local RNG state (e.g. around unexpected `fork()`s). Password
 /// generation is a low-frequency operation, so the extra per-character
 /// syscall cost is irrelevant here.
-fn generate_password(length: usize, pool: &[char]) -> String {
+fn generate_password(length: usize, pool: &[char]) -> Zeroizing<String> {
     use rand::rngs::OsRng;
     use rand::Rng;
     if pool.is_empty() || length == 0 {
-        return String::new();
+        return Zeroizing::new(String::new());
     }
     let mut rng = OsRng;
-    (0..length).map(|_| pool[rng.gen_range(0..pool.len())]).collect()
+    Zeroizing::new((0..length).map(|_| pool[rng.gen_range(0..pool.len())]).collect())
 }
