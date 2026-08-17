@@ -1,6 +1,9 @@
 //! Secure file shredding: multi-pass random overwrite + zero pass, then
-//! delete. Mirrors the Python original's `shred_file`, including its
-//! TOCTOU/symlink defenses.
+//! delete. The destructive path opens the file first, verifies its identity,
+//! overwrites that open handle, and only then deletes it. Windows uses
+//! handle-based deletion to avoid a final pathname race; Unix keeps the
+//! open-handle identity check and refuses to delete a pathname that no longer
+//! names the verified inode.
 
 use anyhow::{anyhow, bail, Context, Result};
 use rand::rngs::OsRng;
@@ -8,8 +11,6 @@ use rand::RngCore;
 use std::fs::{self, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
-#[cfg(not(unix))]
-use std::time::SystemTime;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileIdentity {
@@ -17,69 +18,127 @@ pub struct FileIdentity {
     pub dev: u64,
     #[cfg(unix)]
     pub ino: u64,
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    pub volume_serial: u32,
+    #[cfg(windows)]
+    pub file_index: u64,
+    #[cfg(not(any(unix, windows)))]
     pub len: u64,
-    #[cfg(not(unix))]
-    pub modified: Option<SystemTime>,
+    #[cfg(not(any(unix, windows)))]
+    pub modified: Option<std::time::SystemTime>,
 }
 
 pub fn file_identity(path: &Path) -> Result<FileIdentity> {
-    let meta = fs::metadata(path).with_context(|| format!("stat {path:?}"))?;
-    if !meta.is_file() {
-        bail!("Refusing to identify a non-regular file: {path:?}");
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        Ok(FileIdentity { dev: meta.dev(), ino: meta.ino() })
-    }
-    #[cfg(not(unix))]
-    {
-        Ok(FileIdentity { len: meta.len(), modified: meta.modified().ok() })
-    }
+    let file = open_shred_handle(path)?;
+    file_identity_from_file(&file)
 }
 
 fn file_identity_from_file(file: &fs::File) -> Result<FileIdentity> {
     let meta = file.metadata()?;
     if !meta.is_file() {
-        bail!("Refusing to shred a non-regular file");
+        bail!("Refusing to identify a non-regular file");
     }
+
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        Ok(FileIdentity { dev: meta.dev(), ino: meta.ino() })
+        Ok(FileIdentity {
+            dev: meta.dev(),
+            ino: meta.ino(),
+        })
     }
-    #[cfg(not(unix))]
+
+    #[cfg(windows)]
     {
-        Ok(FileIdentity { len: meta.len(), modified: meta.modified().ok() })
+        use std::os::windows::io::AsRawHandle;
+
+        #[repr(C)]
+        struct FileTime {
+            low_date_time: u32,
+            high_date_time: u32,
+        }
+
+        #[repr(C)]
+        struct ByHandleFileInformation {
+            dw_file_attributes: u32,
+            ft_creation_time: FileTime,
+            ft_last_access_time: FileTime,
+            ft_last_write_time: FileTime,
+            dw_volume_serial_number: u32,
+            n_file_size_high: u32,
+            n_file_size_low: u32,
+            n_number_of_links: u32,
+            n_file_index_high: u32,
+            n_file_index_low: u32,
+        }
+
+        extern "system" {
+            fn GetFileInformationByHandle(
+                h_file: *mut std::ffi::c_void,
+                lp_file_information: *mut ByHandleFileInformation,
+            ) -> i32;
+        }
+
+        let mut info = std::mem::MaybeUninit::<ByHandleFileInformation>::uninit();
+        let ok = unsafe {
+            GetFileInformationByHandle(
+                file.as_raw_handle() as *mut std::ffi::c_void,
+                info.as_mut_ptr(),
+            )
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let info = unsafe { info.assume_init() };
+        Ok(FileIdentity {
+            volume_serial: info.dw_volume_serial_number,
+            file_index: ((info.n_file_index_high as u64) << 32)
+                | info.n_file_index_low as u64,
+        })
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        Ok(FileIdentity {
+            len: meta.len(),
+            modified: meta.modified().ok(),
+        })
     }
 }
 
-/// Shred only the file whose identity was captured before verification.
-/// The file is opened first and compared by identity before any overwrite.
-/// If the pathname changed afterwards, the opened (verified) inode is still
-/// shredded, but the replacement at the pathname is never removed.
-pub fn shred_file_if_identity(
-    path: &Path,
-    expected: FileIdentity,
-    passes: u32,
-) -> Result<ShredOutcome> {
+fn open_shred_handle(path: &Path) -> Result<fs::File> {
     let mut opts = OpenOptions::new();
     opts.read(true).write(true);
+
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         opts.custom_flags(libc_o_nofollow());
     }
-    let mut file = opts.open(path).with_context(|| format!("opening {path:?}"))?;
-    let actual = file_identity_from_file(&file)?;
-    if actual != expected {
-        bail!("File changed after verification; refusing to overwrite the replacement: {path:?}");
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const GENERIC_READ: u32 = 0x8000_0000;
+        const GENERIC_WRITE: u32 = 0x4000_0000;
+        const DELETE: u32 = 0x0001_0000;
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+        const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+        opts.access_mode(GENERIC_READ | GENERIC_WRITE | DELETE);
+        opts.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
     }
 
+    opts.open(path)
+        .with_context(|| format!("opening {path:?} for secure shredding"))
+        .map_err(Into::into)
+}
+
+fn overwrite_open_file(file: &mut fs::File, passes: u32) -> Result<()> {
     let size = file.metadata()?.len();
     const CHUNK: usize = 1024 * 1024;
     let mut buf = vec![0u8; CHUNK];
+
     for _ in 0..passes {
         file.seek(SeekFrom::Start(0))?;
         let mut written = 0u64;
@@ -89,8 +148,11 @@ pub fn shred_file_if_identity(
             file.write_all(&buf[..n])?;
             written += n as u64;
         }
+        file.flush()?;
         file.sync_all()?;
     }
+
+    // Final zero pass.
     file.seek(SeekFrom::Start(0))?;
     let zeros = vec![0u8; CHUNK];
     let mut written = 0u64;
@@ -99,19 +161,126 @@ pub fn shred_file_if_identity(
         file.write_all(&zeros[..n])?;
         written += n as u64;
     }
+    file.flush()?;
     file.sync_all()?;
-    drop(file);
+    Ok(())
+}
 
-    // Never remove a pathname that no longer names the verified file.
-    match file_identity(path) {
-        Ok(current) if current == expected => {
-            fs::remove_file(path).with_context(|| format!("removing {path:?} after overwrite"))?;
-            fsync_parent(path);
-            Ok(ShredOutcome::Secure)
+#[cfg(windows)]
+fn delete_open_handle(file: &fs::File) -> Result<()> {
+    use std::os::windows::io::AsRawHandle;
+
+    // FILE_DISPOSITION_INFO_EX = 21. Mark the already-open handle for delete
+    // using POSIX semantics when supported. This avoids resolving the
+    // pathname again after the overwrite.
+    #[repr(C)]
+    struct FileDispositionInfoEx {
+        flags: u32,
+    }
+
+    const FILE_DISPOSITION_INFO_EX: u32 = 21;
+    const FILE_DISPOSITION_FLAG_DELETE: u32 = 0x0000_0001;
+    const FILE_DISPOSITION_FLAG_POSIX_SEMANTICS: u32 = 0x0000_0002;
+    const FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE: u32 = 0x0000_0010;
+
+    extern "system" {
+        fn SetFileInformationByHandle(
+            h_file: *mut std::ffi::c_void,
+            file_information_class: u32,
+            file_information: *const std::ffi::c_void,
+            buffer_size: u32,
+        ) -> i32;
+    }
+
+    let info = FileDispositionInfoEx {
+        flags: FILE_DISPOSITION_FLAG_DELETE
+            | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS
+            | FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
+    };
+
+    let ok = unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle() as *mut std::ffi::c_void,
+            FILE_DISPOSITION_INFO_EX,
+            &info as *const _ as *const std::ffi::c_void,
+            std::mem::size_of::<FileDispositionInfoEx>() as u32,
+        )
+    };
+
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+/// Shred only the file whose identity was captured before verification.
+///
+/// The file is opened with symlink protection where supported, its identity is
+/// checked against the expected identity, and all overwrites happen through
+/// that open handle. On Windows the final deletion is also performed through
+/// the same handle. On Unix, unlinking necessarily uses the directory entry;
+/// the pathname is re-checked immediately before unlinking and a mismatch
+/// causes a safe failure rather than deleting the replacement.
+pub fn shred_file_if_identity(
+    path: &Path,
+    expected: FileIdentity,
+    passes: u32,
+) -> Result<ShredOutcome> {
+    let mut file = open_shred_handle(path)?;
+    let actual = file_identity_from_file(&file)?;
+    if actual != expected {
+        bail!(
+            "File changed after verification; refusing to overwrite the replacement: {path:?}"
+        );
+    }
+
+    overwrite_open_file(&mut file, passes)?;
+
+    #[cfg(windows)]
+    {
+        delete_open_handle(&file)?;
+        // The handle itself is now marked for deletion; dropping it completes
+        // the deletion without resolving the pathname again.
+        drop(file);
+        Ok(ShredOutcome::Secure)
+    }
+
+    #[cfg(unix)]
+    {
+        // Unix has no portable standard-library equivalent of Windows'
+        // delete-by-handle primitive. Re-check the inode immediately before
+        // unlinking so a pathname replacement is detected rather than
+        // destroyed. This is the strongest portable pathname-based guarantee.
+        match file_identity(path) {
+            Ok(current) if current == expected => {
+                drop(file);
+                fs::remove_file(path)
+                    .with_context(|| format!("removing {path:?} after overwrite"))?;
+                fsync_parent(path);
+                Ok(ShredOutcome::Secure)
+            }
+            Ok(_) | Err(_) => {
+                drop(file);
+                bail!(
+                    "File name changed during shredding; verified file was overwritten but the current pathname was left untouched: {path:?}"
+                );
+            }
         }
-        Ok(_) | Err(_) => {
-            fsync_parent(path);
-            bail!("File name changed during shredding; verified file was overwritten but the current pathname was left untouched: {path:?}");
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        match file_identity(path) {
+            Ok(current) if current == expected => {
+                drop(file);
+                fs::remove_file(path)
+                    .with_context(|| format!("removing {path:?} after overwrite"))?;
+                fsync_parent(path);
+                Ok(ShredOutcome::Secure)
+            }
+            _ => bail!(
+                "File name changed during shredding; verified file was overwritten but the current pathname was left untouched: {path:?}"
+            ),
         }
     }
 }
@@ -128,114 +297,24 @@ pub const SSD_SHRED_CAVEAT: &str =
 pub enum ShredOutcome {
     /// Overwritten securely, then deleted.
     Secure,
-    /// Overwrite failed but the caller opted to delete anyway.
-    Fallback,
 }
 
-/// Securely shred `path`: `passes` random-data passes, then one zero pass,
-/// then delete. If the overwrite fails (read-only FS, permission error,
-/// I/O error) and `delete_on_overwrite_failure` is false, the file is left
-/// untouched and an error is returned instead of silently downgrading to a
-/// plain delete.
-pub fn shred_file(path: &Path, passes: u32, delete_on_overwrite_failure: bool) -> Result<ShredOutcome> {
-    let meta = fs::symlink_metadata(path).with_context(|| format!("stat {path:?}"))?;
-
-    if meta.file_type().is_symlink() {
-        bail!(
-            "Refusing to shred a symlink (would overwrite its target, not the \
-             link itself): {path:?}"
-        );
-    }
-    if meta.is_dir() {
-        bail!("Cannot shred a directory: {path:?}");
-    }
-
-    let size = meta.len();
-    let mut overwrite_ok = true;
-    let mut overwrite_err: Option<anyhow::Error> = None;
-
-    if size > 0 {
-        let result = (|| -> Result<()> {
-            // Open without following symlinks where the platform supports
-            // it (TOCTOU guard: refuses to open through a symlink swapped
-            // in after the metadata check above).
-            let mut opts = OpenOptions::new();
-            opts.read(true).write(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                opts.custom_flags(libc_o_nofollow());
-            }
-            let mut file = opts.open(path).with_context(|| format!("opening {path:?}"))?;
-
-            let real_meta = file.metadata()?;
-            if !real_meta.is_file() {
-                bail!("Refusing to shred a non-regular file: {path:?}");
-            }
-
-            const CHUNK: usize = 1024 * 1024;
-            let mut buf = vec![0u8; CHUNK];
-
-            for _ in 0..passes {
-                file.seek(SeekFrom::Start(0))?;
-                let mut written = 0u64;
-                while written < size {
-                    let to_write = std::cmp::min(CHUNK as u64, size - written) as usize;
-                    OsRng.fill_bytes(&mut buf[..to_write]);
-                    file.write_all(&buf[..to_write])?;
-                    written += to_write as u64;
-                }
-                file.flush()?;
-                let _ = file.sync_all();
-            }
-
-            // Final zero pass.
-            file.seek(SeekFrom::Start(0))?;
-            let zeros = vec![0u8; CHUNK];
-            let mut written = 0u64;
-            while written < size {
-                let to_write = std::cmp::min(CHUNK as u64, size - written) as usize;
-                file.write_all(&zeros[..to_write])?;
-                written += to_write as u64;
-            }
-            file.flush()?;
-            let _ = file.sync_all();
-            Ok(())
-        })();
-
-        if let Err(e) = result {
-            overwrite_ok = false;
-            overwrite_err = Some(e);
-        }
-    }
-
-    if !overwrite_ok && !delete_on_overwrite_failure {
-        return Err(anyhow!(
-            "Secure overwrite failed ({}); file left in place: {path:?}",
-            overwrite_err.map(|e| e.to_string()).unwrap_or_default()
-        ));
-    }
-
-    #[cfg(unix)]
-    {
-        // Ensure we still have write permission on the (now-overwritten)
-        // file so remove() doesn't fail on an oddly-permissioned file.
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(m) = fs::metadata(path) {
-            let mut perm = m.permissions();
-            perm.set_mode(0o600);
-            let _ = fs::set_permissions(path, perm);
-        }
-    }
-
-    fs::remove_file(path).with_context(|| format!("removing {path:?} after overwrite"))?;
-    fsync_parent(path);
-
-    Ok(if overwrite_ok {
-        ShredOutcome::Secure
-    } else {
-        ShredOutcome::Fallback
-    })
+/// Securely shred `path`: capture its identity, then perform the destructive
+/// operation only on a handle whose identity still matches that capture.
+/// This replaces the older metadata-check/open-by-path implementation and is
+/// also used by the GUI's manual shred action.
+pub fn shred_file(
+    path: &Path,
+    passes: u32,
+    delete_on_overwrite_failure: bool,
+) -> Result<ShredOutcome> {
+    let expected = file_identity(path)?;
+    let _ = delete_on_overwrite_failure;
+    // Never downgrade a failed secure overwrite to a plain pathname delete.
+    // The parameter is retained for source compatibility with the previous API,
+    // but is intentionally ignored because deleting plaintext after an overwrite
+    // failure would defeat the security purpose of shredding.
+    shred_file_if_identity(path, expected, passes)
 }
 
 fn fsync_parent(path: &Path) {
