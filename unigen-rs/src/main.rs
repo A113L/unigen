@@ -1481,7 +1481,6 @@ impl UnigenApp {
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut self.autoclear_enabled, "Auto-clear clipboard after");
                     ui.add(egui::DragValue::new(&mut self.autoclear_seconds).range(5..=300));
-                    ui.add(egui::DragValue::new(&mut self.pwd_autoclear_seconds).range(5..=600));
                 });
 
                 ui.horizontal(|ui| {
