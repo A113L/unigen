@@ -16,8 +16,8 @@ strip = true
 panic = "unwind"
 
 [dependencies]
-eframe = { version = "0.27", default-features = false, features = ["glow", "default_fonts", "persistence", "accesskit"] }
-egui = "0.27"
+eframe = { version = "0.28", default-features = false, features = ["glow", "default_fonts", "persistence", "accesskit"] }
+egui = "0.28"
 
 # Crypto
 aes-gcm = "0.10"
