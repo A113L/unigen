@@ -9,7 +9,9 @@ mod charsets;
 mod crypto;
 mod shred;
 
-use charsets::{all_charsets, build_pool, calculate_entropy, estimate_passphrase_entropy, rate_entropy, CharSet};
+use charsets::{
+    all_charsets, build_pool, calculate_entropy, estimate_passphrase_entropy, rate_entropy, CharSet,
+};
 use eframe::egui;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -199,7 +201,9 @@ fn load_custom_fonts(ctx: &eframe::egui::Context) {
     let mut all_files = Vec::new();
     let mut stack = vec![fonts_dir];
     while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
@@ -225,8 +229,13 @@ fn load_custom_fonts(ctx: &eframe::egui::Context) {
     let mut chosen: Vec<(String, PathBuf)> = Vec::new();
     let mut seen_family = HashSet::new();
     for path in all_files.iter().filter(|p| is_font_ext(p)) {
-        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { continue };
-        if let Some(family) = stem.strip_suffix("-Regular").or_else(|| stem.strip_suffix("-regular")) {
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if let Some(family) = stem
+            .strip_suffix("-Regular")
+            .or_else(|| stem.strip_suffix("-regular"))
+        {
             if seen_family.insert(family.to_string()) {
                 chosen.push((family.to_string(), path.clone()));
             }
@@ -238,7 +247,10 @@ fn load_custom_fonts(ctx: &eframe::egui::Context) {
         // static/ folder), one per distinct file name so we don't still
         // pull in unrelated duplicates.
         for path in all_files.into_iter().filter(|p| is_font_ext(p)) {
-            let key = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+            let key = path
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
             if seen_family.insert(key.clone()) {
                 chosen.push((key, path));
             }
@@ -248,8 +260,12 @@ fn load_custom_fonts(ctx: &eframe::egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     let mut loaded_any = false;
     for (family_key, path) in chosen {
-        let Ok(bytes) = std::fs::read(&path) else { continue };
-        fonts.font_data.insert(family_key.clone(), egui::FontData::from_owned(bytes));
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        fonts
+            .font_data
+            .insert(family_key.clone(), egui::FontData::from_owned(bytes));
         // Push to the *end* of both families' fallback lists so the
         // default font is always tried first and this only fills in
         // glyphs (e.g. CJK/Kana) that the default font is missing.
@@ -436,7 +452,11 @@ impl UnigenApp {
     }
 
     fn palette(&self) -> &'static theme::Palette {
-        if self.dark_mode { &theme::DARK } else { &theme::LIGHT }
+        if self.dark_mode {
+            &theme::DARK
+        } else {
+            &theme::LIGHT
+        }
     }
 
     fn active_pool(&self) -> Vec<char> {
@@ -462,7 +482,10 @@ impl UnigenApp {
                 self.autoclear_deadline =
                     Some(Instant::now() + Duration::from_secs(self.autoclear_seconds as u64));
                 self.autoclear_expected = Some(text.to_string());
-                self.editor_status = format!("Copied line. Clipboard clears in {}s.", self.autoclear_seconds);
+                self.editor_status = format!(
+                    "Copied line. Clipboard clears in {}s.",
+                    self.autoclear_seconds
+                );
                 return;
             }
         }
@@ -498,7 +521,8 @@ impl UnigenApp {
         let path = match self.last_saved_password_path.clone() {
             Some(p) if p.exists() => p,
             _ => {
-                self.gen_status = "No saved password file to encrypt — save the list first.".to_string();
+                self.gen_status =
+                    "No saved password file to encrypt — save the list first.".to_string();
                 zeroize_string(&mut self.encrypt_shred_pwd);
                 return;
             }
@@ -609,7 +633,9 @@ impl UnigenApp {
     }
 
     fn start_encrypt(&mut self) {
-        let Some(in_path) = self.enc_file.clone() else { return; };
+        let Some(in_path) = self.enc_file.clone() else {
+            return;
+        };
         if self.enc_pwd.chars().count() < crypto::MIN_PASSPHRASE_LEN {
             self.enc_status = format!(
                 "Passphrase must be at least {} characters.",
@@ -627,7 +653,10 @@ impl UnigenApp {
         let out_path = if streaming {
             let default_name = format!(
                 "{}.enc",
-                in_path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()
+                in_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default()
             );
             rfd::FileDialog::new()
                 .set_title("Save encrypted file (large file — streamed)")
@@ -648,10 +677,16 @@ impl UnigenApp {
         let shred_after = self.shred_after;
         #[cfg(target_os = "linux")]
         if self.linux_try_exclusion && !try_mlock_str(&pwd) {
-            self.enc_status = "Warning: mlock() failed; passphrase remains subject to normal VM paging.".to_string();
+            self.enc_status =
+                "Warning: mlock() failed; passphrase remains subject to normal VM paging."
+                    .to_string();
         }
         let (tx, rx) = channel();
-        self.encrypt_job = Some(BackgroundJob { rx, last_status: "Starting…".into(), progress: None });
+        self.encrypt_job = Some(BackgroundJob {
+            rx,
+            last_status: "Starting…".into(),
+            progress: None,
+        });
 
         std::thread::spawn(move || {
             run_encrypt_job(in_path, out_path, pwd, kdf_id, shred_after, tx);
@@ -659,7 +694,9 @@ impl UnigenApp {
     }
 
     fn start_decrypt(&mut self) {
-        let Some(in_path) = self.dec_file.clone() else { return; };
+        let Some(in_path) = self.dec_file.clone() else {
+            return;
+        };
         if self.dec_pwd.is_empty() {
             self.dec_status = "Enter the passphrase.".to_string();
             return;
@@ -695,7 +732,11 @@ impl UnigenApp {
         self.busy_ops.insert("decrypt");
         let pwd = Zeroizing::new(self.dec_pwd.clone());
         let (tx, rx) = channel();
-        self.decrypt_job = Some(BackgroundJob { rx, last_status: "Starting…".into(), progress: None });
+        self.decrypt_job = Some(BackgroundJob {
+            rx,
+            last_status: "Starting…".into(),
+            progress: None,
+        });
 
         std::thread::spawn(move || {
             run_decrypt_job(in_path, out_path, pwd, is_streaming, tx);
@@ -703,13 +744,19 @@ impl UnigenApp {
     }
 
     fn start_shred(&mut self) {
-        let Some(path) = self.shred_target.clone() else { return; };
+        let Some(path) = self.shred_target.clone() else {
+            return;
+        };
         if self.busy_ops.contains("shred") {
             return;
         }
         self.busy_ops.insert("shred");
         let (tx, rx) = channel();
-        self.shred_job = Some(BackgroundJob { rx, last_status: "Shredding…".into(), progress: None });
+        self.shred_job = Some(BackgroundJob {
+            rx,
+            last_status: "Shredding…".into(),
+            progress: None,
+        });
         std::thread::spawn(move || {
             let result = shred::shred_file(&path, 3, false);
             let msg = match result {
@@ -736,9 +783,14 @@ impl UnigenApp {
             }
             let combined = crypto::decode_blob_text(&file_contents);
             let plain = Zeroizing::new(crypto::decrypt_blob_compat(&pwd, &combined)?);
-            let text = String::from_utf8(plain.as_slice().to_vec())
-                .map_err(|_| anyhow::anyhow!("Decrypted content isn't valid UTF-8 text — not editable here."))?;
-            Ok((text, crypto::peek_kdf_id(&combined), crypto::is_legacy_no_aad_format(&combined)))
+            let text = String::from_utf8(plain.as_slice().to_vec()).map_err(|_| {
+                anyhow::anyhow!("Decrypted content isn't valid UTF-8 text — not editable here.")
+            })?;
+            Ok((
+                text,
+                crypto::peek_kdf_id(&combined),
+                crypto::is_legacy_no_aad_format(&combined),
+            ))
         })();
 
         match result {
@@ -785,17 +837,23 @@ impl UnigenApp {
     /// silently-bad encryption, can never leave the on-disk file corrupted
     /// or replaced with something that doesn't actually decrypt.
     fn save_editor(&mut self) {
-        let Some(path) = self.editor_source.clone() else { return };
+        let Some(path) = self.editor_source.clone() else {
+            return;
+        };
         let expected = self.editor_content.clone();
         let result = (|| -> anyhow::Result<()> {
-            let combined = crypto::encrypt_blob(&self.editor_pwd, expected.as_bytes(), self.editor_kdf)?;
+            let combined =
+                crypto::encrypt_blob(&self.editor_pwd, expected.as_bytes(), self.editor_kdf)?;
 
             // Verify round-trip BEFORE touching the real file: decrypt the
             // freshly-produced ciphertext with the same passphrase and
             // confirm it matches exactly what we intended to save.
             let verify = Zeroizing::new(
-                crypto::decrypt_blob(&self.editor_pwd, &combined)
-                    .map_err(|e| anyhow::anyhow!("Verification failed after encrypting — original file left untouched: {e}"))?
+                crypto::decrypt_blob(&self.editor_pwd, &combined).map_err(|e| {
+                    anyhow::anyhow!(
+                        "Verification failed after encrypting — original file left untouched: {e}"
+                    )
+                })?,
             );
             if verify.as_slice() != expected.as_bytes() {
                 anyhow::bail!(
@@ -936,9 +994,7 @@ fn try_mlock_str(s: &str) -> bool {
     if s.is_empty() {
         return true;
     }
-    unsafe {
-        mlock(s.as_ptr() as *const std::ffi::c_void, s.len()) == 0
-    }
+    unsafe { mlock(s.as_ptr() as *const std::ffi::c_void, s.len()) == 0 }
 }
 
 fn zeroize_string(s: &mut String) {
@@ -975,7 +1031,9 @@ fn run_encrypt_job(
     tx: Sender<JobMsg>,
 ) {
     let result = (|| -> Result<String, String> {
-        let size = std::fs::metadata(&in_path).map_err(|e| e.to_string())?.len();
+        let size = std::fs::metadata(&in_path)
+            .map_err(|e| e.to_string())?
+            .len();
 
         if let Some(out) = &out_path {
             // Capture the exact source identity before encryption. The later
@@ -985,8 +1043,15 @@ fn run_encrypt_job(
             let tx_prog = tx.clone();
             let cb = crypto::Progress {
                 callback: Box::new(move |done, total| {
-                    let pct = if total > 0 { done as f32 / total as f32 } else { 0.0 };
-                    let _ = tx_prog.send(JobMsg::Progress(pct, format!("Encrypting… {:.0}%", pct * 100.0)));
+                    let pct = if total > 0 {
+                        done as f32 / total as f32
+                    } else {
+                        0.0
+                    };
+                    let _ = tx_prog.send(JobMsg::Progress(
+                        pct,
+                        format!("Encrypting… {:.0}%", pct * 100.0),
+                    ));
                 }),
             };
             crypto::stream_encrypt_file(&in_path, out, &pwd, kdf_id, Some(cb))
@@ -996,16 +1061,19 @@ fn run_encrypt_job(
                 let tx_verify = tx.clone();
                 let cb = crypto::Progress {
                     callback: Box::new(move |done, total| {
-                        let pct = if total > 0 { done as f32 / total as f32 } else { 0.0 };
+                        let pct = if total > 0 {
+                            done as f32 / total as f32
+                        } else {
+                            0.0
+                        };
                         let _ = tx_verify.send(JobMsg::Progress(
                             pct,
                             format!("Verifying before shred… {:.0}%", pct * 100.0),
                         ));
                     }),
                 };
-                crypto::verify_stream_roundtrip(out, &in_path, &pwd, Some(cb)).map_err(|e| {
-                    format!("Encrypted, but post-encrypt verification failed: {e}")
-                })?;
+                crypto::verify_stream_roundtrip(out, &in_path, &pwd, Some(cb))
+                    .map_err(|e| format!("Encrypted, but post-encrypt verification failed: {e}"))?;
                 let _ = tx.send(JobMsg::Progress(1.0, "Shredding original…".to_string()));
                 match shred::shred_file_if_identity(&in_path, source_identity, 3) {
                     Ok(shred::ShredOutcome::Secure) => Ok(format!(
@@ -1019,7 +1087,11 @@ fn run_encrypt_job(
                     )),
                 }
             } else {
-                Ok(format!("Encrypted (streamed, {}). Saved: {:?}", crypto::kdf_name(kdf_id), out))
+                Ok(format!(
+                    "Encrypted (streamed, {}). Saved: {:?}",
+                    crypto::kdf_name(kdf_id),
+                    out
+                ))
             }
         } else {
             // Small-file, in-memory blob path.
@@ -1029,9 +1101,8 @@ fn run_encrypt_job(
             let combined = crypto::encrypt_blob(&pwd, &data, kdf_id).map_err(|e| e.to_string())?;
 
             // Verify round-trip before offering to shred.
-            let verify = Zeroizing::new(
-                crypto::decrypt_blob(&pwd, &combined).map_err(|e| e.to_string())?
-            );
+            let verify =
+                Zeroizing::new(crypto::decrypt_blob(&pwd, &combined).map_err(|e| e.to_string())?);
             if verify.as_slice() != data.as_slice() {
                 return Err("Verification failed — original was NOT modified.".to_string());
             }
@@ -1044,7 +1115,7 @@ fn run_encrypt_job(
             let save_path = rfd::FileDialog::new()
                 .set_title("Save encrypted file")
                 .set_file_name(
-                    &default_out
+                    default_out
                         .file_name()
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_else(|| "encrypted.enc".to_string()),
@@ -1091,7 +1162,10 @@ fn run_encrypt_job(
                     )),
                 }
             } else {
-                Ok(format!("Encrypted ({}). Saved: {save_path:?}", crypto::kdf_name(kdf_id)))
+                Ok(format!(
+                    "Encrypted ({}). Saved: {save_path:?}",
+                    crypto::kdf_name(kdf_id)
+                ))
             }
         }
     })();
@@ -1113,8 +1187,15 @@ fn run_decrypt_job(
             let tx_prog = tx.clone();
             let cb = crypto::Progress {
                 callback: Box::new(move |done, total| {
-                    let pct = if total > 0 { done as f32 / total as f32 } else { 0.0 };
-                    let _ = tx_prog.send(JobMsg::Progress(pct, format!("Decrypting… {:.0}%", pct * 100.0)));
+                    let pct = if total > 0 {
+                        done as f32 / total as f32
+                    } else {
+                        0.0
+                    };
+                    let _ = tx_prog.send(JobMsg::Progress(
+                        pct,
+                        format!("Decrypting… {:.0}%", pct * 100.0),
+                    ));
                 }),
             };
             crypto::stream_decrypt_file(&in_path, Some(&out_path), &pwd, Some(cb))
@@ -1123,7 +1204,9 @@ fn run_decrypt_job(
             crypto::check_blob_file_size(&in_path).map_err(|e| e.to_string())?;
             let file_contents = std::fs::read(&in_path).map_err(|e| e.to_string())?;
             let combined = crypto::decode_blob_text(&file_contents);
-            let plain = Zeroizing::new(crypto::decrypt_blob_compat(&pwd, &combined).map_err(|e| e.to_string())?);
+            let plain = Zeroizing::new(
+                crypto::decrypt_blob_compat(&pwd, &combined).map_err(|e| e.to_string())?,
+            );
             let legacy_no_aad = crypto::is_legacy_no_aad_format(&combined);
             let tmp = crypto::unique_tmp_path(&out_path);
             crypto::write_durable(&tmp, &plain).map_err(|e| e.to_string())?;
@@ -1197,7 +1280,9 @@ impl eframe::App for UnigenApp {
                 .collapsible(false)
                 .resizable(false)
                 .show(ctx, |ui| {
-                    ui.label("Enter a passphrase (min 8 characters) to protect this password file:");
+                    ui.label(
+                        "Enter a passphrase (min 8 characters) to protect this password file:",
+                    );
                     ui.add(egui::TextEdit::singleline(&mut self.encrypt_shred_pwd).password(true));
                     ui.horizontal(|ui| {
                         if ui.button("Cancel").clicked() {
@@ -1205,13 +1290,21 @@ impl eframe::App for UnigenApp {
                             self.encrypt_shred_prompt_open = false;
                         }
                         let can_go = self.encrypt_shred_pwd.chars().count() >= 8;
-                        if ui.add_enabled(can_go, egui::Button::new("Encrypt & Shred")).clicked() {
+                        if ui
+                            .add_enabled(can_go, egui::Button::new("Encrypt & Shred"))
+                            .clicked()
+                        {
                             self.encrypt_shred_prompt_open = false;
                             self.run_encrypt_and_shred_password_file();
                         }
                     });
-                    if !self.encrypt_shred_pwd.is_empty() && self.encrypt_shred_pwd.chars().count() < 8 {
-                        ui.colored_label(self.palette().danger, "Passphrase must be at least 8 characters.");
+                    if !self.encrypt_shred_pwd.is_empty()
+                        && self.encrypt_shred_pwd.chars().count() < 8
+                    {
+                        ui.colored_label(
+                            self.palette().danger,
+                            "Passphrase must be at least 8 characters.",
+                        );
                     }
                 });
         }
@@ -1237,7 +1330,10 @@ impl eframe::App for UnigenApp {
                             self.editor_open_target = None;
                         }
                         let can_go = !self.editor_open_pwd.is_empty();
-                        if ui.add_enabled(can_go, egui::Button::new("Decrypt")).clicked() {
+                        if ui
+                            .add_enabled(can_go, egui::Button::new("Decrypt"))
+                            .clicked()
+                        {
                             let path = self.editor_open_target.clone().unwrap();
                             let pwd = std::mem::take(&mut self.editor_open_pwd);
                             self.open_editor_decrypt(path, pwd);
@@ -1251,7 +1347,9 @@ impl eframe::App for UnigenApp {
                 .collapsible(false)
                 .resizable(false)
                 .show(ctx, |ui| {
-                    ui.label("You have unsaved edits in the password editor. Close without saving?");
+                    ui.label(
+                        "You have unsaved edits in the password editor. Close without saving?",
+                    );
                     ui.horizontal(|ui| {
                         if ui.button("Keep editing").clicked() {
                             self.editor_confirm_close = false;
@@ -1309,7 +1407,14 @@ impl eframe::App for UnigenApp {
                     // fonts — including egui's bundled emoji font — have no
                     // glyph for it and render nothing. 🌙 (U+1F319, an
                     // actual emoji) is the equivalent that reliably shows.
-                    if ui.button(if self.dark_mode { "☀ Light" } else { "🌙 Dark" }).clicked() {
+                    if ui
+                        .button(if self.dark_mode {
+                            "☀ Light"
+                        } else {
+                            "🌙 Dark"
+                        })
+                        .clicked()
+                    {
                         self.dark_mode = !self.dark_mode;
                         theme::apply(ctx, self.dark_mode);
                     }
@@ -1330,12 +1435,13 @@ impl eframe::App for UnigenApp {
             // that content silently clips at the window edge instead of
             // being reachable. Wrapping in a ScrollArea makes the whole
             // tab scrollable rather than clipped.
-            egui::ScrollArea::vertical().id_source("central_scroll").auto_shrink([false, false]).show(ui, |ui| {
-                match self.tab {
+            egui::ScrollArea::vertical()
+                .id_source("central_scroll")
+                .auto_shrink([false, false])
+                .show(ui, |ui| match self.tab {
                     Tab::Generator => self.ui_generator_tab(ui),
                     Tab::FileProtector => self.ui_file_protector_tab(ui),
-                }
-            });
+                });
         });
     }
 }
@@ -1451,7 +1557,7 @@ impl UnigenApp {
                     }
                     if ui.add_enabled(!self.generated.is_empty(), egui::Button::new("Save to File")).clicked() {
                         if let Some(path) = rfd::FileDialog::new()
-                            .set_file_name(&format!("passwords_{}.txt", self.generated.len()))
+                            .set_file_name(format!("passwords_{}.txt", self.generated.len()))
                             .add_filter("Text files", &["txt"])
                             .save_file()
                         {
@@ -1766,7 +1872,10 @@ impl UnigenApp {
                         self.close_editor();
                     }
                 }
-                if ui.add_enabled(dirty, egui::Button::new("Save (re-encrypt)")).clicked() {
+                if ui
+                    .add_enabled(dirty, egui::Button::new("Save (re-encrypt)"))
+                    .clicked()
+                {
                     self.save_editor();
                 }
                 if dirty {
@@ -1813,10 +1922,8 @@ impl UnigenApp {
             // egui's bundled default font (the same tofu-box issue the
             // CJK/Kana fallback fonts fix for *content* doesn't cover UI
             // glyphs), so it rendered as an empty box.
-            if !self.editor_search.is_empty() {
-                if ui.button("Clear").clicked() {
-                    self.editor_search.clear();
-                }
+            if !self.editor_search.is_empty() && ui.button("Clear").clicked() {
+                self.editor_search.clear();
             }
         });
         ui.small(
@@ -1927,5 +2034,9 @@ fn generate_password(length: usize, pool: &[char]) -> Zeroizing<String> {
         return Zeroizing::new(String::new());
     }
     let mut rng = OsRng;
-    Zeroizing::new((0..length).map(|_| pool[rng.gen_range(0..pool.len())]).collect())
+    Zeroizing::new(
+        (0..length)
+            .map(|_| pool[rng.gen_range(0..pool.len())])
+            .collect(),
+    )
 }
