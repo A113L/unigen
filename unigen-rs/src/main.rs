@@ -784,6 +784,14 @@ impl UnigenApp {
         self.editor_source = None;
         self.editor_open = false;
         self.editor_confirm_close = false;
+        // A line copied from the search view may still be sitting on the
+        // clipboard with its 20s auto-clear timer not yet elapsed — closing
+        // the editor shouldn't leave a decrypted passphrase reachable
+        // indefinitely just because the user didn't wait it out. Clearing
+        // here also cancels the pending timer (clear_clipboard resets
+        // autoclear_deadline/expected), so tick_autoclear won't later fire
+        // on whatever unrelated thing may be on the clipboard by then.
+        self.clear_clipboard();
     }
 
     fn poll_jobs(&mut self, ctx: &egui::Context) {
@@ -1742,3 +1750,4 @@ fn generate_password(length: usize, pool: &[char]) -> String {
     let mut rng = rand::thread_rng();
     (0..length).map(|_| pool[rng.gen_range(0..pool.len())]).collect()
 }
+
