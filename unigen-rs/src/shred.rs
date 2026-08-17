@@ -5,7 +5,7 @@
 //! open-handle identity check and refuses to delete a pathname that no longer
 //! names the verified inode.
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use std::fs::{self, OpenOptions};
@@ -317,6 +317,7 @@ pub fn shred_file(
     shred_file_if_identity(path, expected, passes)
 }
 
+#[cfg(not(windows))]
 fn fsync_parent(path: &Path) {
     if let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         if let Ok(d) = std::fs::File::open(dir) {
@@ -340,5 +341,63 @@ fn libc_o_nofollow() -> i32 {
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         0
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn test_path(name: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before UNIX_EPOCH")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "unigen_shred_{name}_{}_{}",
+            std::process::id(),
+            stamp
+        ))
+    }
+
+    #[test]
+    fn shred_deletes_verified_file() {
+        let path = test_path("delete");
+        fs::write(&path, b"secret data that must not remain").unwrap();
+
+        let result = shred_file(&path, 1, false);
+
+        assert!(result.is_ok(), "shred failed: {result:?}");
+        assert!(!path.exists(), "shredded file still exists");
+    }
+
+    #[test]
+    fn shred_refuses_identity_mismatch_without_overwriting_replacement() {
+        let path = test_path("identity");
+        let replacement = test_path("replacement");
+
+        fs::write(&path, b"original secret").unwrap();
+        let expected = file_identity(&path).unwrap();
+
+        // Replace the pathname with a different inode/file object after the
+        // expected identity was captured.
+        fs::rename(&path, &replacement).unwrap();
+        fs::write(&path, b"do not destroy this replacement").unwrap();
+
+        let result = shred_file_if_identity(&path, expected, 1);
+
+        assert!(result.is_err(), "identity mismatch was not rejected");
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            b"do not destroy this replacement",
+            "replacement file was modified despite identity mismatch"
+        );
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&replacement);
     }
 }
