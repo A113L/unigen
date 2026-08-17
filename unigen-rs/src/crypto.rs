@@ -31,7 +31,7 @@ use pbkdf2::pbkdf2_hmac;
 use rand::rngs::OsRng;
 use rand::RngCore;
 use sha2::Sha256;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
@@ -416,9 +416,38 @@ fn fsync_dir(path: &Path) {
     }
 }
 
+/// Create a new private temporary/output file.
+///
+/// On Unix the file is created with mode 0600 from the moment it exists, so
+/// plaintext is never briefly exposed with the process umask's default mode.
+/// `create_new(true)` also prevents a rare temporary-name collision from
+/// truncating an unrelated file. On Windows the file inherits the ACL of its
+/// containing directory; the important invariant there is that we never
+/// overwrite an existing path during temporary-file creation.
+pub fn create_private_file(path: &Path) -> std::io::Result<File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+    }
+
+    #[cfg(not(unix))]
+    {
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+    }
+}
+
 /// Write a file and force its contents to stable storage before it can be renamed.
+/// The temporary file is private from creation time.
 pub fn write_durable(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    let mut file = File::create(path)?;
+    let mut file = create_private_file(path)?;
     file.write_all(data)?;
     file.sync_all()?;
     Ok(())
@@ -524,7 +553,7 @@ pub fn stream_encrypt_file(
     let result = (|| -> Result<()> {
         let fin = File::open(in_path).with_context(|| format!("opening {in_path:?}"))?;
         let mut reader = BufReader::with_capacity(STREAM_CHUNK_SIZE, fin);
-        let fout = File::create(&tmp_path).with_context(|| format!("creating {tmp_path:?}"))?;
+        let fout = create_private_file(&tmp_path).with_context(|| format!("creating private temporary file {tmp_path:?}"))?;
         let mut writer = BufWriter::with_capacity(STREAM_CHUNK_SIZE + 4096, fout);
 
         writer.write_all(STREAM_MAGIC)?;
@@ -663,7 +692,7 @@ pub fn stream_decrypt_file(
         let mut writer = match &tmp_path {
             Some(p) => Some(BufWriter::with_capacity(
                 STREAM_CHUNK_SIZE + 4096,
-                File::create(p)?,
+                create_private_file(p)?,
             )),
             None => None,
         };
