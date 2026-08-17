@@ -92,8 +92,7 @@ fn file_identity_from_file(file: &fs::File) -> Result<FileIdentity> {
         let info = unsafe { info.assume_init() };
         Ok(FileIdentity {
             volume_serial: info.dw_volume_serial_number,
-            file_index: ((info.n_file_index_high as u64) << 32)
-                | info.n_file_index_low as u64,
+            file_index: ((info.n_file_index_high as u64) << 32) | info.n_file_index_low as u64,
         })
     }
 
@@ -131,7 +130,6 @@ fn open_shred_handle(path: &Path) -> Result<fs::File> {
 
     opts.open(path)
         .with_context(|| format!("opening {path:?} for secure shredding"))
-        .map_err(Into::into)
 }
 
 fn overwrite_open_file(file: &mut fs::File, passes: u32) -> Result<()> {
@@ -229,9 +227,7 @@ pub fn shred_file_if_identity(
     let mut file = open_shred_handle(path)?;
     let actual = file_identity_from_file(&file)?;
     if actual != expected {
-        bail!(
-            "File changed after verification; refusing to overwrite the replacement: {path:?}"
-        );
+        bail!("File changed after verification; refusing to overwrite the replacement: {path:?}");
     }
 
     overwrite_open_file(&mut file, passes)?;
@@ -343,7 +339,6 @@ fn libc_o_nofollow() -> i32 {
         0
     }
 }
-
 
 #[cfg(test)]
 mod tests {
