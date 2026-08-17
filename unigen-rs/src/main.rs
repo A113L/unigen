@@ -435,6 +435,22 @@ impl UnigenApp {
         build_pool(&self.charset_enabled, &self.charsets)
     }
 
+    /// Copies `text` to the clipboard and unconditionally schedules it to
+    /// be wiped after 20 seconds — used for the password-search results
+    /// below, where lines are sensitive and should never linger for
+    /// longer regardless of the user's general auto-clear setting/timer.
+    fn copy_to_clipboard_20s(&mut self, text: &str) {
+        if let Some(cb) = self.clipboard.as_mut() {
+            if cb.set_text(text.to_string()).is_ok() {
+                self.autoclear_deadline = Some(Instant::now() + Duration::from_secs(20));
+                self.autoclear_expected = Some(text.to_string());
+                self.editor_status = "Copied line. Clipboard clears in 20s.".to_string();
+                return;
+            }
+        }
+        self.editor_status = "Copy failed: no clipboard access.".to_string();
+    }
+
     fn copy_to_clipboard(&mut self, text: &str) {
         if let Some(cb) = self.clipboard.as_mut() {
             if cb.set_text(text.to_string()).is_ok() {
@@ -1656,13 +1672,18 @@ impl UnigenApp {
             // be fed back into a plain edit buffer 1:1); clear the search
             // to go back to the full editable text.
             let needle = self.editor_search.to_lowercase();
-            let matches: Vec<(usize, &str)> = self
+            let matches: Vec<(usize, String)> = self
                 .editor_content
                 .lines()
                 .enumerate()
                 .filter(|(_, l)| l.to_lowercase().contains(&needle))
+                .map(|(i, l)| (i, l.to_string()))
                 .collect();
-            ui.small(format!("{} matching line(s) — clear search to edit the full file.", matches.len()));
+            ui.small(format!(
+                "{} matching line(s) — clear search to edit the full file. Copied lines clear from the clipboard after 20s.",
+                matches.len()
+            ));
+            let mut to_copy: Option<String> = None;
             egui::ScrollArea::vertical()
                 .id_source("editor_search_scroll")
                 .max_height(340.0)
@@ -1670,19 +1691,26 @@ impl UnigenApp {
                     if matches.is_empty() {
                         ui.small("No matches.");
                     } else {
-                        let mut joined = String::new();
                         for (line_no, line) in &matches {
-                            joined.push_str(&format!("{:>4}: {line}\n", line_no + 1));
+                            ui.horizontal(|ui| {
+                                if ui.button("Copy").on_hover_text("Copy this line; auto-clears from the clipboard in 20s.").clicked() {
+                                    to_copy = Some(line.clone());
+                                }
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(format!("{:>4}: {line}", line_no + 1))
+                                            .font(egui::FontId::monospace(13.0)),
+                                    )
+                                    .selectable(true)
+                                    .wrap(false),
+                                );
+                            });
                         }
-                        ui.add(
-                            egui::TextEdit::multiline(&mut joined)
-                                .font(egui::TextStyle::Monospace)
-                                .desired_rows(10)
-                                .desired_width(f32::INFINITY)
-                                .interactive(false),
-                        );
                     }
                 });
+            if let Some(line) = to_copy {
+                self.copy_to_clipboard_20s(&line);
+            }
         } else {
             // Below a certain length this used to give a cramped ~120px
             // box; now that the window is taller by default (see main())
