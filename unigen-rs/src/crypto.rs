@@ -416,16 +416,21 @@ fn fsync_dir(path: &Path) {
     }
 }
 
+/// Write a file and force its contents to stable storage before it can be renamed.
+pub fn write_durable(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let mut file = File::create(path)?;
+    file.write_all(data)?;
+    file.sync_all()?;
+    Ok(())
+}
+
 /// Atomically (best-effort) replace `dest` with `tmp`.
 ///
-/// `fs::rename` refuses to overwrite an existing destination file on
-/// Windows (it succeeds silently on Unix). This wraps the platform
-/// difference so callers get consistent "replace whatever is there"
-/// semantics on both. On Windows we use `MoveFileExW` with
-/// `MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH`, which is the
-/// standard way to get an overwriting, durable rename; if that's
-/// unavailable for some reason we fall back to remove-then-rename,
-/// which is not atomic but still correct outside of a crash window.
+/// Atomically replace `dest` with `tmp` where the platform provides the
+/// required primitive. On Windows this uses MoveFileExW with
+/// MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH. If that primitive
+/// fails, return the OS error rather than deleting the existing destination.
+/// A safe failure is preferable to a remove-then-rename data-loss window.
 pub fn replace_file(tmp: &Path, dest: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {
@@ -461,9 +466,7 @@ pub fn replace_file(tmp: &Path, dest: &Path) -> std::io::Result<()> {
         if ok != 0 {
             return Ok(());
         }
-        // Fall back to remove-then-rename (e.g. odd filesystem/ACL cases).
-        let _ = fs::remove_file(dest);
-        fs::rename(tmp, dest)
+        Err(std::io::Error::last_os_error())
     }
     #[cfg(not(windows))]
     {
