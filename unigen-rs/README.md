@@ -329,38 +329,3 @@ unigen-rs/
   eliminates the collision risk that motivated the idea, so a sweep would
   only reintroduce a smaller version of the same "might delete a file that
   isn't ours" risk for no real benefit.
-
-## A note on rendering in VirtualBox / other VMs
-
-If you're testing this in a VirtualBox VM (or similar) and see rendering
-problems — an `OpenGL 2.0+` panic, warped/garbled glyphs, a darkened
-background, or a `wgpu`/`Option::unwrap()` panic mentioning `instance.rs` —
-that's the VM's virtual GPU driver stack, not a bug in this app's code.
-This app uses `eframe`'s `glow` (OpenGL) renderer, which is what the vast
-majority of egui apps ship with and what works reliably on real Windows
-hardware. What was tried and why it didn't stick, for anyone hitting the
-same wall:
-
-- **`egui_glow requires opengl 2.0+`** — happens when the VM has no 3D
-  acceleration enabled at all. Fix: VM settings → Display → enable 3D
-  Acceleration, raise video memory, and install/update VirtualBox Guest
-  Additions in the guest.
-- **Warped glyphs / dark background after enabling 3D** — VirtualBox's
-  bundled `Mesa`/`SVGA3D` virtual OpenGL driver has known rendering bugs.
-  Switching the renderer to `wgpu` was tried as a workaround, but on this
-  driver stack `wgpu` either fell back to the same broken GL path (shader
-  compile error: `unrecognized layout identifier 'binding'`) or, when
-  pinned to DX12, hit a known upstream `wgpu` 0.19.x bug where DX12
-  surface creation panics instead of failing gracefully on VMs with no
-  usable DX12 adapter (see gfx-rs/wgpu#5225, #5294). So this app stays on
-  `glow`, with `multisampling`/`depth_buffer`/`stencil_buffer` disabled and
-  `vsync` off (`src/main.rs::main`) — settings that reduce, but may not
-  fully eliminate, artifacts on this particular driver.
-- **The actual fix, if you hit this**: none of the above is a limitation
-  of real Windows machines — physical hardware has a properly-implemented
-  GPU driver and none of this applies. If you specifically need to test
-  inside a VM, the most reliable options are, in order: (1) run on real
-  hardware instead, (2) use a hypervisor with real GPU passthrough (e.g.
-  Hyper-V with DDA, or a cloud VM with an attached GPU) instead of
-  VirtualBox's software-emulated 3D, or (3) accept the cosmetic glitches
-  as a VM-only artifact — the app is fully functional even with them.
