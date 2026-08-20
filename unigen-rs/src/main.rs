@@ -8,6 +8,7 @@
 mod charsets;
 mod crypto;
 mod shred;
+mod vault;
 
 use charsets::{
     all_charsets, build_pool, calculate_entropy, estimate_passphrase_entropy, rate_entropy, CharSet,
@@ -17,6 +18,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
+use vault::VaultEntry;
 use zeroize::{Zeroize, Zeroizing};
 
 /// Exact hex palette from the Python original's `THEMES` dict, so the two
@@ -290,6 +292,7 @@ fn load_custom_fonts(ctx: &eframe::egui::Context) {
 enum Tab {
     Generator,
     FileProtector,
+    Vault,
 }
 
 /// Messages sent from a background worker thread back to the UI thread.
@@ -379,6 +382,53 @@ struct UnigenApp {
     editor_open_pwd: String,
     editor_open_error: String,
 
+    // ---- Vault (password manager) ----
+    /// Path to the vault's encrypted file on disk (persisted across
+    /// runs like other path fields; `None` until the user picks/creates
+    /// one from the vault tab's "Open/Create vault..." button).
+    vault_path: Option<PathBuf>,
+    vault_unlocked: bool,
+    /// Master password input, before unlock. Zeroized after use, same
+    /// discipline as `enc_pwd`/`dec_pwd` above.
+    vault_master_pwd: String,
+    /// Decrypted entries, only populated while unlocked. Wrapped so the
+    /// whole list — including every entry's password/notes strings via
+    /// `VaultEntry`'s manual `Zeroize` impl — is scrubbed the moment it's
+    /// replaced or the app drops it (e.g. on lock or exit).
+    vault_entries: Zeroizing<Vec<VaultEntry>>,
+    vault_kdf: u8,
+    vault_status: String,
+    vault_dirty: bool,
+    vault_search: String,
+    /// Id of the entry currently shown in the edit pane, if any.
+    vault_selected: Option<u64>,
+    /// Scratch buffers for the edit pane; copied into the real entry on
+    /// explicit "Save entry" so partial edits can be discarded on cancel.
+    vault_edit_title: String,
+    vault_edit_username: String,
+    vault_edit_password: String,
+    vault_edit_url: String,
+    vault_edit_notes: String,
+    vault_reveal_password: bool,
+    vault_confirm_delete: Option<u64>,
+    /// Auto-lock: mirrors the existing passphrase inactivity-clear
+    /// pattern, but locks (re-encrypts and drops plaintext entries from
+    /// memory) instead of just clearing a text field.
+    vault_last_activity: Instant,
+    vault_autolock_seconds: u32,
+
+    // ---- Vault: change master password ----
+    vault_change_pwd_open: bool,
+    vault_change_pwd_current: String,
+    vault_change_pwd_new: String,
+    vault_change_pwd_confirm: String,
+    vault_change_pwd_error: String,
+
+    // ---- Vault: CSV import ----
+    vault_import_open: bool,
+    vault_import_source: vault::CsvSource,
+    vault_import_status: String,
+
     // ---- Background job tracking ----
     busy_ops: HashSet<&'static str>,
     encrypt_job: Option<BackgroundJob>,
@@ -442,6 +492,32 @@ impl UnigenApp {
             editor_open_target: None,
             editor_open_pwd: String::new(),
             editor_open_error: String::new(),
+            vault_path: None,
+            vault_unlocked: false,
+            vault_master_pwd: String::new(),
+            vault_entries: Zeroizing::new(Vec::new()),
+            vault_kdf: crypto::DEFAULT_KDF,
+            vault_status: String::new(),
+            vault_dirty: false,
+            vault_search: String::new(),
+            vault_selected: None,
+            vault_edit_title: String::new(),
+            vault_edit_username: String::new(),
+            vault_edit_password: String::new(),
+            vault_edit_url: String::new(),
+            vault_edit_notes: String::new(),
+            vault_reveal_password: false,
+            vault_confirm_delete: None,
+            vault_last_activity: Instant::now(),
+            vault_autolock_seconds: 120,
+            vault_change_pwd_open: false,
+            vault_change_pwd_current: String::new(),
+            vault_change_pwd_new: String::new(),
+            vault_change_pwd_confirm: String::new(),
+            vault_change_pwd_error: String::new(),
+            vault_import_open: false,
+            vault_import_source: vault::CsvSource::Generic,
+            vault_import_status: String::new(),
             busy_ops: HashSet::new(),
             encrypt_job: None,
             decrypt_job: None,
@@ -509,6 +585,601 @@ impl UnigenApp {
             }
         }
         self.clip_status = "Copy failed: no clipboard access.".to_string();
+    }
+
+    // ---- Vault (password manager) ----
+
+    fn vault_touch(&mut self) {
+        self.vault_last_activity = Instant::now();
+    }
+
+    fn tick_vault_autolock(&mut self) {
+        if self.vault_unlocked
+            && self.vault_autolock_seconds > 0
+            && self.vault_last_activity.elapsed()
+                >= Duration::from_secs(self.vault_autolock_seconds as u64)
+        {
+            self.lock_vault(true);
+            self.vault_status = "Vault auto-locked after inactivity.".to_string();
+        }
+    }
+
+    /// Unlock (or create) the vault at `self.vault_path` using
+    /// `self.vault_master_pwd`. Leaves the master-password field zeroized
+    /// either way, matching how every other passphrase field in this app
+    /// is handled once it's been consumed.
+    fn unlock_vault(&mut self) {
+        let Some(path) = self.vault_path.clone() else {
+            self.vault_status = "Choose a vault file first.".to_string();
+            return;
+        };
+        let mut pwd = std::mem::take(&mut self.vault_master_pwd);
+        let is_new = !path.exists();
+        let result = vault::open_or_create(&path, &pwd);
+        zeroize_string(&mut pwd);
+        match result {
+            Ok(entries) => {
+                self.vault_entries = Zeroizing::new(entries);
+                self.vault_unlocked = true;
+                self.vault_dirty = false;
+                self.vault_selected = None;
+                self.vault_status = if is_new {
+                    "New vault created. It's saved once you add and save an entry.".to_string()
+                } else {
+                    format!("Vault unlocked ({} entries).", self.vault_entries.len())
+                };
+                self.vault_touch();
+            }
+            Err(e) => {
+                self.vault_status = format!("Unlock failed: {e}");
+            }
+        }
+    }
+
+    /// Save the current in-memory entries back to disk, re-encrypting
+    /// with the same master password used to unlock. Requires the vault
+    /// to still be unlocked; callers should prompt for the master
+    /// password again if it's ever needed for a from-scratch save.
+    fn save_vault_with(&mut self, master_password: &str) {
+        let Some(path) = self.vault_path.clone() else {
+            self.vault_status = "No vault file selected.".to_string();
+            return;
+        };
+        match vault::write_vault_file(&path, master_password, &self.vault_entries, self.vault_kdf)
+        {
+            Ok(()) => {
+                self.vault_dirty = false;
+                self.vault_status = format!("Saved ({} entries).", self.vault_entries.len());
+            }
+            Err(e) => {
+                self.vault_status = format!("Save failed: {e}");
+            }
+        }
+    }
+
+    /// Lock the vault: drop decrypted entries (zeroizing them) and clear
+    /// the edit pane. If `warn_if_dirty` and there are unsaved changes,
+    /// locking still proceeds — losing an unsaved edit on an inactivity
+    /// timeout is preferable to leaving plaintext credentials sitting in
+    /// memory indefinitely — but the status line says so.
+    fn lock_vault(&mut self, warn_if_dirty: bool) {
+        if !self.vault_unlocked {
+            return;
+        }
+        let had_unsaved = self.vault_dirty;
+        self.vault_entries = Zeroizing::new(Vec::new());
+        self.vault_unlocked = false;
+        self.vault_dirty = false;
+        self.vault_selected = None;
+        self.clear_vault_edit_buffers();
+        self.close_change_pwd_dialog();
+        self.vault_import_open = false;
+        self.vault_import_status.clear();
+        if warn_if_dirty && had_unsaved {
+            self.vault_status = "Locked. Unsaved changes were discarded.".to_string();
+        }
+    }
+
+    fn clear_vault_edit_buffers(&mut self) {
+        zeroize_string(&mut self.vault_edit_title);
+        zeroize_string(&mut self.vault_edit_username);
+        zeroize_string(&mut self.vault_edit_password);
+        zeroize_string(&mut self.vault_edit_url);
+        zeroize_string(&mut self.vault_edit_notes);
+        self.vault_reveal_password = false;
+    }
+
+    fn vault_select(&mut self, id: u64) {
+        if let Some(e) = self.vault_entries.iter().find(|e| e.id == id) {
+            self.vault_edit_title = e.title.clone();
+            self.vault_edit_username = e.username.clone();
+            self.vault_edit_password = e.password.clone();
+            self.vault_edit_url = e.url.clone();
+            self.vault_edit_notes = e.notes.clone();
+            self.vault_selected = Some(id);
+            self.vault_reveal_password = false;
+        }
+    }
+
+    fn vault_new_entry(&mut self) {
+        self.clear_vault_edit_buffers();
+        self.vault_selected = None;
+        self.vault_edit_title = "New entry".to_string();
+    }
+
+    /// Commit the edit-pane buffers into `vault_entries`: updates the
+    /// selected entry in place, or appends a new one if nothing was
+    /// selected. Does not write to disk — call `save_vault_with` (which
+    /// prompts for the master password if needed) to persist.
+    fn vault_commit_edit(&mut self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if let Some(id) = self.vault_selected {
+            if let Some(e) = self.vault_entries.iter_mut().find(|e| e.id == id) {
+                // Zeroize the old field contents before overwriting them.
+                // A plain assignment (`e.password = ...`) drops the old
+                // `String` without wiping its heap buffer first, leaving
+                // the previous plaintext password sitting unzeroized in
+                // freed memory. Same class of gap documented on `impl
+                // Zeroize for VaultEntry` above (Vec growth/shift), just
+                // triggered here by a single-field replace instead.
+                e.title.zeroize();
+                e.username.zeroize();
+                e.password.zeroize();
+                e.url.zeroize();
+                e.notes.zeroize();
+                e.title = self.vault_edit_title.clone();
+                e.username = self.vault_edit_username.clone();
+                e.password = self.vault_edit_password.clone();
+                e.url = self.vault_edit_url.clone();
+                e.notes = self.vault_edit_notes.clone();
+                e.updated_at = now;
+            }
+        } else {
+            let mut id = now;
+            while self.vault_entries.iter().any(|e| e.id == id) {
+                id += 1;
+            }
+            self.vault_entries.push(VaultEntry {
+                id,
+                title: self.vault_edit_title.clone(),
+                username: self.vault_edit_username.clone(),
+                password: self.vault_edit_password.clone(),
+                url: self.vault_edit_url.clone(),
+                notes: self.vault_edit_notes.clone(),
+                created_at: now,
+                updated_at: now,
+            });            self.vault_selected = Some(id);
+        }
+        self.vault_dirty = true;
+        self.vault_status = "Entry updated (not yet saved to disk).".to_string();
+        self.vault_touch();
+    }
+
+    fn vault_delete_entry(&mut self, id: u64) {
+        if let Some(pos) = self.vault_entries.iter().position(|e| e.id == id) {
+            let mut removed = self.vault_entries.remove(pos);
+            removed.zeroize();
+        }
+        if self.vault_selected == Some(id) {
+            self.vault_selected = None;
+            self.clear_vault_edit_buffers();
+        }
+        self.vault_dirty = true;
+        self.vault_status = "Entry deleted (not yet saved to disk).".to_string();
+        self.vault_touch();
+    }
+
+    /// Verify `current_password` actually unlocks the vault currently on
+    /// disk, then re-encrypt the in-memory entries under
+    /// `self.vault_change_pwd_new` and write them out. Requires the file
+    /// to already exist (there's nothing to "change" for a brand-new,
+    /// never-saved vault — just set the master password via Unlock).
+    fn change_master_password(&mut self) {
+        let Some(path) = self.vault_path.clone() else {
+            self.vault_change_pwd_error = "No vault file selected.".to_string();
+            return;
+        };
+        if !path.exists() {
+            self.vault_change_pwd_error =
+                "Vault hasn't been saved to disk yet — save it first.".to_string();
+            return;
+        }
+        if self.vault_change_pwd_new.chars().count() < 8 {
+            self.vault_change_pwd_error =
+                "New password must be at least 8 characters.".to_string();
+            return;
+        }
+        if self.vault_change_pwd_new != self.vault_change_pwd_confirm {
+            self.vault_change_pwd_error = "New password and confirmation don't match.".to_string();
+            return;
+        }
+
+        // Re-verify the *current* password against the file on disk
+        // (not just "the vault happens to be unlocked right now") so a
+        // stale unlock from long ago can't be used to silently change
+        // the password to something the user didn't intend, and so a
+        // typo in the current-password field is caught here rather than
+        // producing a vault re-encrypted under the wrong assumption.
+        let mut current = std::mem::take(&mut self.vault_change_pwd_current);
+        let verify = vault::read_vault_file(&path).and_then(|combined| {
+            vault::decrypt_vault(&current, &combined)
+        });
+        zeroize_string(&mut current);
+
+        if verify.is_err() {
+            self.vault_change_pwd_error = "Current password is incorrect.".to_string();
+            return;
+        }
+
+        let mut new_pwd = std::mem::take(&mut self.vault_change_pwd_new);
+        let result =
+            vault::change_master_password(&path, &self.vault_entries, &new_pwd, self.vault_kdf);
+        zeroize_string(&mut new_pwd);
+        zeroize_string(&mut self.vault_change_pwd_confirm);
+
+        match result {
+            Ok(()) => {
+                self.vault_dirty = false;
+                self.vault_change_pwd_open = false;
+                self.vault_change_pwd_error.clear();
+                self.vault_status = "Master password changed.".to_string();
+                self.vault_touch();
+            }
+            Err(e) => {
+                self.vault_change_pwd_error = format!("Failed to save with new password: {e}");
+            }
+        }
+    }
+
+    fn close_change_pwd_dialog(&mut self) {
+        zeroize_string(&mut self.vault_change_pwd_current);
+        zeroize_string(&mut self.vault_change_pwd_new);
+        zeroize_string(&mut self.vault_change_pwd_confirm);
+        self.vault_change_pwd_error.clear();
+        self.vault_change_pwd_open = false;
+    }
+
+    /// Import entries from a CSV file exported by another password
+    /// manager, appending them to the current in-memory vault. Does not
+    /// save to disk on its own — imported entries show up as unsaved
+    /// changes like any other edit, so the user gets a chance to review
+    /// before committing them.
+    fn run_csv_import(&mut self, path: PathBuf) {
+        let mut contents = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) => {
+                self.vault_import_status = format!("Couldn't read file: {e}");
+                return;
+            }
+        };
+        let parsed = vault::parse_csv(&contents, self.vault_import_source);
+        // The whole exported file — every plaintext password it
+        // contains — has now either been copied into `rows` (parse
+        // succeeded) or is no longer needed (parse failed). Either way
+        // this buffer should not linger un-zeroized in memory for the
+        // rest of the session.
+        zeroize_string(&mut contents);
+        match parsed {
+            Ok(rows) => {
+                if rows.is_empty() {
+                    self.vault_import_status = "No rows found to import.".to_string();
+                    return;
+                }
+                let n = vault::append_imported(&mut self.vault_entries, rows);
+                self.vault_dirty = true;
+                self.vault_import_status = format!(
+                    "Imported {n} entries. Review them below, then save the vault to disk."
+                );
+                self.vault_status = format!("Imported {n} entries (not yet saved to disk).");
+                self.vault_touch();
+            }
+            Err(e) => {
+                self.vault_import_status = format!("Import failed: {e}");
+            }
+        }
+    }
+
+    fn ui_vault_tab(&mut self, ui: &mut egui::Ui) {
+        let pal = self.palette();
+
+        ui.horizontal(|ui| {
+            let label = self
+                .vault_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "No vault file selected".to_string());
+            ui.label(label);
+            // Two distinct actions rather than one "Open/Create" button
+            // backed by save_file(): a save dialog triggers the OS's
+            // native "this file already exists — overwrite it?" prompt
+            // the moment you pick an existing vault, even though opening
+            // an existing vault is a pure read here — the app doesn't
+            // touch the file until Unlock is pressed. pick_file() opens
+            // an existing file with no such warning; save_file() is kept
+            // only for the "create a new, not-yet-existing vault" case.
+            if ui.button("Open existing vault…").clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("UNIGEN vault", &["uvault", "enc"])
+                    .pick_file()
+                {
+                    self.lock_vault(true);
+                    self.vault_path = Some(path);
+                }
+            }
+            if ui.button("New vault…").clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("UNIGEN vault", &["uvault", "enc"])
+                    .set_file_name("vault.uvault")
+                    .save_file()
+                {
+                    self.lock_vault(true);
+                    self.vault_path = Some(path);
+                }
+            }
+        });
+
+        if !self.vault_status.is_empty() {
+            ui.small(&self.vault_status);
+        }
+
+        ui.separator();
+
+        if !self.vault_unlocked {
+            ui.label("Enter the master password to unlock (or create) this vault:");
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut self.vault_master_pwd).password(true));
+                let can_go = self.vault_path.is_some() && !self.vault_master_pwd.is_empty();
+                if ui
+                    .add_enabled(can_go, egui::Button::new("Unlock"))
+                    .clicked()
+                {
+                    self.unlock_vault();
+                }
+            });
+            return;
+        }
+
+        ui.horizontal(|ui| {
+            if self.vault_dirty {
+                ui.colored_label(pal.warning, "Unsaved changes");
+            }
+            if ui.button("Lock").clicked() {
+                self.lock_vault(true);
+            }
+            if ui.button("Change master password…").clicked() {
+                self.vault_change_pwd_open = true;
+            }
+            if ui.button("Import from CSV…").clicked() {
+                self.vault_import_open = true;
+                self.vault_import_status.clear();
+            }
+        });
+
+        ui.separator();
+
+        ui.horizontal(|ui| {
+            ui.label("Search:");
+            ui.text_edit_singleline(&mut self.vault_search);
+            if ui.button("+ New entry").clicked() {
+                self.vault_new_entry();
+                self.vault_touch();
+            }
+        });
+
+        ui.columns(2, |cols| {
+            let query = self.vault_search.to_lowercase();
+            let mut ids: Vec<u64> = self
+                .vault_entries
+                .iter()
+                .filter(|e| {
+                    query.is_empty()
+                        || e.title.to_lowercase().contains(&query)
+                        || e.username.to_lowercase().contains(&query)
+                        || e.url.to_lowercase().contains(&query)
+                })
+                .map(|e| e.id)
+                .collect();
+            ids.sort_by_key(|id| {
+                self.vault_entries
+                    .iter()
+                    .find(|e| e.id == *id)
+                    .map(|e| e.title.to_lowercase())
+                    .unwrap_or_default()
+            });
+
+            egui::ScrollArea::vertical()
+                .id_source("vault_list")
+                .show(&mut cols[0], |ui| {
+                    for id in &ids {
+                        let entry = self.vault_entries.iter().find(|e| e.id == *id);
+                        let Some(entry) = entry else { continue };
+                        let title = if entry.title.is_empty() {
+                            "(untitled)".to_string()
+                        } else {
+                            entry.title.clone()
+                        };
+                        let selected = self.vault_selected == Some(*id);
+                        if ui.selectable_label(selected, title).clicked() {
+                            self.vault_select(*id);
+                            self.vault_touch();
+                        }
+                    }
+                    if ids.is_empty() {
+                        ui.small("No entries yet.");
+                    }
+                });
+
+            let ui = &mut cols[1];
+            ui.label("Title");
+            ui.text_edit_singleline(&mut self.vault_edit_title);
+            ui.label("Username");
+            ui.text_edit_singleline(&mut self.vault_edit_username);
+            ui.label("Password");
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.vault_edit_password)
+                        .password(!self.vault_reveal_password),
+                );
+                if ui
+                    .button(if self.vault_reveal_password {
+                        "Hide"
+                    } else {
+                        "Show"
+                    })
+                    .clicked()
+                {
+                    self.vault_reveal_password = !self.vault_reveal_password;
+                }
+                if ui.button("Copy").clicked() {
+                    let pwd = self.vault_edit_password.clone();
+                    self.copy_to_clipboard(&pwd);
+                }
+                if ui.button("Generate").clicked() {
+                    let pool = build_pool(&self.charset_enabled, &self.charsets);
+                    if !pool.is_empty() {
+                        self.vault_edit_password =
+                            generate_password(self.length as usize, &pool).to_string();
+                    }
+                }
+            });
+            ui.label("URL");
+            ui.text_edit_singleline(&mut self.vault_edit_url);
+            ui.label("Notes");
+            ui.add(egui::TextEdit::multiline(&mut self.vault_edit_notes).desired_rows(4));
+
+            ui.horizontal(|ui| {
+                let has_title = !self.vault_edit_title.trim().is_empty();
+                if ui
+                    .add_enabled(has_title, egui::Button::new("Save entry"))
+                    .clicked()
+                {
+                    self.vault_commit_edit();
+                }
+                if let Some(id) = self.vault_selected {
+                    if ui.button("Delete entry").clicked() {
+                        self.vault_confirm_delete = Some(id);
+                    }
+                }
+            });
+
+        });
+
+        if self.vault_dirty {
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label("Master password to save:");
+                ui.add(egui::TextEdit::singleline(&mut self.vault_master_pwd).password(true));
+                if ui.button("Save vault").clicked() {
+                    let mut pwd = std::mem::take(&mut self.vault_master_pwd);
+                    self.save_vault_with(&pwd);
+                    zeroize_string(&mut pwd);
+                }
+            });
+        }
+
+        if let Some(id) = self.vault_confirm_delete {
+            egui::Window::new("Delete entry?")
+                .collapsible(false)
+                .resizable(false)
+                .show(ui.ctx(), |ui| {
+                    ui.label("This removes the entry from the in-memory vault. Save the vault afterwards to make it permanent.");
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            self.vault_confirm_delete = None;
+                        }
+                        if ui.button("Delete").clicked() {
+                            self.vault_delete_entry(id);
+                            self.vault_confirm_delete = None;
+                        }
+                    });
+                });
+        }
+
+        if self.vault_change_pwd_open {
+            egui::Window::new("Change master password")
+                .collapsible(false)
+                .resizable(false)
+                .show(ui.ctx(), |ui| {
+                    ui.label("Current master password:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.vault_change_pwd_current)
+                            .password(true),
+                    );
+                    ui.label("New master password (min 8 characters):");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.vault_change_pwd_new).password(true),
+                    );
+                    ui.label("Confirm new master password:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.vault_change_pwd_confirm)
+                            .password(true),
+                    );
+                    if !self.vault_change_pwd_error.is_empty() {
+                        ui.colored_label(pal.danger, &self.vault_change_pwd_error);
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            self.close_change_pwd_dialog();
+                        }
+                        let can_go = !self.vault_change_pwd_current.is_empty()
+                            && self.vault_change_pwd_new.chars().count() >= 8
+                            && !self.vault_change_pwd_confirm.is_empty();
+                        if ui
+                            .add_enabled(can_go, egui::Button::new("Change password"))
+                            .clicked()
+                        {
+                            self.change_master_password();
+                        }
+                    });
+                });
+        }
+
+        if self.vault_import_open {
+            egui::Window::new("Import from CSV")
+                .collapsible(false)
+                .resizable(false)
+                .show(ui.ctx(), |ui| {
+                    ui.label("Source format:");
+                    egui::ComboBox::from_id_source("vault_import_source")
+                        .selected_text(self.vault_import_source.label())
+                        .show_ui(ui, |ui| {
+                            for src in vault::CsvSource::ALL {
+                                ui.selectable_value(
+                                    &mut self.vault_import_source,
+                                    src,
+                                    src.label(),
+                                );
+                            }
+                        });
+                    ui.add_space(6.0);
+                    ui.small(
+                        "The plaintext CSV file only exists on disk until you delete it — \
+                         most password managers don't shred their own exports, so consider \
+                         deleting the file yourself afterwards (Manual Shred, in File Protector, \
+                         does this securely).",
+                    );
+                    ui.add_space(6.0);
+                    if !self.vault_import_status.is_empty() {
+                        ui.label(&self.vault_import_status);
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Close").clicked() {
+                            self.vault_import_open = false;
+                            self.vault_import_status.clear();
+                        }
+                        if ui.button("Choose CSV file…").clicked() {
+                            if let Some(path) =
+                                rfd::FileDialog::new().add_filter("CSV", &["csv"]).pick_file()
+                            {
+                                self.run_csv_import(path);
+                            }
+                        }
+                    });
+                });
+        }
     }
 
     /// One-click: encrypt the saved plaintext password list with a
@@ -976,7 +1647,14 @@ impl UnigenApp {
         let autoclear_pending = self.autoclear_deadline.is_some()
             || (self.enc_pwd_autoclear && !self.enc_pwd.is_empty())
             || (self.dec_pwd_autoclear && !self.dec_pwd.is_empty());
-        if !self.busy_ops.is_empty() || autoclear_pending {
+        // Vault auto-lock relies on this same repaint mechanism to check
+        // its timer — without it, an idle window with no other pending
+        // timer would never re-run `update()`, and `tick_vault_autolock`
+        // would never fire until the next real user interaction. That
+        // would leave an unlocked vault decrypted in memory indefinitely
+        // while the app sits idle, defeating the point of auto-lock.
+        let vault_autolock_pending = self.vault_unlocked && self.vault_autolock_seconds > 0;
+        if !self.busy_ops.is_empty() || autoclear_pending || vault_autolock_pending {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
     }
@@ -1255,6 +1933,7 @@ impl eframe::App for UnigenApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.tick_autoclear();
         self.tick_pwd_autoclear();
+        self.tick_vault_autolock();
         self.poll_jobs(ctx);
 
         // Replaces the old `on_close_event` hook, which was removed from
@@ -1269,6 +1948,7 @@ impl eframe::App for UnigenApp {
                 zeroize_string(&mut self.editor_open_pwd);
                 self.close_editor();
                 self.clear_clipboard();
+                self.lock_vault(false);
             } else {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 self.show_close_confirm = true;
@@ -1423,6 +2103,7 @@ impl eframe::App for UnigenApp {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.tab, Tab::Generator, "Password Generator");
                 ui.selectable_value(&mut self.tab, Tab::FileProtector, "File Protector");
+                ui.selectable_value(&mut self.tab, Tab::Vault, "Vault");
             });
         });
 
@@ -1441,6 +2122,7 @@ impl eframe::App for UnigenApp {
                 .show(ui, |ui| match self.tab {
                     Tab::Generator => self.ui_generator_tab(ui),
                     Tab::FileProtector => self.ui_file_protector_tab(ui),
+                    Tab::Vault => self.ui_vault_tab(ui),
                 });
         });
     }
