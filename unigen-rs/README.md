@@ -68,6 +68,35 @@ of bytes in memory. Rust provides that:
 - **Linux swap-exclusion (best-effort)** — optional `mlock()` on the
   passphrase before encryption; not guaranteed on every kernel/filesystem
   configuration.
+- **Password vault** — a single encrypted file holding many named
+  credential entries (title, username, password, URL, notes), unlocked
+  with one master password. It's not a new crypto format: a vault file
+  is just an `encrypt_blob()` container (see
+  [Container formats](#container-formats)) whose plaintext payload is
+  JSON, so it gets the same AAD-bound header, size cap, and
+  format-version handling as any other small encrypted file in this app.
+  Vault-specific safeguards:
+  - Changing the master password re-verifies the *current* password
+    against the file on disk (not just "the vault happens to be
+    unlocked right now") before re-encrypting under the new one.
+  - The vault auto-locks after a configurable period of inactivity,
+    zeroizing all decrypted entries from memory — even unsaved edits, on
+    the theory that losing an unsaved edit is preferable to leaving
+    plaintext credentials sitting in memory indefinitely.
+  - Entries are held in `Zeroizing<Vec<VaultEntry>>`; deleting or
+    editing an entry explicitly zeroizes its old field contents (title,
+    username, password, URL, notes) before they're dropped or
+    overwritten, rather than just letting the old `String` buffers be
+    freed unwiped.
+  - **CSV import** — bring in existing passwords from Chrome/Edge/Brave,
+    Firefox, Bitwarden, 1Password, or KeePass exports, or a generic
+    auto-detect layout for anything else. Imported rows are zeroizable
+    on discard and only ever folded into the vault in memory; nothing is
+    written to disk until you explicitly save.
+  - Opening an existing vault and creating a new one are separate
+    actions in the UI (**Open existing vault…** / **New vault…**) — the
+    former uses a plain file-open dialog so pointing it at your existing
+    vault never triggers an OS "overwrite this file?" prompt.
 - **Dark/light theme**, resizable window, CJK/Kana glyph rendering via an
   optional local fallback font (see
   [Fonts](#fonts-for-cjk--kana--other-non-latin-scripts)).
@@ -140,6 +169,36 @@ command-line tools (macOS) toolchain — `cargo build --release` is enough.
   [Write safety](#write-safety--tmp-file-handling)); **Close** discards the
   in-memory buffer (with confirmation if there are unsaved changes) and
   zeroizes it.
+
+### Vault
+
+- **Open existing vault…** — pick an already-existing `.uvault``
+  vault file with a plain file-open dialog (no "overwrite this file?"
+  prompt, since opening is read-only until you actually save).
+- **New vault…** — pick a location and name for a brand-new vault (this
+  uses a save dialog, since a new file genuinely is being created).
+- **Unlock** — enter the master password. If the chosen path doesn't
+  exist yet, unlocking it also creates it (in memory only — nothing is
+  written to disk until you save an entry).
+- Once unlocked, add/edit/delete entries (title, username, password,
+  URL, notes) in the edit pane on the right; the entry list on the left
+  is filterable by title.
+- **Save** re-encrypts the current in-memory entries under the same
+  master password and writes them to disk (atomically — see
+  [Write safety](#write-safety--tmp-file-handling)).
+- **Change master password** — prompts for the *current* password
+  (re-verified against the file on disk, not just trusted from the
+  current unlock), a new password, and a confirmation, then re-encrypts
+  and saves under the new password.
+- **Import from CSV…** — choose the source layout (Chrome/Edge/Brave,
+  Firefox, Bitwarden, 1Password, KeePass, or Generic auto-detect),
+  pick the exported `.csv` file, and review the imported rows before
+  saving. Existing entries are never overwritten or merged by
+  title — duplicates just show up as separate entries you can delete.
+- **Lock** (or the configurable inactivity auto-lock) drops and
+  zeroizes all decrypted entries from memory; unsaved edits are
+  discarded when this happens, since leaving plaintext credentials in
+  memory indefinitely is worse than losing an unsaved edit.
 
 ### A note on SSDs and secure shredding
 
@@ -255,8 +314,9 @@ unigen-rs/
 │       └── README.md   — what font(s) to add, and why
 └── src/
     ├── main.rs      — eframe/egui GUI, background job orchestration,
-    │                   password-file editor, font loading
+    │                   password-file editor, vault UI, font loading
     ├── crypto.rs    — KDFs, AEAD blob/streaming container formats
+    ├── vault.rs     — vault entries, CSV import, master-password change
     ├── charsets.rs  — password generator character sets & entropy math
     └── shred.rs     — secure multi-pass file shredding
 ```
