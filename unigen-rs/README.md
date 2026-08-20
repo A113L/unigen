@@ -1,74 +1,34 @@
-# UNIGEN (Rust Edition)
+# UNIGEN
 
 UNIGEN is a Unicode password generator and local file-encryption utility:
-generate high-entropy passwords from configurable Unicode character sets
-(Latin, Cyrillic, Greek, CJK & Kana, Simplified Chinese, symbols, and
-more), and encrypt/decrypt/securely-shred files with a passphrase using
+it generates high-entropy passwords from configurable Unicode character
+sets (Latin, Cyrillic, Greek, CJK & Kana, Simplified Chinese, symbols, and
+more), and encrypts/decrypts/securely shreds files with a passphrase using
 AES-256-GCM.
 
-This is a from-scratch Rust/egui rewrite of an earlier Python/Tkinter
-prototype. **The Python version has been abandoned** — see below for why —
-and this Rust edition is the actively maintained one. It ships as a single
-native binary with no Python interpreter or runtime dependency.
+The app is written in Rust (egui) and ships as a single native binary —
+with no dependency on an interpreter or runtime for any other language.
 
-## Why the Python version was abandoned
+## Why Rust
 
-The Python prototype (`unigen`, Tkinter + the `cryptography` package) was
-functionally complete, but had one security property Python simply cannot
-guarantee: **reliably wiping the passphrase from memory once it's no
-longer needed.**
+Reliably wiping a passphrase from memory once it's no longer needed
+requires a language that gives full control over the lifetime and layout
+of bytes in memory. Rust provides that:
 
-The problem is structural, not a bug that better Python code could fix:
-
-- **`str` is immutable.** Every operation that touches a passphrase —
-  slicing it, hashing it, passing it to a KDF — creates new string objects.
-  The old copies aren't overwritten; they're just dereferenced and left for
-  the garbage collector, sitting in freed-but-not-yet-reused heap memory
-  (and possibly already paged to disk in swap) for an unpredictable amount
-  of time.
-- **CPython gives no portable way to `mlock()` an arbitrary object**, so
-  you can't even reliably keep that memory from being swapped out while it
-  lingers.
-- **Tkinter's `Entry`/`StringVar` widgets are themselves backed by
-  ordinary Python strings**, so the on-screen passphrase field has the same
-  problem — there's no secure-string-backed text input to fall back to.
-
-The Python code (see `secure_zero()`, `try_mlock()`, and the surrounding
-comments in the original source) went as far as pure Python reasonably
-can: it converted secrets to `bytearray` at each point of use so it could
-explicitly overwrite them with zero bytes afterward, and best-effort
-called `mlock()`/`VirtualLock()` via `ctypes` to ask the OS to keep that
-buffer out of swap. Both are documented in the code itself as
-**best-effort, not a guarantee** — `secure_zero()` only ever zeros a
-`bytearray` or writable `memoryview`, and `str`-typed copies of the
-passphrase could still have existed transiently in memory with no way to
-zero them. There is no pure-Python construct equivalent to "this buffer is
-guaranteed overwritten before it's freed."
-
-That gap was assessed as a fundamental limitation of the language/runtime
-for this use case, not something worth continuing to work around — so the
-Python app was retired and rewritten in Rust, where the guarantee is
-actually achievable:
-
-- Rust has **owned, movable byte buffers** (`Vec<u8>`, `String`) whose
-  exact lifetime and layout the program controls.
-- The [`zeroize`](https://docs.rs/zeroize) crate provides `Zeroizing<T>`, a
-  wrapper that guarantees its contents are overwritten with zeros when it's
-  dropped — including on early return and on `?`-propagated errors, via
-  Rust's deterministic `Drop`. This is used for every derived key and every
-  raw passphrase buffer passed into a KDF in `src/crypto.rs`.
-- The one place this guarantee still can't fully reach is the same one
-  Python couldn't solve either: the **on-screen passphrase entry field**.
-  `egui`, like Tk, has no secure-string-backed text widget, so that field
-  is still a plain `String`. This app minimizes the exposure window instead
-  of pretending it away: the field is explicitly zeroed (not just cleared)
-  on an inactivity timeout and unconditionally on window close — see
-  `zeroize_string()` in `src/main.rs` and the "Clear passphrase after Ns of
-  inactivity" setting.
-
-In short: the Rust rewrite doesn't add a feature so much as fix a category
-of bug that the Python implementation's language and GUI toolkit made
-impossible to fully fix.
+- **Owned, movable byte buffers** (`Vec<u8>`, `String`) whose exact
+  lifetime and layout the program controls.
+- The [`zeroize`](https://docs.rs/zeroize) crate provides `Zeroizing<T>`,
+  a wrapper that guarantees its contents are overwritten on drop —
+  including on early return and on `?`-propagated errors. It's used for
+  every derived key and every raw passphrase buffer passed into a KDF in
+  `src/crypto.rs`.
+- The one place this guarantee doesn't fully reach is the on-screen
+  passphrase entry field: `egui` has no secure-string-backed text widget,
+  so that field is a plain `String`. The app minimizes the exposure
+  window instead of pretending the problem away: the field is explicitly
+  zeroed (not just cleared) on an inactivity timeout and unconditionally
+  on window close — see `zeroize_string()` in `src/main.rs` and the
+  "Clear passphrase after Ns of inactivity" setting.
 
 ## Features
 
@@ -85,9 +45,8 @@ impossible to fully fix.
   OWASP interactive-use baseline) or PBKDF2-HMAC-SHA256 (legacy
   compatibility, 600,000 iterations). Large files (>20 MiB) are streamed
   in 4 MiB chunks instead of loaded into memory whole.
-- **File decryption** — reads this app's own container format, and is
-  backward-compatible with both eras of the retired Python app's `.enc`
-  files (see [Container formats](#container-formats) below).
+- **File decryption** — reads this app's own container format (see
+  [Container formats](#container-formats) below).
 - **Verify-then-shred encryption** — optionally, after encrypting a file,
   the app decrypts the result back and byte-compares it to the original
   before securely overwriting and deleting the plaintext original. If
@@ -105,8 +64,7 @@ impossible to fully fix.
   fields are zeroized after a configurable period of inactivity (5–600s),
   independent of the clipboard auto-clear timer.
 - **Linux swap-exclusion (best-effort)** — optional `mlock()` on the
-  passphrase before encryption, same caveat as the retired Python
-  version's equivalent: not guaranteed on every kernel/filesystem
+  passphrase before encryption; not guaranteed on every kernel/filesystem
   configuration.
 - **Dark/light theme**, resizable window, CJK/Kana glyph rendering via an
   optional local fallback font (see
@@ -208,11 +166,10 @@ this app's shred feature is defense-in-depth, not a substitute for that.
 
 ### Passphrase handling
 
-Covered in detail above — see
-[Why the Python version was abandoned](#why-the-python-version-was-abandoned).
-Short version: derived keys and raw passphrase bytes passed into KDFs are
-wrapped in `zeroize::Zeroizing` and guaranteed-wiped on drop; the on-screen
-entry field is a plain `String` (no toolkit alternative exists) but is
+Covered in detail above — see [Why Rust](#why-rust). Short version:
+derived keys and raw passphrase bytes passed into KDFs are wrapped in
+`zeroize::Zeroizing` and guaranteed-wiped on drop; the on-screen entry
+field is a plain `String` (no toolkit alternative exists) but is
 explicitly zeroized on inactivity timeout and on close.
 
 ### Write safety / `.tmp` file handling
@@ -236,8 +193,7 @@ shred job is still running, rather than silently killing it.
 Small-file blob (this app, "UGR1"):
   MAGIC(4="UGR1") + FORMAT_VERSION(1) + kdf_id(1) + salt(16) + nonce(12) + ciphertext
   AAD = MAGIC || FORMAT_VERSION || kdf_id
-  On disk: base64-encoded text (matches the retired Python app's on-disk
-  representation, and allows copy/paste of small encrypted blobs)
+  On disk: base64-encoded text (allows copy/paste of small encrypted blobs)
 
 Streaming format (this app, "UGRS"):
   MAGIC(4="UGRS") + per-4MiB-chunk: nonce(12) + ciphertext + tag
@@ -245,19 +201,19 @@ Streaming format (this app, "UGRS"):
 ```
 
 Decryption also accepts, for backward compatibility with files produced by
-the retired Python app:
+an earlier version of this tool that was written in Python:
 
 ```
-Legacy Python, post-Argon2id era ("UG2"):
+Legacy, post-Argon2id era ("UG2"):
   MAGIC(4=b"UG2\0") + kdf_id(1) + salt(16) + iv(12) + ciphertext   (AAD=None)
 
-Legacy Python, pre-Argon2id era (no magic):
+Legacy, pre-Argon2id era (no magic):
   salt(16) + iv(12) + ciphertext   (always PBKDF2, AAD=None)
 ```
 
-This Rust app **only ever writes** its own `UGR1`/`UGRS` formats — the
-legacy formats are read-only compatibility, not something new files use,
-because fixing the missing-AAD issue in those formats properly required a
+This app **only ever writes** its own `UGR1`/`UGRS` formats — the legacy
+formats are read-only compatibility, not something new files use, because
+fixing the missing-AAD issue in those formats properly required a
 wire-format change (there's no way to add AAD binding to an
 already-written `AAD=None` ciphertext).
 
@@ -302,30 +258,3 @@ unigen-rs/
     ├── charsets.rs  — password generator character sets & entropy math
     └── shred.rs     — secure multi-pass file shredding
 ```
-
-## Known limitations / intentionally not ported
-
-- **On-screen passphrase field isn't a secure-string widget.** See
-  [Why the Python version was abandoned](#why-the-python-version-was-abandoned) —
-  this is a toolkit limitation (`egui`, like Tk, has none), mitigated by
-  aggressive auto-clearing rather than eliminated.
-- **`mlock`/swap exclusion is best-effort only**, on Linux, and only for
-  the encryption passphrase — not a guarantee on every kernel/filesystem
-  configuration.
-- **Secure shred is not a guarantee on SSDs/CoW filesystems** — see the
-  note above.
-- OS-specific "hide from clipboard history manager" tricks (Windows'
-  `ExcludeClipboardContentFromMonitorProcessing`, macOS's nspasteboard.org
-  marker types, KDE's `x-kde-passwordManagerHint`) were present in the
-  Python prototype as OS-API-specific hacks layered on top of Tkinter's
-  limited clipboard support. This version uses `arboard` for clipboard
-  access plus the same auto-clear-after-N-seconds behavior, but doesn't
-  attempt those OS-specific markers.
-- The Python prototype's "Source Code (this file)" self-referential
-  charset (built by scanning its own `.py` source for unique characters)
-  was dropped — it doesn't translate meaningfully to a compiled binary.
-- A blind startup sweep deleting stray `*.tmp` files was considered and
-  deliberately **not** implemented: the unique-per-run temp naming already
-  eliminates the collision risk that motivated the idea, so a sweep would
-  only reintroduce a smaller version of the same "might delete a file that
-  isn't ours" risk for no real benefit.
