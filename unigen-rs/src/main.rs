@@ -7,6 +7,7 @@
 
 mod charsets;
 mod crypto;
+mod secret;
 mod shred;
 mod vault;
 
@@ -18,6 +19,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
+use secret::SecretString;
 use vault::VaultEntry;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -400,7 +402,13 @@ struct UnigenApp {
     /// whole list — including every entry's password/notes strings via
     /// `VaultEntry`'s manual `Zeroize` impl — is scrubbed the moment it's
     /// replaced or the app drops it (e.g. on lock or exit).
-    vault_entries: Zeroizing<Vec<VaultEntry>>,
+    ///
+    /// Each entry is individually `Box`ed: growing/shrinking this `Vec`
+    /// then only ever moves 8-byte pointers, never `VaultEntry` contents,
+    /// closing the stray-unzeroized-copy gap a plain `Vec<VaultEntry>`
+    /// had on resize. See the note on `impl Zeroize for VaultEntry` in
+    /// `vault.rs` for the full explanation and its remaining caveat.
+    vault_entries: Zeroizing<Vec<Box<VaultEntry>>>,
     vault_kdf: u8,
     vault_status: String,
     vault_dirty: bool,
@@ -700,11 +708,11 @@ impl UnigenApp {
 
     fn vault_select(&mut self, id: u64) {
         if let Some(e) = self.vault_entries.iter().find(|e| e.id == id) {
-            self.vault_edit_title = Zeroizing::new(e.title.clone());
-            self.vault_edit_username = Zeroizing::new(e.username.clone());
-            self.vault_edit_password = Zeroizing::new(e.password.clone());
-            self.vault_edit_url = Zeroizing::new(e.url.clone());
-            self.vault_edit_notes = Zeroizing::new(e.notes.clone());
+            self.vault_edit_title = Zeroizing::new(e.title.as_str().to_string());
+            self.vault_edit_username = Zeroizing::new(e.username.as_str().to_string());
+            self.vault_edit_password = Zeroizing::new(e.password.as_str().to_string());
+            self.vault_edit_url = Zeroizing::new(e.url.as_str().to_string());
+            self.vault_edit_notes = Zeroizing::new(e.notes.as_str().to_string());
             self.vault_selected = Some(id);
             self.vault_reveal_password = false;
         }
@@ -739,11 +747,16 @@ impl UnigenApp {
                 e.password.zeroize();
                 e.url.zeroize();
                 e.notes.zeroize();
-                e.title = self.vault_edit_title.to_string();
-                e.username = self.vault_edit_username.to_string();
-                e.password = self.vault_edit_password.to_string();
-                e.url = self.vault_edit_url.to_string();
-                e.notes = self.vault_edit_notes.to_string();
+                // `SecretString::from_str` copies directly from the
+                // edit-pane buffer's `&str` view into a fresh
+                // `SecretString`-controlled allocation — no intermediate
+                // plain `String` is created as a stray unzeroized copy
+                // along the way.
+                e.title = SecretString::from_str(self.vault_edit_title.as_str());
+                e.username = SecretString::from_str(self.vault_edit_username.as_str());
+                e.password = SecretString::from_str(self.vault_edit_password.as_str());
+                e.url = SecretString::from_str(self.vault_edit_url.as_str());
+                e.notes = SecretString::from_str(self.vault_edit_notes.as_str());
                 e.updated_at = now;
             }
         } else {
@@ -751,16 +764,17 @@ impl UnigenApp {
             while self.vault_entries.iter().any(|e| e.id == id) {
                 id += 1;
             }
-            self.vault_entries.push(VaultEntry {
+            self.vault_entries.push(Box::new(VaultEntry {
                 id,
-                title: self.vault_edit_title.to_string(),
-                username: self.vault_edit_username.to_string(),
-                password: self.vault_edit_password.to_string(),
-                url: self.vault_edit_url.to_string(),
-                notes: self.vault_edit_notes.to_string(),
+                title: SecretString::from_str(self.vault_edit_title.as_str()),
+                username: SecretString::from_str(self.vault_edit_username.as_str()),
+                password: SecretString::from_str(self.vault_edit_password.as_str()),
+                url: SecretString::from_str(self.vault_edit_url.as_str()),
+                notes: SecretString::from_str(self.vault_edit_notes.as_str()),
                 created_at: now,
                 updated_at: now,
-            });            self.vault_selected = Some(id);
+            }));
+            self.vault_selected = Some(id);
         }
         self.vault_dirty = true;
         self.vault_status = "Entry updated (not yet saved to disk).".to_string();
@@ -1018,7 +1032,10 @@ impl UnigenApp {
                         let title = if entry.title.is_empty() {
                             "(untitled)".to_string()
                         } else {
-                            entry.title.clone()
+                            // Plain `String` here is fine: this is a
+                            // transient UI label handed to egui, not a
+                            // vault-managed copy of the field.
+                            entry.title.as_str().to_string()
                         };
                         let selected = self.vault_selected == Some(*id);
                         if ui.selectable_label(selected, title).clicked() {
@@ -2752,4 +2769,3 @@ fn generate_password(length: usize, pool: &[char]) -> Zeroizing<String> {
             .collect(),
     )
 }
-
