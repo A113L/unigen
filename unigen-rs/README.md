@@ -1,7 +1,5 @@
 # UNIGEN
 
-<h3>Every byte of a secret has a lifecycle, and that lifecycle ends in zeros, not hope.</h3>
-
 UNIGEN is a Unicode password generator and local file-encryption utility:
 it generates high-entropy passwords from configurable Unicode character
 sets (Latin, Cyrillic, Greek, CJK & Kana, Simplified Chinese, symbols, and
