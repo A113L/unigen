@@ -388,9 +388,14 @@ struct UnigenApp {
     /// one from the vault tab's "Open/Create vault..." button).
     vault_path: Option<PathBuf>,
     vault_unlocked: bool,
-    /// Master password input, before unlock. Zeroized after use, same
-    /// discipline as `enc_pwd`/`dec_pwd` above.
-    vault_master_pwd: String,
+    /// Master password input, before unlock. Held in `Zeroizing<String>`
+    /// from the moment it's typed (rather than a plain `String` that's
+    /// only zeroized manually after use) so there's no window where a
+    /// `Vec`/`String` reallocation elsewhere could copy the plaintext to
+    /// a new heap address before the manual zeroize ever runs; `Drop`
+    /// guarantees the wipe even on an early-return path that forgets to
+    /// call it explicitly.
+    vault_master_pwd: Zeroizing<String>,
     /// Decrypted entries, only populated while unlocked. Wrapped so the
     /// whole list — including every entry's password/notes strings via
     /// `VaultEntry`'s manual `Zeroize` impl — is scrubbed the moment it's
@@ -404,11 +409,15 @@ struct UnigenApp {
     vault_selected: Option<u64>,
     /// Scratch buffers for the edit pane; copied into the real entry on
     /// explicit "Save entry" so partial edits can be discarded on cancel.
-    vault_edit_title: String,
-    vault_edit_username: String,
-    vault_edit_password: String,
-    vault_edit_url: String,
-    vault_edit_notes: String,
+    /// `Zeroizing<String>` from creation (not just zeroized manually
+    /// before being overwritten/cleared) for the same reason as
+    /// `vault_master_pwd` above — `vault_edit_password` in particular
+    /// holds a plaintext credential for as long as the entry is open.
+    vault_edit_title: Zeroizing<String>,
+    vault_edit_username: Zeroizing<String>,
+    vault_edit_password: Zeroizing<String>,
+    vault_edit_url: Zeroizing<String>,
+    vault_edit_notes: Zeroizing<String>,
     vault_reveal_password: bool,
     vault_confirm_delete: Option<u64>,
     /// Auto-lock: mirrors the existing passphrase inactivity-clear
@@ -419,9 +428,9 @@ struct UnigenApp {
 
     // ---- Vault: change master password ----
     vault_change_pwd_open: bool,
-    vault_change_pwd_current: String,
-    vault_change_pwd_new: String,
-    vault_change_pwd_confirm: String,
+    vault_change_pwd_current: Zeroizing<String>,
+    vault_change_pwd_new: Zeroizing<String>,
+    vault_change_pwd_confirm: Zeroizing<String>,
     vault_change_pwd_error: String,
 
     // ---- Vault: CSV import ----
@@ -494,26 +503,26 @@ impl UnigenApp {
             editor_open_error: String::new(),
             vault_path: None,
             vault_unlocked: false,
-            vault_master_pwd: String::new(),
+            vault_master_pwd: Zeroizing::new(String::new()),
             vault_entries: Zeroizing::new(Vec::new()),
             vault_kdf: crypto::DEFAULT_KDF,
             vault_status: String::new(),
             vault_dirty: false,
             vault_search: String::new(),
             vault_selected: None,
-            vault_edit_title: String::new(),
-            vault_edit_username: String::new(),
-            vault_edit_password: String::new(),
-            vault_edit_url: String::new(),
-            vault_edit_notes: String::new(),
+            vault_edit_title: Zeroizing::new(String::new()),
+            vault_edit_username: Zeroizing::new(String::new()),
+            vault_edit_password: Zeroizing::new(String::new()),
+            vault_edit_url: Zeroizing::new(String::new()),
+            vault_edit_notes: Zeroizing::new(String::new()),
             vault_reveal_password: false,
             vault_confirm_delete: None,
             vault_last_activity: Instant::now(),
             vault_autolock_seconds: 120,
             vault_change_pwd_open: false,
-            vault_change_pwd_current: String::new(),
-            vault_change_pwd_new: String::new(),
-            vault_change_pwd_confirm: String::new(),
+            vault_change_pwd_current: Zeroizing::new(String::new()),
+            vault_change_pwd_new: Zeroizing::new(String::new()),
+            vault_change_pwd_confirm: Zeroizing::new(String::new()),
             vault_change_pwd_error: String::new(),
             vault_import_open: false,
             vault_import_source: vault::CsvSource::Generic,
@@ -616,7 +625,7 @@ impl UnigenApp {
         let mut pwd = std::mem::take(&mut self.vault_master_pwd);
         let is_new = !path.exists();
         let result = vault::open_or_create(&path, &pwd);
-        zeroize_string(&mut pwd);
+        pwd.zeroize();
         match result {
             Ok(entries) => {
                 self.vault_entries = Zeroizing::new(entries);
@@ -681,21 +690,21 @@ impl UnigenApp {
     }
 
     fn clear_vault_edit_buffers(&mut self) {
-        zeroize_string(&mut self.vault_edit_title);
-        zeroize_string(&mut self.vault_edit_username);
-        zeroize_string(&mut self.vault_edit_password);
-        zeroize_string(&mut self.vault_edit_url);
-        zeroize_string(&mut self.vault_edit_notes);
+        self.vault_edit_title.zeroize();
+        self.vault_edit_username.zeroize();
+        self.vault_edit_password.zeroize();
+        self.vault_edit_url.zeroize();
+        self.vault_edit_notes.zeroize();
         self.vault_reveal_password = false;
     }
 
     fn vault_select(&mut self, id: u64) {
         if let Some(e) = self.vault_entries.iter().find(|e| e.id == id) {
-            self.vault_edit_title = e.title.clone();
-            self.vault_edit_username = e.username.clone();
-            self.vault_edit_password = e.password.clone();
-            self.vault_edit_url = e.url.clone();
-            self.vault_edit_notes = e.notes.clone();
+            self.vault_edit_title = Zeroizing::new(e.title.clone());
+            self.vault_edit_username = Zeroizing::new(e.username.clone());
+            self.vault_edit_password = Zeroizing::new(e.password.clone());
+            self.vault_edit_url = Zeroizing::new(e.url.clone());
+            self.vault_edit_notes = Zeroizing::new(e.notes.clone());
             self.vault_selected = Some(id);
             self.vault_reveal_password = false;
         }
@@ -704,7 +713,7 @@ impl UnigenApp {
     fn vault_new_entry(&mut self) {
         self.clear_vault_edit_buffers();
         self.vault_selected = None;
-        self.vault_edit_title = "New entry".to_string();
+        self.vault_edit_title = Zeroizing::new("New entry".to_string());
     }
 
     /// Commit the edit-pane buffers into `vault_entries`: updates the
@@ -730,11 +739,11 @@ impl UnigenApp {
                 e.password.zeroize();
                 e.url.zeroize();
                 e.notes.zeroize();
-                e.title = self.vault_edit_title.clone();
-                e.username = self.vault_edit_username.clone();
-                e.password = self.vault_edit_password.clone();
-                e.url = self.vault_edit_url.clone();
-                e.notes = self.vault_edit_notes.clone();
+                e.title = self.vault_edit_title.to_string();
+                e.username = self.vault_edit_username.to_string();
+                e.password = self.vault_edit_password.to_string();
+                e.url = self.vault_edit_url.to_string();
+                e.notes = self.vault_edit_notes.to_string();
                 e.updated_at = now;
             }
         } else {
@@ -744,11 +753,11 @@ impl UnigenApp {
             }
             self.vault_entries.push(VaultEntry {
                 id,
-                title: self.vault_edit_title.clone(),
-                username: self.vault_edit_username.clone(),
-                password: self.vault_edit_password.clone(),
-                url: self.vault_edit_url.clone(),
-                notes: self.vault_edit_notes.clone(),
+                title: self.vault_edit_title.to_string(),
+                username: self.vault_edit_username.to_string(),
+                password: self.vault_edit_password.to_string(),
+                url: self.vault_edit_url.to_string(),
+                notes: self.vault_edit_notes.to_string(),
                 created_at: now,
                 updated_at: now,
             });            self.vault_selected = Some(id);
@@ -807,7 +816,7 @@ impl UnigenApp {
         let verify = vault::read_vault_file(&path).and_then(|combined| {
             vault::decrypt_vault(&current, &combined)
         });
-        zeroize_string(&mut current);
+        current.zeroize();
 
         if verify.is_err() {
             self.vault_change_pwd_error = "Current password is incorrect.".to_string();
@@ -817,8 +826,8 @@ impl UnigenApp {
         let mut new_pwd = std::mem::take(&mut self.vault_change_pwd_new);
         let result =
             vault::change_master_password(&path, &self.vault_entries, &new_pwd, self.vault_kdf);
-        zeroize_string(&mut new_pwd);
-        zeroize_string(&mut self.vault_change_pwd_confirm);
+        new_pwd.zeroize();
+        self.vault_change_pwd_confirm.zeroize();
 
         match result {
             Ok(()) => {
@@ -835,9 +844,9 @@ impl UnigenApp {
     }
 
     fn close_change_pwd_dialog(&mut self) {
-        zeroize_string(&mut self.vault_change_pwd_current);
-        zeroize_string(&mut self.vault_change_pwd_new);
-        zeroize_string(&mut self.vault_change_pwd_confirm);
+        self.vault_change_pwd_current.zeroize();
+        self.vault_change_pwd_new.zeroize();
+        self.vault_change_pwd_confirm.zeroize();
         self.vault_change_pwd_error.clear();
         self.vault_change_pwd_open = false;
     }
@@ -925,12 +934,22 @@ impl UnigenApp {
             ui.small(&self.vault_status);
         }
 
+        ui.horizontal(|ui| {
+            ui.label("Auto-lock vault after");
+            // Same field as the control on the Password Generator tab
+            // (kept there alongside the other auto-clear timers) — also
+            // surfaced here since this is the more obvious place to look
+            // for it while actually using the vault. 0 disables it.
+            ui.add(egui::DragValue::new(&mut self.vault_autolock_seconds).range(0..=3600));
+            ui.label("seconds of inactivity (0 = never)");
+        });
+
         ui.separator();
 
         if !self.vault_unlocked {
             ui.label("Enter the master password to unlock (or create) this vault:");
             ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut self.vault_master_pwd).password(true));
+                ui.add(egui::TextEdit::singleline(&mut *self.vault_master_pwd).password(true));
                 let can_go = self.vault_path.is_some() && !self.vault_master_pwd.is_empty();
                 if ui
                     .add_enabled(can_go, egui::Button::new("Unlock"))
@@ -1014,13 +1033,13 @@ impl UnigenApp {
 
             let ui = &mut cols[1];
             ui.label("Title");
-            ui.text_edit_singleline(&mut self.vault_edit_title);
+            ui.text_edit_singleline(&mut *self.vault_edit_title);
             ui.label("Username");
-            ui.text_edit_singleline(&mut self.vault_edit_username);
+            ui.text_edit_singleline(&mut *self.vault_edit_username);
             ui.label("Password");
             ui.horizontal(|ui| {
                 ui.add(
-                    egui::TextEdit::singleline(&mut self.vault_edit_password)
+                    egui::TextEdit::singleline(&mut *self.vault_edit_password)
                         .password(!self.vault_reveal_password),
                 );
                 if ui
@@ -1041,14 +1060,14 @@ impl UnigenApp {
                     let pool = build_pool(&self.charset_enabled, &self.charsets);
                     if !pool.is_empty() {
                         self.vault_edit_password =
-                            generate_password(self.length as usize, &pool).to_string();
+                            Zeroizing::new(generate_password(self.length as usize, &pool).to_string());
                     }
                 }
             });
             ui.label("URL");
-            ui.text_edit_singleline(&mut self.vault_edit_url);
+            ui.text_edit_singleline(&mut *self.vault_edit_url);
             ui.label("Notes");
-            ui.add(egui::TextEdit::multiline(&mut self.vault_edit_notes).desired_rows(4));
+            ui.add(egui::TextEdit::multiline(&mut *self.vault_edit_notes).desired_rows(4));
 
             ui.horizontal(|ui| {
                 let has_title = !self.vault_edit_title.trim().is_empty();
@@ -1071,11 +1090,11 @@ impl UnigenApp {
             ui.separator();
             ui.horizontal(|ui| {
                 ui.label("Master password to save:");
-                ui.add(egui::TextEdit::singleline(&mut self.vault_master_pwd).password(true));
+                ui.add(egui::TextEdit::singleline(&mut *self.vault_master_pwd).password(true));
                 if ui.button("Save vault").clicked() {
                     let mut pwd = std::mem::take(&mut self.vault_master_pwd);
                     self.save_vault_with(&pwd);
-                    zeroize_string(&mut pwd);
+                    pwd.zeroize();
                 }
             });
         }
@@ -1105,16 +1124,16 @@ impl UnigenApp {
                 .show(ui.ctx(), |ui| {
                     ui.label("Current master password:");
                     ui.add(
-                        egui::TextEdit::singleline(&mut self.vault_change_pwd_current)
+                        egui::TextEdit::singleline(&mut *self.vault_change_pwd_current)
                             .password(true),
                     );
                     ui.label("New master password (min 8 characters):");
                     ui.add(
-                        egui::TextEdit::singleline(&mut self.vault_change_pwd_new).password(true),
+                        egui::TextEdit::singleline(&mut *self.vault_change_pwd_new).password(true),
                     );
                     ui.label("Confirm new master password:");
                     ui.add(
-                        egui::TextEdit::singleline(&mut self.vault_change_pwd_confirm)
+                        egui::TextEdit::singleline(&mut *self.vault_change_pwd_confirm)
                             .password(true),
                     );
                     if !self.vault_change_pwd_error.is_empty() {
@@ -2287,6 +2306,17 @@ impl UnigenApp {
                     ui.label("seconds of inactivity");
                 });
 
+                ui.horizontal(|ui| {
+                    ui.label("Auto-lock vault after");
+                    // 0 disables auto-lock entirely (tick_vault_autolock
+                    // treats `vault_autolock_seconds > 0` as the enabled
+                    // condition), so this is a single control rather than
+                    // a checkbox + DragValue pair like the clipboard one
+                    // above.
+                    ui.add(egui::DragValue::new(&mut self.vault_autolock_seconds).range(0..=3600));
+                    ui.label("seconds of inactivity (0 = never)");
+                });
+
                 if !self.gen_status.is_empty() {
                     ui.label(&self.gen_status);
                 }
@@ -2722,3 +2752,4 @@ fn generate_password(length: usize, pool: &[char]) -> Zeroizing<String> {
             .collect(),
     )
 }
+
