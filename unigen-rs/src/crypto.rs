@@ -100,6 +100,19 @@ pub fn kdf_name(id: u8) -> &'static str {
 /// other caller that derives a key for a brand-new encryption (rather than
 /// decrypting existing data) is responsible for checking
 /// `MIN_PASSPHRASE_LEN` itself before calling in here.
+///
+/// NOTE on the `password: &str` parameter: `pwd_bytes` below is a fresh
+/// `Zeroizing` copy of `password.as_bytes()`, so the copy this function
+/// makes is wiped on return. The borrowed `&str` itself is not owned
+/// here and outlives this call — this function has no way to zeroize
+/// the caller's original buffer. That's fine as long as every caller
+/// already holds its passphrase in a `Zeroizing<String>` (or zeroizes a
+/// plain `String`/`egui` text field immediately after use, as this
+/// app's UI code does everywhere it reads a passphrase) — the plaintext
+/// then still gets wiped, just by the caller rather than by
+/// `derive_key`. A caller that hands in a passphrase it never zeroizes
+/// would leave that copy lingering regardless of anything this function
+/// does.
 fn derive_key(password: &str, salt: &[u8], kdf_id: u8) -> Result<Zeroizing<[u8; 32]>> {
     let char_count = password.chars().count();
     if char_count > MAX_PASSPHRASE_LEN {
