@@ -580,13 +580,22 @@ pub fn stream_encrypt_file(
         // An explicit is_final byte (rather than "peek at the next read to
         // see if it's EOF", as the Python original did) makes the decoder
         // a simple straight-line loop with no lookahead/rewind bookkeeping.
+        // MEMORY-RESIDUE fix: plaintext chunks read from disk are held in
+        // `Zeroizing<Vec<u8>>` rather than a bare `Vec<u8>`. A bare `Vec`
+        // dropped here (whether via the `chunk = next_chunk` reassignment
+        // below, an early `?` return, or falling off the end of this
+        // closure) is freed without its contents being wiped — for a
+        // large file that's up to `STREAM_CHUNK_SIZE` (4 MiB) of plaintext
+        // per in-flight buffer sitting unzeroized in freed heap memory.
+        // `Zeroizing`'s `Drop` closes that on every one of those exit
+        // paths, not just the happy path.
         let mut counter: u64 = 0;
         let mut done: u64 = 0;
-        let mut chunk = vec![0u8; STREAM_CHUNK_SIZE];
+        let mut chunk: Zeroizing<Vec<u8>> = Zeroizing::new(vec![0u8; STREAM_CHUNK_SIZE]);
         let mut chunk_len = read_full(&mut reader, &mut chunk)?;
 
         loop {
-            let mut next_chunk = vec![0u8; STREAM_CHUNK_SIZE];
+            let mut next_chunk: Zeroizing<Vec<u8>> = Zeroizing::new(vec![0u8; STREAM_CHUNK_SIZE]);
             let next_len = read_full(&mut reader, &mut next_chunk)?;
             let is_final = next_len == 0;
 
@@ -755,17 +764,24 @@ pub fn stream_decrypt_file(
             let nonce = Nonce::from_slice(&nonce_bytes);
             let aad = stream_chunk_aad(kdf_id, version, counter, is_final);
 
-            let plain = cipher
-                .decrypt(
-                    nonce,
-                    Payload {
-                        msg: &ct,
-                        aad: &aad,
-                    },
-                )
-                .map_err(|_| {
-                    anyhow!("Decryption failed: wrong passphrase or corrupted/tampered file")
-                })?;
+            // MEMORY-RESIDUE fix: each decrypted chunk is plaintext file
+            // content — wrap it so it's zeroized on drop at the end of
+            // this loop iteration (or on an early `?` return from a
+            // later chunk) instead of being freed as-is, same rationale
+            // as the `chunk`/`next_chunk` buffers in `stream_encrypt_file`.
+            let plain = Zeroizing::new(
+                cipher
+                    .decrypt(
+                        nonce,
+                        Payload {
+                            msg: &ct,
+                            aad: &aad,
+                        },
+                    )
+                    .map_err(|_| {
+                        anyhow!("Decryption failed: wrong passphrase or corrupted/tampered file")
+                    })?,
+            );
 
             if let Some(w) = writer.as_mut() {
                 w.write_all(&plain)?;
