@@ -23,10 +23,11 @@
 
 use std::alloc::{alloc, dealloc, Layout};
 use std::fmt;
-use std::ops::Deref;
+use std::ops::{Deref, Range};
 use std::ptr::{self, NonNull};
 use std::str;
 
+use egui::TextBuffer;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use zeroize::Zeroize;
 
@@ -151,6 +152,85 @@ impl SecretBytes {
         new.push_slice(self.as_slice());
         new
     }
+
+    /// Insert `data` at byte offset `at` (0 <= at <= len). Grows through
+    /// `grow_to` (which zeroizes any vacated old buffer) if needed, then
+    /// shifts the existing tail right with an overlap-safe `ptr::copy`
+    /// (not `copy_nonoverlapping` — source and destination *do* overlap
+    /// here) to make room before writing the new bytes in place. This is
+    /// the in-place equivalent of `push_slice` for non-append positions,
+    /// used by `TextBuffer::insert_text` so mid-string edits (e.g. the
+    /// cursor isn't at the end of a password field) never fall back to a
+    /// plain `String`/`Vec` insert that would leave a stray unzeroized
+    /// copy behind on reallocation.
+    fn insert_slice(&mut self, at: usize, data: &[u8]) {
+        debug_assert!(at <= self.len);
+        if data.is_empty() {
+            return;
+        }
+        let old_len = self.len;
+        let needed = old_len + data.len();
+        if needed > self.cap {
+            self.grow_to(needed);
+        }
+        // SAFETY: `grow_to` guarantees `self.cap >= needed`. `at <=
+        // old_len <= self.cap`, and `old_len - at` bytes are being moved
+        // to `[at + data.len(), needed)`, which is in bounds. The source
+        // and destination ranges can overlap (when `data.len() <
+        // old_len - at`), so this must be `ptr::copy`, not
+        // `copy_nonoverlapping`.
+        unsafe {
+            let base = self.ptr.as_ptr();
+            ptr::copy(base.add(at), base.add(at + data.len()), old_len - at);
+            ptr::copy_nonoverlapping(data.as_ptr(), base.add(at), data.len());
+        }
+        self.len = needed;
+    }
+
+    /// Remove the byte range `[start, end)` (0 <= start <= end <= len),
+    /// shifting the tail left over the gap. Critically, this also
+    /// zeroizes the now-vacated bytes at the tail end of the live
+    /// region — after the shift they sit past the new `len` but are
+    /// still inside `cap`, i.e. exactly the "capacity beyond len can
+    /// still hold stale bytes" case the module docs warn about. Without
+    /// this, backspacing characters out of a password field would leave
+    /// deleted plaintext readable in the buffer's slack space for the
+    /// rest of the buffer's life (survives until the next `grow_to` or
+    /// `Drop`), which defeats the point of a wipe-on-relocate type.
+    fn delete_byte_range(&mut self, range: Range<usize>) {
+        let Range { start, end } = range;
+        debug_assert!(start <= end && end <= self.len);
+        if start >= end {
+            return;
+        }
+        let tail_len = self.len - end;
+        // SAFETY: `start`, `end`, `tail_len` are all within `[0,
+        // self.len] <= self.cap`, as established by the caller's
+        // byte-index derivation from a valid char range over
+        // `as_str()`. Overlapping shift uses `ptr::copy`.
+        unsafe {
+            let base = self.ptr.as_ptr();
+            ptr::copy(base.add(end), base.add(start), tail_len);
+            let vacated_start = start + tail_len;
+            let vacated_len = self.len - vacated_start;
+            if vacated_len > 0 {
+                let vacated =
+                    std::slice::from_raw_parts_mut(base.add(vacated_start), vacated_len);
+                vacated.zeroize();
+            }
+        }
+        self.len -= end - start;
+    }
+
+    /// Raw pointer/capacity of the live backing buffer, for callers that
+    /// need to `mlock()` it directly (Linux-only best-effort swap
+    /// exclusion — see `SecretString::mlock_best_effort`). Not exposed
+    /// more broadly since holding onto this past the next mutation
+    /// (which may relocate the buffer via `grow_to`) is unsafe.
+    #[cfg(target_os = "linux")]
+    fn as_ptr_cap(&self) -> (*const u8, usize) {
+        (self.ptr.as_ptr(), self.cap)
+    }
 }
 
 impl Drop for SecretBytes {
@@ -223,6 +303,125 @@ impl SecretString {
     /// pattern used elsewhere in this app for defense in depth.
     pub fn clear(&mut self) {
         self.bytes.zeroize_in_place();
+    }
+
+    /// Byte offset of the `char_index`-th character (like
+    /// `str::char_indices`, clamped to `len()` if `char_index` is past
+    /// the end — matches the behavior `egui::TextBuffer` implementations
+    /// are expected to have for cursor/selection positions).
+    fn byte_index_from_char_index(&self, char_index: usize) -> usize {
+        self.as_str()
+            .char_indices()
+            .nth(char_index)
+            .map(|(bi, _)| bi)
+            .unwrap_or(self.bytes.len)
+    }
+
+    /// Insert `text` at byte offset `byte_idx` (0 <= byte_idx <= len(),
+    /// and must land on a char boundary). Goes through
+    /// `SecretBytes::insert_slice`, so any growth this triggers zeroizes
+    /// the vacated old buffer the same as every other mutator here.
+    pub fn insert_str(&mut self, byte_idx: usize, text: &str) {
+        self.bytes.insert_slice(byte_idx, text.as_bytes());
+    }
+
+    /// Delete the byte range `[start, end)` (must land on char
+    /// boundaries). The vacated tail bytes are zeroized in place by
+    /// `SecretBytes::delete_byte_range` — deleted characters (e.g. from
+    /// backspacing while editing a password field) don't linger as
+    /// readable slack-space bytes.
+    pub fn delete_byte_range(&mut self, range: Range<usize>) {
+        self.bytes.delete_byte_range(range);
+    }
+
+    /// Best-effort: ask the Linux kernel to keep this buffer's *current*
+    /// allocation out of swap (`mlock(2)`). Returns `false` if the kernel
+    /// refuses (e.g. `RLIMIT_MEMLOCK` exceeded) — callers must treat that
+    /// as informational, not fatal, same as every other mlock use in this
+    /// app.
+    ///
+    /// Unlike locking a one-off clone handed to a background thread (the
+    /// existing pattern for the passphrase actually used in a crypto
+    /// operation), this locks the *live* field a UI text box writes into
+    /// — the buffer that exists, unencrypted, for the entire time the
+    /// user is looking at / typing into that field, which is the longest
+    /// exposure window for a passphrase in this app. Callers should
+    /// re-invoke this after every edit: a `grow_to` relocation moves the
+    /// buffer to a new allocation that the previous `mlock()` call no
+    /// longer covers (the kernel doesn't follow it), so there's a small
+    /// window right after growth, until this is called again, where the
+    /// buffer isn't locked. This is the same "not a guarantee, only
+    /// shrinks the exposure window" caveat this app already documents
+    /// for `mlock` everywhere else.
+    #[cfg(target_os = "linux")]
+    pub fn mlock_best_effort(&self) -> bool {
+        extern "C" {
+            fn mlock(addr: *const std::ffi::c_void, len: usize) -> i32;
+        }
+        let (ptr, cap) = self.bytes.as_ptr_cap();
+        if cap == 0 {
+            return true;
+        }
+        // SAFETY: `ptr` is valid for `cap` bytes for as long as `self`
+        // isn't mutated (this call is synchronous and doesn't retain
+        // `ptr`), per `SecretBytes`'s own invariants.
+        unsafe { mlock(ptr as *const std::ffi::c_void, cap) == 0 }
+    }
+}
+
+/// Lets `SecretString` be used directly as the backing buffer for an
+/// `egui::TextEdit` (`ui.add(TextEdit::singleline(&mut some_secret_string))`).
+///
+/// This is the fix for the gap documented in the module docs: without
+/// this impl, any password/secret field editable in the UI had to be a
+/// plain `String` (or `Zeroizing<String>`, which only wipes on final
+/// `Drop`) because that's the only thing `TextEdit` can write into.
+/// Every keystroke into such a field went through `String`'s own
+/// `insert`/`remove`, which reallocates via the global allocator and
+/// frees the old buffer *unzeroized* — exactly the residual-plaintext
+/// problem this module exists to close, except happening continuously
+/// while the user types, for the single longest-lived, most sensitive
+/// buffer in the app (the passphrase actually being typed).
+///
+/// With this impl, `TextEdit`'s insert/delete calls route through
+/// `SecretBytes::insert_slice`/`delete_byte_range`, which zeroize
+/// vacated-on-grow and vacated-on-delete bytes respectively. The one
+/// unavoidable gap is `take()`: its trait signature returns an owned
+/// `String` (used internally by egui for cut/paste), which necessarily
+/// copies the text out into a normal, non-wiped buffer for that
+/// operation. That's an egui API constraint, not something this impl
+/// can close — same residual risk as the existing system-clipboard
+/// caveat noted elsewhere in this app.
+impl TextBuffer for SecretString {
+    fn is_mutable(&self) -> bool {
+        true
+    }
+
+    fn as_str(&self) -> &str {
+        SecretString::as_str(self)
+    }
+
+    fn insert_text(&mut self, text: &str, char_index: usize) -> usize {
+        if text.is_empty() {
+            return 0;
+        }
+        let byte_idx = self.byte_index_from_char_index(char_index);
+        self.insert_str(byte_idx, text);
+        text.chars().count()
+    }
+
+    fn delete_char_range(&mut self, char_range: Range<usize>) {
+        let start = self.byte_index_from_char_index(char_range.start);
+        let end = self.byte_index_from_char_index(char_range.end);
+        self.delete_byte_range(start..end);
+    }
+
+    fn byte_index_from_char_index(&self, char_index: usize) -> usize {
+        SecretString::byte_index_from_char_index(self, char_index)
+    }
+
+    fn clear(&mut self) {
+        SecretString::clear(self);
     }
 }
 
@@ -372,6 +571,50 @@ mod tests {
         // plausibly reuse it.
         let leftover = unsafe { std::slice::from_raw_parts(ptr, len) };
         assert!(leftover.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn text_buffer_insert_at_cursor_positions() {
+        // Simulates typing "helo", moving cursor back one, then typing
+        // "l" to fix it to "hello" — the mid-string insert path that a
+        // plain `String` handles fine functionally, but that this type
+        // must additionally handle without leaking stale bytes.
+        let mut s = SecretString::new();
+        assert_eq!(s.insert_text("helo", 0), 4);
+        assert_eq!(s.as_str(), "helo");
+        assert_eq!(s.insert_text("l", 3), 1);
+        assert_eq!(s.as_str(), "hello");
+    }
+
+    #[test]
+    fn text_buffer_delete_char_range_zeroizes_vacated_tail() {
+        let mut s = SecretString::from_str("hello world");
+        // Delete "hello " (chars 0..6), leaving "world".
+        s.delete_char_range(0..6);
+        assert_eq!(s.as_str(), "world");
+        // The vacated tail (old bytes 5..11, now past the new len=5)
+        // must be zeroized, not just logically truncated — inspect the
+        // raw allocation directly to confirm no stale plaintext remains
+        // in the slack space between len and cap.
+        let live_len = s.bytes.len;
+        let cap = s.bytes.cap;
+        let raw = unsafe { std::slice::from_raw_parts(s.bytes.ptr.as_ptr(), cap) };
+        assert_eq!(&raw[..live_len], b"world");
+        assert!(
+            raw[live_len..].iter().all(|&b| b == 0),
+            "deleted bytes must be zeroized, found: {:?}",
+            &raw[live_len..]
+        );
+    }
+
+    #[test]
+    fn text_buffer_multibyte_char_boundaries() {
+        let mut s = SecretString::from_str("héllo");
+        // 'é' is 2 bytes; make sure char-index-based insert/delete don't
+        // split it.
+        assert_eq!(s.as_str(), "héllo");
+        s.delete_char_range(1..2); // remove just 'é'
+        assert_eq!(s.as_str(), "hllo");
     }
 
     #[test]
