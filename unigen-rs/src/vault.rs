@@ -10,6 +10,7 @@
 //! future-format-version handling as encrypted regular files.
 
 use crate::crypto;
+use crate::secret::SecretString;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -30,46 +31,54 @@ pub struct VaultEntry {
     /// without relying on its position in the list, which changes under
     /// sorting/filtering.
     pub id: u64,
-    pub title: String,
-    pub username: String,
-    pub password: String,
-    pub url: String,
-    pub notes: String,
+    pub title: SecretString,
+    pub username: SecretString,
+    pub password: SecretString,
+    pub url: SecretString,
+    pub notes: SecretString,
     pub created_at: u64,
     pub updated_at: u64,
 }
 
 
-// `Vec<VaultEntry>` doesn't implement `Zeroize` itself (no blanket impl
-// for `Vec<T: Zeroize>` in this crate's zeroize version), so the app wraps
-// entries in `Zeroizing<Vec<VaultEntry>>` and this manual impl is what
-// makes that wrapper's `Drop` actually scrub the string contents instead
-// of only dropping the `Vec`'s spine.
+// `Vec<Box<VaultEntry>>` doesn't implement `Zeroize` itself (no blanket
+// impl for `Vec<T: Zeroize>` in this crate's zeroize version), so the app
+// wraps entries in `Zeroizing<Vec<Box<VaultEntry>>>` and this manual impl
+// is what makes that wrapper's `Drop` actually scrub the string contents
+// instead of only dropping the `Vec`'s spine. `Zeroize` on `Box<T>`
+// resolves through auto-deref to this impl, so callers can write
+// `boxed_entry.zeroize()` directly without a separate `Box`-specific impl.
 //
-// KNOWN LIMITATION: `Zeroizing`'s guarantee only covers the moment the
-// wrapper itself is dropped. It does *not* intercept `Vec`'s internal
-// reallocations — `push()` past capacity, or the internal shift a
-// `remove()` does — which can memcpy entries (passwords included) to a
-// different heap address and leave the old bytes behind, unzeroed, until
-// the allocator hands that memory to something else. This is the same
-// category of gap the Python prototype was retired over (see README),
-// reintroduced here one level up, at the `Vec` growth/shrink level
-// rather than the per-`String` level.
+// FIX (previously a documented known limitation): entries used to live
+// inline in the outer `Vec<VaultEntry>`. Every growth reallocation
+// (`push()` past capacity) or shift (`remove()`) copied whichever
+// `VaultEntry` structs the operation touched to a new/different location
+// in the backing buffer, and the vacated bytes were never explicitly
+// wiped before the allocator reused them. Wrapping each entry in its own
+// `Box` fixes the part of that gap the outer `Vec` was responsible for:
+// a `VaultEntry`'s fields now live at one fixed heap address for the
+// entry's whole lifetime, and growing/shrinking the outer `Vec` only ever
+// copies 8-byte `Box` pointers around — never the entry's own bytes.
 //
-// Two mitigations are applied where the call sites live (`main.rs`):
-//   - `reserve_vault_capacity()` pre-reserves room in bulk-growth paths
-//     (CSV import) so many pushes in a row don't each trigger their own
-//     reallocation-and-copy.
-//   - `vault_delete_entry` explicitly zeroizes the *removed* entry before
-//     dropping it, which is the one case this module can fully control.
-// Neither mitigation closes the gap for a single `push()` that happens to
-// cross capacity, or for the internal shift inside `remove()` — a full
-// fix would need a custom zeroizing allocator or a `Vec` replacement
-// that never moves its backing storage without scrubbing the vacated
-// bytes first, which is out of scope here. Treat "no plaintext password
-// ever survives a `Vec` resize" as unmet, the same honest way the
-// now-retired Python prototype's README section documents its own
-// best-effort-not-a-guarantee gaps.
+// FIX (previously the last open item in this comment, and in the
+// project's README "Known limitations" section): each field used to be
+// a plain `String`, which owns its *own* separate heap buffer that can
+// reallocate independently of the outer `Vec` — e.g. `push`/`push_str`
+// crossing capacity, or `.clone()`. `String`'s growth/clone path is
+// "allocate new buffer, copy, free the old one" with no wipe step, so
+// the vacated bytes (a stale copy of a password, in the worst case) were
+// left readable in freed-but-not-yet-reused heap memory. Boxing the
+// entry (above) did nothing about this — it only removed the
+// outer-`Vec`-reallocation source of stray copies.
+//
+// Every field is now `secret::SecretString` instead of `String`.
+// `SecretString` owns its own growth/clone path end-to-end (see
+// `src/secret.rs`) and zeroizes the old buffer before every relocation
+// and on `Drop` — not just "the wrapper was dropped" like
+// `Zeroizing<String>` gives you, but every intermediate reallocation
+// during the value's own lifetime. This closes the gap for incremental
+// construction (e.g. CSV import field concatenation) and `.clone()`
+// alike, without needing a custom global allocator.
 impl Zeroize for VaultEntry {
     fn zeroize(&mut self) {
         self.title.zeroize();
@@ -83,6 +92,27 @@ impl Zeroize for VaultEntry {
     }
 }
 
+// `zeroize` (as of the pinned 1.7.x line, and still true in later 1.9.x
+// releases) only provides blanket `Zeroize` impls for `Box<[Z]>` and
+// `Box<str>` — not for `Box<Z>` generically. Since `vault_entries` is
+// `Zeroizing<Vec<Box<VaultEntry>>>`, the outer `Vec<Z>: Zeroize` blanket
+// impl needs `Z = Box<VaultEntry>: Zeroize`, which doesn't exist without
+// this explicit impl. `Box` is a `#[fundamental]` type, so implementing a
+// foreign trait (`Zeroize`) for `Box<VaultEntry>` is allowed under the
+// orphan rules because `VaultEntry` itself is local to this crate.
+//
+// (This impl was missing from the first cut of the `Box<VaultEntry>`
+// change and broke the `Zeroizing<Vec<Box<VaultEntry>>>` field in
+// main.rs at compile time — caught by a build against the real
+// zeroize 1.9.0 that main.rs's Cargo.lock resolves to, and now covered
+// by `main_shape_tests` in the standalone logic crate used for CI-less
+// verification in this environment.)
+impl Zeroize for Box<VaultEntry> {
+    fn zeroize(&mut self) {
+        (**self).zeroize();
+    }
+}
+
 fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -92,7 +122,24 @@ fn now_unix() -> u64 {
 
 /// Serialize entries to JSON and encrypt them with the same blob format
 /// used for the "encrypt a small file" path elsewhere in the app.
-pub fn encrypt_vault(master_password: &str, entries: &[VaultEntry], kdf_id: u8) -> Result<Vec<u8>> {
+///
+/// COLD-BOOT / STALE-COPY HARDENING: `entries` is `&[Box<VaultEntry>]`
+/// rather than `&[VaultEntry]` everywhere in this module and in the
+/// caller's app state. The entries themselves are heap-allocated one at a
+/// time via `Box`, at a stable address that never moves for the lifetime
+/// of that entry. Only the *pointers* live inside the outer `Vec`, so when
+/// that `Vec` grows past capacity or shrinks (`push`/`remove`/`reserve`),
+/// what gets copied to a new backing allocation is 8-byte pointers — never
+/// password bytes. This closes the gap documented below on `impl Zeroize
+/// for VaultEntry`: a `Vec<VaultEntry>` resize could leave an unzeroized
+/// copy of a whole entry (password included) behind at the old address;
+/// a `Vec<Box<VaultEntry>>` resize cannot, because no `VaultEntry` bytes
+/// are ever part of what the `Vec`'s own reallocation copies.
+pub fn encrypt_vault(
+    master_password: &str,
+    entries: &[Box<VaultEntry>],
+    kdf_id: u8,
+) -> Result<Vec<u8>> {
     let mut json = serde_json::to_vec(entries).context("failed to serialize vault entries")?;
     let out = crypto::encrypt_blob(master_password, &json, kdf_id);
     json.zeroize();
@@ -100,14 +147,17 @@ pub fn encrypt_vault(master_password: &str, entries: &[VaultEntry], kdf_id: u8) 
 }
 
 /// Decrypt and parse a vault file's contents (already read into memory by
-/// the caller via [`read_vault_file`]).
-pub fn decrypt_vault(master_password: &str, combined: &[u8]) -> Result<Vec<VaultEntry>> {
+/// the caller via [`read_vault_file`]). Each entry is individually boxed
+/// on the way out of `serde_json` deserialization (see the note on
+/// [`encrypt_vault`] for why) so the in-memory vault never stores
+/// `VaultEntry` values inline inside a `Vec`'s own resizable buffer.
+pub fn decrypt_vault(master_password: &str, combined: &[u8]) -> Result<Vec<Box<VaultEntry>>> {
     let mut plaintext = crypto::decrypt_blob_compat(master_password, combined)
         .context("wrong master password, or file is not a valid vault")?;
     let entries: Vec<VaultEntry> =
         serde_json::from_slice(&plaintext).context("vault contents are not valid entry data")?;
     plaintext.zeroize();
-    Ok(entries)
+    Ok(entries.into_iter().map(Box::new).collect())
 }
 
 /// Read a vault file from disk, enforcing the same size cap as the
@@ -125,7 +175,7 @@ pub fn read_vault_file(path: &Path) -> Result<Vec<u8>> {
 pub fn write_vault_file(
     path: &Path,
     master_password: &str,
-    entries: &[VaultEntry],
+    entries: &[Box<VaultEntry>],
     kdf_id: u8,
 ) -> Result<()> {
     let combined = encrypt_vault(master_password, entries, kdf_id)?;
@@ -143,15 +193,31 @@ pub fn write_vault_file(
     Ok(())
 }
 
+/// Minimum capacity reserved up front for a freshly unlocked/created
+/// vault's entry list, so ordinary day-to-day use (adding a handful of
+/// entries) doesn't trigger a `Vec` growth reallocation at all. See the
+/// note on [`encrypt_vault`]: growth reallocations only ever move 8-byte
+/// `Box` pointers now, not entry contents, but avoiding them entirely
+/// where cheap to do so is still strictly better than relying on that
+/// mitigation alone.
+pub const VAULT_MIN_RESERVED_CAPACITY: usize = 64;
+
 /// Load and decrypt a vault, returning an empty vault (not an error) if
 /// the file doesn't exist yet — this is what lets "unlock" double as
-/// "create a new vault on first use" in the UI.
-pub fn open_or_create(path: &Path, master_password: &str) -> Result<Vec<VaultEntry>> {
+/// "create a new vault on first use" in the UI. The returned `Vec` has
+/// at least [`VAULT_MIN_RESERVED_CAPACITY`] reserved.
+pub fn open_or_create(path: &Path, master_password: &str) -> Result<Vec<Box<VaultEntry>>> {
     if !path.exists() {
-        return Ok(Vec::new());
+        let mut entries = Vec::new();
+        entries.reserve(VAULT_MIN_RESERVED_CAPACITY);
+        return Ok(entries);
     }
     let combined = read_vault_file(path)?;
-    decrypt_vault(master_password, &combined)
+    let mut entries = decrypt_vault(master_password, &combined)?;
+    if entries.capacity() - entries.len() < VAULT_MIN_RESERVED_CAPACITY {
+        entries.reserve(VAULT_MIN_RESERVED_CAPACITY - (entries.capacity() - entries.len()));
+    }
+    Ok(entries)
 }
 
 /// Re-encrypt an already-unlocked vault's entries under a new master
@@ -167,7 +233,7 @@ pub fn open_or_create(path: &Path, master_password: &str) -> Result<Vec<VaultEnt
 /// string it's handed.
 pub fn change_master_password(
     path: &Path,
-    entries: &[VaultEntry],
+    entries: &[Box<VaultEntry>],
     new_password: &str,
     kdf_id: u8,
 ) -> Result<()> {
@@ -209,11 +275,15 @@ impl ImportedRow {
         let now = now_unix();
         VaultEntry {
             id,
-            title: self.title,
-            username: self.username,
-            password: self.password,
-            url: self.url,
-            notes: self.notes,
+            // `From<String> for SecretString` copies into the new
+            // controlled buffer and zeroizes the source `String`'s
+            // buffer afterward, so the plaintext CSV-parsed field
+            // doesn't linger unzeroized once it's folded into the entry.
+            title: self.title.into(),
+            username: self.username.into(),
+            password: self.password.into(),
+            url: self.url.into(),
+            notes: self.notes.into(),
             created_at: now,
             updated_at: now,
         }
@@ -451,24 +521,134 @@ pub fn parse_csv(contents: &str, source: CsvSource) -> Result<Vec<ImportedRow>> 
 /// — this never overwrites/merges by title, so accidental duplicate
 /// imports are visible (and deletable) rather than silently clobbering
 /// something already in the vault.
-pub fn append_imported(entries: &mut Vec<VaultEntry>, rows: Vec<ImportedRow>) -> usize {
+///
+/// `entries` is `Vec<Box<VaultEntry>>`: each imported row is boxed
+/// individually (its own stable heap allocation) before being pushed, so
+/// growing this outer `Vec` — whether via this bulk import or any later
+/// single `push()` elsewhere in the app — only ever copies 8-byte
+/// pointers around, never `VaultEntry` contents (see the note on
+/// `encrypt_vault` in this module). The `reserve()` call below is still
+/// worth keeping even though it's no longer covering a passwords-in-heap
+/// risk: it avoids the (cheap but non-zero) pointer-churn cost of growing
+/// one push at a time for a large import.
+pub fn append_imported(entries: &mut Vec<Box<VaultEntry>>, rows: Vec<ImportedRow>) -> usize {
     let mut next_id = now_unix();
     let count = rows.len();
-    // Reserve the needed capacity up front: importing N rows one push()
-    // at a time can otherwise trigger several reallocate-and-copy growth
-    // steps along the way, each one leaving a stale, unzeroized copy of
-    // earlier entries' passwords behind on the heap (see the note on
-    // `impl Zeroize for VaultEntry` above). Reserving once doesn't fully
-    // close that gap — a single push crossing capacity is still possible
-    // elsewhere — but it collapses "several copies" down to "at most
-    // one" for the common bulk-import case.
     entries.reserve(count);
     for row in rows {
         while entries.iter().any(|e| e.id == next_id) {
             next_id += 1;
         }
-        entries.push(row.into_entry(next_id));
+        entries.push(Box::new(row.into_entry(next_id)));
         next_id += 1;
     }
     count
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PWD: &str = "correct horse battery staple";
+
+    fn sample_entry(id: u64, title: &str) -> Box<VaultEntry> {
+        Box::new(VaultEntry {
+            id,
+            title: title.into(),
+            username: "user@example.com".into(),
+            password: "s3cr3t-password".into(),
+            url: "https://example.com".into(),
+            notes: "some notes".into(),
+            created_at: 1,
+            updated_at: 1,
+        })
+    }
+
+    #[test]
+    fn vault_round_trip_boxed_entries() {
+        let entries = vec![sample_entry(1, "first"), sample_entry(2, "second")];
+        let combined = encrypt_vault(PWD, &entries, crypto::KDF_ARGON2ID).unwrap();
+        let decrypted = decrypt_vault(PWD, &combined).unwrap();
+        assert_eq!(decrypted.len(), 2);
+        assert_eq!(decrypted[0].title, "first");
+        assert_eq!(decrypted[1].password, "s3cr3t-password");
+    }
+
+    #[test]
+    fn vault_wrong_password_fails() {
+        let entries = vec![sample_entry(1, "only")];
+        let combined = encrypt_vault(PWD, &entries, crypto::KDF_ARGON2ID).unwrap();
+        assert!(decrypt_vault("wrong password", &combined).is_err());
+    }
+
+    #[test]
+    fn open_or_create_reserves_minimum_capacity_for_new_vault() {
+        let dir = std::env::temp_dir().join(format!(
+            "unigen_vault_test_{}_{}",
+            std::process::id(),
+            {
+                use rand::rngs::OsRng;
+                use rand::RngCore;
+                let mut n = [0u8; 8];
+                OsRng.fill_bytes(&mut n);
+                hex::encode(n)
+            }
+        ));
+        let path = dir.join("nonexistent.vault");
+        let entries = open_or_create(&path, PWD).unwrap();
+        assert!(entries.is_empty());
+        assert!(entries.capacity() >= VAULT_MIN_RESERVED_CAPACITY);
+    }
+
+    #[test]
+    fn open_or_create_reserves_minimum_capacity_after_loading_existing_vault() {
+        let dir = std::env::temp_dir().join(format!(
+            "unigen_vault_test2_{}_{}",
+            std::process::id(),
+            {
+                use rand::rngs::OsRng;
+                use rand::RngCore;
+                let mut n = [0u8; 8];
+                OsRng.fill_bytes(&mut n);
+                hex::encode(n)
+            }
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("existing.vault");
+
+        let entries = vec![sample_entry(1, "seed")];
+        write_vault_file(&path, PWD, &entries, crypto::KDF_ARGON2ID).unwrap();
+
+        let loaded = open_or_create(&path, PWD).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded.capacity() - loaded.len() >= VAULT_MIN_RESERVED_CAPACITY);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn append_imported_assigns_unique_ids_and_reserves_capacity() {
+        let mut entries: Vec<Box<VaultEntry>> = Vec::new();
+        let rows = vec![
+            ImportedRow {
+                title: "a".to_string(),
+                username: "ua".to_string(),
+                password: "pa".to_string(),
+                url: "".to_string(),
+                notes: "".to_string(),
+            },
+            ImportedRow {
+                title: "b".to_string(),
+                username: "ub".to_string(),
+                password: "pb".to_string(),
+                url: "".to_string(),
+                notes: "".to_string(),
+            },
+        ];
+        let added = append_imported(&mut entries, rows);
+        assert_eq!(added, 2);
+        assert_eq!(entries.len(), 2);
+        assert_ne!(entries[0].id, entries[1].id);
+        assert!(entries.capacity() >= 2);
+    }
 }
