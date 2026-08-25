@@ -30,7 +30,15 @@ rand_core = { version = "0.6", features = ["std"] }
 zeroize = { version = "1.7", features = ["derive"] }
 
 # File dialogs / clipboard
-rfd = "0.14"
+# Default features pull in the xdg-desktop-portal (DBus) backend on
+# Linux, which silently hangs forever if no portal service/backend
+# (xdg-desktop-portal + xdg-desktop-portal-gtk/-kde) is running — the
+# dialog thread never returns, no error, no crash, the window just never
+# appears. Switching to the gtk3 backend makes the dialog a normal
+# synchronous GTK call instead of a DBus round-trip, so it doesn't
+# depend on a portal service being present. No effect on Windows/macOS,
+# whose backends aren't gated by these features.
+rfd = { version = "0.14", default-features = false, features = ["gtk3"] }
 arboard = "3.3"
 
 # Misc
@@ -38,3 +46,7 @@ anyhow = "1.0"
 thiserror = "1.0"
 base64 = "0.22"
 hex = "0.4"
+
+# Vault (password-manager entry storage)
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
