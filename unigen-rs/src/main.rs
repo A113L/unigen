@@ -115,6 +115,20 @@ mod theme {
 }
 
 fn main() -> eframe::Result<()> {
+    // MEMORY-RESIDUE fix: ask the kernel not to write a core dump for this
+    // process. Without this, a crash (segfault, panic-induced abort, an
+    // operator running `kill -SEGV`/`gcore` against the PID, etc.) can
+    // leave a coredump file on disk containing every secret currently
+    // live in memory — decrypted vault entries, the passphrase actually
+    // being typed, decrypted editor content — completely bypassing every
+    // `Zeroize`/`SecretString` protection in this app, since none of
+    // that runs during an abnormal process termination. `PR_SET_DUMPABLE`
+    // is Linux-only and best-effort (a debugger with `ptrace` capability
+    // can still attach and read process memory directly; this only closes
+    // the "crash leaves a readable file behind" case, and only on Linux).
+    #[cfg(target_os = "linux")]
+    disable_core_dumps();
+
     // Mirror the Python original: size the window relative to the screen
     // (capped to a sane range) and center it, instead of a fixed size.
     // A more compact default now that the scroll area properly fills its
@@ -300,7 +314,52 @@ enum Tab {
 /// Messages sent from a background worker thread back to the UI thread.
 enum JobMsg {
     Progress(f32, String),
+    /// Sent by `run_encrypt_job`'s small-file (in-memory blob) path when
+    /// it needs the user to pick a save location. Carries a suggested
+    /// default filename and a one-shot reply channel; the job thread
+    /// blocks on `reply_rx.recv()` after sending this, so it costs
+    /// nothing extra to wait — see the comment at the send site in
+    /// `run_encrypt_job` for the full rationale.
+    NeedSavePath(String, Sender<Option<PathBuf>>),
     Done(Result<String, String>),
+}
+
+/// What to do once a `spawn_dialog`-launched native file dialog reports
+/// back which path (if any) the user picked. See `spawn_dialog`'s doc
+/// comment for why this exists: the underlying `rfd::FileDialog` call
+/// must never run directly on the UI thread.
+enum PendingPick {
+    OpenVault,
+    NewVault,
+    ImportCsv,
+    EncryptSelectFile,
+    /// Streaming-encrypt output path. Carries everything `start_encrypt`
+    /// had already gathered before the dialog was spawned, since none of
+    /// it can be re-read from `self` once the dialog closes (the button
+    /// click that triggered this may be several frames in the past by
+    /// then, and e.g. `self.enc_pwd` could have auto-cleared).
+    EncryptSaveOutput {
+        in_path: PathBuf,
+        pwd: Zeroizing<String>,
+        kdf_id: u8,
+        shred_after: bool,
+    },
+    DecryptSelectFile,
+    /// Decrypt output path, same rationale as `EncryptSaveOutput`.
+    DecryptSaveOutput {
+        in_path: PathBuf,
+        pwd: Zeroizing<String>,
+        is_streaming: bool,
+    },
+    ShredSelectFile,
+    EditorSelectFile,
+    SaveGeneratedPasswords,
+    /// The `run_encrypt_job` background thread (small-file/in-memory
+    /// blob path) is blocked waiting to know where to save. Once the
+    /// dialog resolves, the chosen path (or `None` if cancelled) is
+    /// forwarded to it over this one-shot reply channel so it can
+    /// finish — see `JobMsg::NeedSavePath`.
+    EncryptSmallFileSavePath(Sender<Option<PathBuf>>),
 }
 
 struct BackgroundJob {
@@ -322,7 +381,17 @@ struct UnigenApp {
     gen_status: String,
     last_saved_password_path: Option<PathBuf>,
     encrypt_shred_prompt_open: bool,
-    encrypt_shred_pwd: String,
+    // SECURITY (memory-residue fix): every UI-editable secret field in
+    // this struct is `SecretString`, not `String`/`Zeroizing<String>`.
+    // `SecretString` implements `egui::TextBuffer` (see secret.rs), so
+    // `TextEdit` writes directly into its wipe-on-relocate buffer —
+    // closing the gap where a plain `String` field reallocates on every
+    // keystroke and leaves the old, unzeroized buffer for the allocator
+    // to hand out again. `Zeroizing<String>` only wiped on final Drop;
+    // it never covered the copies made *while the user was still
+    // typing*, which is exactly the longest-lived, most sensitive
+    // window for a passphrase.
+    encrypt_shred_pwd: SecretString,
 
     // ---- Clipboard / auto-clear ----
     clipboard: Option<arboard::Clipboard>,
@@ -335,7 +404,7 @@ struct UnigenApp {
     // ---- File Protector: Encrypt ----
     kdf_choice: u8,
     enc_file: Option<PathBuf>,
-    enc_pwd: String,
+    enc_pwd: SecretString,
     enc_pwd_last_edit: Instant,
     enc_pwd_autoclear: bool,
     shred_after: bool,
@@ -348,7 +417,7 @@ struct UnigenApp {
 
     // ---- File Protector: Decrypt ----
     dec_file: Option<PathBuf>,
-    dec_pwd: String,
+    dec_pwd: SecretString,
     dec_pwd_last_edit: Instant,
     dec_pwd_autoclear: bool,
     dec_status: String,
@@ -365,9 +434,9 @@ struct UnigenApp {
     /// content is re-encrypted, or the app exits.
     editor_open: bool,
     editor_source: Option<PathBuf>,
-    editor_content: String,
-    editor_original_content: String,
-    editor_pwd: String,
+    editor_content: SecretString,
+    editor_original_content: SecretString,
+    editor_pwd: SecretString,
     editor_kdf: u8,
     /// KDF read from the opened file's own header (`None` for legacy
     /// Python-format files, which have no discoverable KDF marker other
@@ -381,7 +450,7 @@ struct UnigenApp {
     /// Passphrase prompt shown before decrypting into the editor.
     editor_open_prompt: bool,
     editor_open_target: Option<PathBuf>,
-    editor_open_pwd: String,
+    editor_open_pwd: SecretString,
     editor_open_error: String,
 
     // ---- Vault (password manager) ----
@@ -397,7 +466,7 @@ struct UnigenApp {
     /// a new heap address before the manual zeroize ever runs; `Drop`
     /// guarantees the wipe even on an early-return path that forgets to
     /// call it explicitly.
-    vault_master_pwd: Zeroizing<String>,
+    vault_master_pwd: SecretString,
     /// Decrypted entries, only populated while unlocked. Wrapped so the
     /// whole list — including every entry's password/notes strings via
     /// `VaultEntry`'s manual `Zeroize` impl — is scrubbed the moment it's
@@ -421,11 +490,11 @@ struct UnigenApp {
     /// before being overwritten/cleared) for the same reason as
     /// `vault_master_pwd` above — `vault_edit_password` in particular
     /// holds a plaintext credential for as long as the entry is open.
-    vault_edit_title: Zeroizing<String>,
-    vault_edit_username: Zeroizing<String>,
-    vault_edit_password: Zeroizing<String>,
-    vault_edit_url: Zeroizing<String>,
-    vault_edit_notes: Zeroizing<String>,
+    vault_edit_title: SecretString,
+    vault_edit_username: SecretString,
+    vault_edit_password: SecretString,
+    vault_edit_url: SecretString,
+    vault_edit_notes: SecretString,
     vault_reveal_password: bool,
     vault_confirm_delete: Option<u64>,
     /// Auto-lock: mirrors the existing passphrase inactivity-clear
@@ -436,9 +505,9 @@ struct UnigenApp {
 
     // ---- Vault: change master password ----
     vault_change_pwd_open: bool,
-    vault_change_pwd_current: Zeroizing<String>,
-    vault_change_pwd_new: Zeroizing<String>,
-    vault_change_pwd_confirm: Zeroizing<String>,
+    vault_change_pwd_current: SecretString,
+    vault_change_pwd_new: SecretString,
+    vault_change_pwd_confirm: SecretString,
     vault_change_pwd_error: String,
 
     // ---- Vault: CSV import ----
@@ -451,6 +520,10 @@ struct UnigenApp {
     encrypt_job: Option<BackgroundJob>,
     decrypt_job: Option<BackgroundJob>,
     shred_job: Option<BackgroundJob>,
+    /// A native file dialog currently running on a background thread
+    /// (see `spawn_dialog`'s doc comment), and what to do with the
+    /// chosen path once it reports back.
+    pending_pick: Option<(Receiver<Option<PathBuf>>, PendingPick)>,
 
     pwd_autoclear_seconds: u32,
 
@@ -472,7 +545,7 @@ impl UnigenApp {
             gen_status: String::new(),
             last_saved_password_path: None,
             encrypt_shred_prompt_open: false,
-            encrypt_shred_pwd: String::new(),
+            encrypt_shred_pwd: SecretString::new(),
             clipboard: arboard::Clipboard::new().ok(),
             autoclear_enabled: true,
             autoclear_seconds: 20,
@@ -481,14 +554,14 @@ impl UnigenApp {
             clip_status: String::new(),
             kdf_choice: crypto::DEFAULT_KDF, // Argon2id first / default, per updated guidance
             enc_file: None,
-            enc_pwd: String::new(),
+            enc_pwd: SecretString::new(),
             enc_pwd_last_edit: Instant::now(),
             enc_pwd_autoclear: true,
             shred_after: true,
             enc_status: String::new(),
             linux_try_exclusion: false,
             dec_file: None,
-            dec_pwd: String::new(),
+            dec_pwd: SecretString::new(),
             dec_pwd_last_edit: Instant::now(),
             dec_pwd_autoclear: true,
             dec_status: String::new(),
@@ -497,9 +570,9 @@ impl UnigenApp {
             shred_status: String::new(),
             editor_open: false,
             editor_source: None,
-            editor_content: String::new(),
-            editor_original_content: String::new(),
-            editor_pwd: String::new(),
+            editor_content: SecretString::new(),
+            editor_original_content: SecretString::new(),
+            editor_pwd: SecretString::new(),
             editor_kdf: crypto::DEFAULT_KDF,
             editor_source_kdf: None,
             editor_search: String::new(),
@@ -507,30 +580,30 @@ impl UnigenApp {
             editor_confirm_close: false,
             editor_open_prompt: false,
             editor_open_target: None,
-            editor_open_pwd: String::new(),
+            editor_open_pwd: SecretString::new(),
             editor_open_error: String::new(),
             vault_path: None,
             vault_unlocked: false,
-            vault_master_pwd: Zeroizing::new(String::new()),
+            vault_master_pwd: SecretString::new(),
             vault_entries: Zeroizing::new(Vec::new()),
             vault_kdf: crypto::DEFAULT_KDF,
             vault_status: String::new(),
             vault_dirty: false,
             vault_search: String::new(),
             vault_selected: None,
-            vault_edit_title: Zeroizing::new(String::new()),
-            vault_edit_username: Zeroizing::new(String::new()),
-            vault_edit_password: Zeroizing::new(String::new()),
-            vault_edit_url: Zeroizing::new(String::new()),
-            vault_edit_notes: Zeroizing::new(String::new()),
+            vault_edit_title: SecretString::new(),
+            vault_edit_username: SecretString::new(),
+            vault_edit_password: SecretString::new(),
+            vault_edit_url: SecretString::new(),
+            vault_edit_notes: SecretString::new(),
             vault_reveal_password: false,
             vault_confirm_delete: None,
             vault_last_activity: Instant::now(),
             vault_autolock_seconds: 120,
             vault_change_pwd_open: false,
-            vault_change_pwd_current: Zeroizing::new(String::new()),
-            vault_change_pwd_new: Zeroizing::new(String::new()),
-            vault_change_pwd_confirm: Zeroizing::new(String::new()),
+            vault_change_pwd_current: SecretString::new(),
+            vault_change_pwd_new: SecretString::new(),
+            vault_change_pwd_confirm: SecretString::new(),
             vault_change_pwd_error: String::new(),
             vault_import_open: false,
             vault_import_source: vault::CsvSource::Generic,
@@ -539,6 +612,7 @@ impl UnigenApp {
             encrypt_job: None,
             decrypt_job: None,
             shred_job: None,
+            pending_pick: None,
             pwd_autoclear_seconds: 30,
             show_close_confirm: false,
         }
@@ -708,11 +782,11 @@ impl UnigenApp {
 
     fn vault_select(&mut self, id: u64) {
         if let Some(e) = self.vault_entries.iter().find(|e| e.id == id) {
-            self.vault_edit_title = Zeroizing::new(e.title.as_str().to_string());
-            self.vault_edit_username = Zeroizing::new(e.username.as_str().to_string());
-            self.vault_edit_password = Zeroizing::new(e.password.as_str().to_string());
-            self.vault_edit_url = Zeroizing::new(e.url.as_str().to_string());
-            self.vault_edit_notes = Zeroizing::new(e.notes.as_str().to_string());
+            self.vault_edit_title = e.title.clone();
+            self.vault_edit_username = e.username.clone();
+            self.vault_edit_password = e.password.clone();
+            self.vault_edit_url = e.url.clone();
+            self.vault_edit_notes = e.notes.clone();
             self.vault_selected = Some(id);
             self.vault_reveal_password = false;
         }
@@ -721,7 +795,7 @@ impl UnigenApp {
     fn vault_new_entry(&mut self) {
         self.clear_vault_edit_buffers();
         self.vault_selected = None;
-        self.vault_edit_title = Zeroizing::new("New entry".to_string());
+        self.vault_edit_title = SecretString::from_str("New entry");
     }
 
     /// Commit the edit-pane buffers into `vault_entries`: updates the
@@ -923,24 +997,26 @@ impl UnigenApp {
             // touch the file until Unlock is pressed. pick_file() opens
             // an existing file with no such warning; save_file() is kept
             // only for the "create a new, not-yet-existing vault" case.
-            if ui.button("Open existing vault…").clicked() {
-                if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("UNIGEN vault", &["uvault", "enc"])
-                    .pick_file()
-                {
-                    self.lock_vault(true);
-                    self.vault_path = Some(path);
-                }
+            if ui
+                .add_enabled(self.pending_pick.is_none(), egui::Button::new("Open existing vault…"))
+                .clicked()
+            {
+                self.spawn_dialog(PendingPick::OpenVault, || {
+                    rfd::FileDialog::new()
+                        .add_filter("UNIGEN vault", &["uvault", "enc"])
+                        .pick_file()
+                });
             }
-            if ui.button("New vault…").clicked() {
-                if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("UNIGEN vault", &["uvault", "enc"])
-                    .set_file_name("vault.uvault")
-                    .save_file()
-                {
-                    self.lock_vault(true);
-                    self.vault_path = Some(path);
-                }
+            if ui
+                .add_enabled(self.pending_pick.is_none(), egui::Button::new("New vault…"))
+                .clicked()
+            {
+                self.spawn_dialog(PendingPick::NewVault, || {
+                    rfd::FileDialog::new()
+                        .add_filter("UNIGEN vault", &["uvault", "enc"])
+                        .set_file_name("vault.uvault")
+                        .save_file()
+                });
             }
         });
 
@@ -957,13 +1033,38 @@ impl UnigenApp {
             ui.add(egui::DragValue::new(&mut self.vault_autolock_seconds).range(0..=3600));
             ui.label("seconds of inactivity (0 = never)");
         });
+        // Auto-lock (and every other in-memory-only protection in this
+        // app) only runs while the process is scheduled and executing
+        // normally. Sleep/hibernate can write the *entire* RAM contents
+        // — decrypted vault entries included — to disk (the hiberfile on
+        // Windows, swap on Linux/macOS) with no chance for auto-lock's
+        // timer-driven check to fire first. This is a real residual gap,
+        // not something the app can close from userspace, so it's
+        // surfaced here rather than left silent.
+        ui.small(
+            "Note: locking the screen doesn't stop the OS from suspending/hibernating in the \
+             background. If the machine sleeps or hibernates while the vault is unlocked, \
+             decrypted entries may be written to disk as part of that (not something this app \
+             can prevent) until the vault is manually locked or the auto-lock timer above fires.",
+        );
 
         ui.separator();
 
         if !self.vault_unlocked {
             ui.label("Enter the master password to unlock (or create) this vault:");
             ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut *self.vault_master_pwd).password(true));
+                let resp = ui.add(egui::TextEdit::singleline(&mut self.vault_master_pwd).password(true));
+                #[cfg(target_os = "linux")]
+                if resp.changed() && self.linux_try_exclusion {
+                    self.vault_master_pwd.mlock_best_effort();
+                }
+                // `resp` is only consumed above, and that whole branch is
+                // Linux-only (`mlock()` isn't a Linux-portable syscall);
+                // on other targets this keeps the variable "used" without
+                // pretending there's a non-Linux equivalent action to
+                // take on change.
+                #[cfg(not(target_os = "linux"))]
+                let _ = &resp;
                 let can_go = self.vault_path.is_some() && !self.vault_master_pwd.is_empty();
                 if ui
                     .add_enabled(can_go, egui::Button::new("Unlock"))
@@ -1050,13 +1151,13 @@ impl UnigenApp {
 
             let ui = &mut cols[1];
             ui.label("Title");
-            ui.text_edit_singleline(&mut *self.vault_edit_title);
+            ui.text_edit_singleline(&mut self.vault_edit_title);
             ui.label("Username");
-            ui.text_edit_singleline(&mut *self.vault_edit_username);
+            ui.text_edit_singleline(&mut self.vault_edit_username);
             ui.label("Password");
             ui.horizontal(|ui| {
                 ui.add(
-                    egui::TextEdit::singleline(&mut *self.vault_edit_password)
+                    egui::TextEdit::singleline(&mut self.vault_edit_password)
                         .password(!self.vault_reveal_password),
                 );
                 if ui
@@ -1076,15 +1177,21 @@ impl UnigenApp {
                 if ui.button("Generate").clicked() {
                     let pool = build_pool(&self.charset_enabled, &self.charsets);
                     if !pool.is_empty() {
-                        self.vault_edit_password =
-                            Zeroizing::new(generate_password(self.length as usize, &pool).to_string());
+                        // `generate_password` returns `Zeroizing<String>`,
+                        // which wipes on its own drop at the end of this
+                        // scope — `SecretString::from_str` copies from it
+                        // (via deref-to-`&str`) into the field's own
+                        // controlled buffer without needing an
+                        // intermediate owned `String`.
+                        let generated = generate_password(self.length as usize, &pool);
+                        self.vault_edit_password = SecretString::from_str(&generated);
                     }
                 }
             });
             ui.label("URL");
-            ui.text_edit_singleline(&mut *self.vault_edit_url);
+            ui.text_edit_singleline(&mut self.vault_edit_url);
             ui.label("Notes");
-            ui.add(egui::TextEdit::multiline(&mut *self.vault_edit_notes).desired_rows(4));
+            ui.add(egui::TextEdit::multiline(&mut self.vault_edit_notes).desired_rows(4));
 
             ui.horizontal(|ui| {
                 let has_title = !self.vault_edit_title.trim().is_empty();
@@ -1107,7 +1214,18 @@ impl UnigenApp {
             ui.separator();
             ui.horizontal(|ui| {
                 ui.label("Master password to save:");
-                ui.add(egui::TextEdit::singleline(&mut *self.vault_master_pwd).password(true));
+                let resp = ui.add(egui::TextEdit::singleline(&mut self.vault_master_pwd).password(true));
+                #[cfg(target_os = "linux")]
+                if resp.changed() && self.linux_try_exclusion {
+                    self.vault_master_pwd.mlock_best_effort();
+                }
+                // `resp` is only consumed above, and that whole branch is
+                // Linux-only (`mlock()` isn't a Linux-portable syscall);
+                // on other targets this keeps the variable "used" without
+                // pretending there's a non-Linux equivalent action to
+                // take on change.
+                #[cfg(not(target_os = "linux"))]
+                let _ = &resp;
                 if ui.button("Save vault").clicked() {
                     let mut pwd = std::mem::take(&mut self.vault_master_pwd);
                     self.save_vault_with(&pwd);
@@ -1141,16 +1259,16 @@ impl UnigenApp {
                 .show(ui.ctx(), |ui| {
                     ui.label("Current master password:");
                     ui.add(
-                        egui::TextEdit::singleline(&mut *self.vault_change_pwd_current)
+                        egui::TextEdit::singleline(&mut self.vault_change_pwd_current)
                             .password(true),
                     );
                     ui.label("New master password (min 8 characters):");
                     ui.add(
-                        egui::TextEdit::singleline(&mut *self.vault_change_pwd_new).password(true),
+                        egui::TextEdit::singleline(&mut self.vault_change_pwd_new).password(true),
                     );
                     ui.label("Confirm new master password:");
                     ui.add(
-                        egui::TextEdit::singleline(&mut *self.vault_change_pwd_confirm)
+                        egui::TextEdit::singleline(&mut self.vault_change_pwd_confirm)
                             .password(true),
                     );
                     if !self.vault_change_pwd_error.is_empty() {
@@ -1206,12 +1324,13 @@ impl UnigenApp {
                             self.vault_import_open = false;
                             self.vault_import_status.clear();
                         }
-                        if ui.button("Choose CSV file…").clicked() {
-                            if let Some(path) =
+                        if ui
+                            .add_enabled(self.pending_pick.is_none(), egui::Button::new("Choose CSV file…"))
+                            .clicked()
+                        {
+                            self.spawn_dialog(PendingPick::ImportCsv, || {
                                 rfd::FileDialog::new().add_filter("CSV", &["csv"]).pick_file()
-                            {
-                                self.run_csv_import(path);
-                            }
+                            });
                         }
                     });
                 });
@@ -1230,12 +1349,12 @@ impl UnigenApp {
             _ => {
                 self.gen_status =
                     "No saved password file to encrypt — save the list first.".to_string();
-                zeroize_string(&mut self.encrypt_shred_pwd);
+                self.encrypt_shred_pwd.clear();
                 return;
             }
         };
 
-        let pwd = Zeroizing::new(self.encrypt_shred_pwd.clone());
+        let pwd = Zeroizing::new(self.encrypt_shred_pwd.as_str().to_string());
         let result = (|| -> anyhow::Result<String> {
             crypto::check_blob_file_size(&path)?;
             let original_identity = shred::file_identity(&path)?;
@@ -1272,7 +1391,7 @@ impl UnigenApp {
             }
         })();
 
-        zeroize_string(&mut self.encrypt_shred_pwd);
+        self.encrypt_shred_pwd.clear();
         match result {
             Ok(msg) => {
                 self.gen_status = msg;
@@ -1321,7 +1440,7 @@ impl UnigenApp {
             && !self.enc_pwd.is_empty()
             && self.enc_pwd_last_edit.elapsed() > secs
         {
-            zeroize_string(&mut self.enc_pwd);
+            self.enc_pwd.clear();
             self.enc_status = format!(
                 "Passphrase cleared from memory after {}s of inactivity.",
                 self.pwd_autoclear_seconds
@@ -1331,7 +1450,7 @@ impl UnigenApp {
             && !self.dec_pwd.is_empty()
             && self.dec_pwd_last_edit.elapsed() > secs
         {
-            zeroize_string(&mut self.dec_pwd);
+            self.dec_pwd.clear();
             self.dec_status = format!(
                 "Passphrase cleared from memory after {}s of inactivity.",
                 self.pwd_autoclear_seconds
@@ -1350,36 +1469,14 @@ impl UnigenApp {
             );
             return;
         }
-        if self.busy_ops.contains("encrypt") {
+        if self.busy_ops.contains("encrypt") || self.pending_pick.is_some() {
             return;
         }
 
         let size = std::fs::metadata(&in_path).map(|m| m.len()).unwrap_or(0);
         let streaming = size > crypto::STREAM_SIZE_THRESHOLD;
 
-        let out_path = if streaming {
-            let default_name = format!(
-                "{}.enc",
-                in_path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default()
-            );
-            rfd::FileDialog::new()
-                .set_title("Save encrypted file (large file — streamed)")
-                .set_file_name(&default_name)
-                .add_filter("Encrypted files", &["enc"])
-                .save_file()
-        } else {
-            None // small files stay in-memory; saved explicitly afterwards
-        };
-        if streaming && out_path.is_none() {
-            self.enc_status = "Cancelled.".to_string();
-            return;
-        }
-
-        self.busy_ops.insert("encrypt");
-        let pwd = Zeroizing::new(self.enc_pwd.clone());
+        let pwd = Zeroizing::new(self.enc_pwd.as_str().to_string());
         let kdf_id = self.kdf_choice;
         let shred_after = self.shred_after;
         #[cfg(target_os = "linux")]
@@ -1388,15 +1485,50 @@ impl UnigenApp {
                 "Warning: mlock() failed; passphrase remains subject to normal VM paging."
                     .to_string();
         }
+
+        if streaming {
+            // Large files need a save-target chosen up front (see
+            // `spawn_dialog`'s doc comment for why this can't be a
+            // direct, blocking `rfd::FileDialog` call here). Everything
+            // `run_encrypt_job` needs is stashed in the `PendingPick`
+            // variant and picked back up in `poll_pending_pick` once the
+            // dialog reports a result.
+            let default_name = format!(
+                "{}.enc",
+                in_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default()
+            );
+            self.spawn_dialog(
+                PendingPick::EncryptSaveOutput {
+                    in_path,
+                    pwd,
+                    kdf_id,
+                    shred_after,
+                },
+                move || {
+                    rfd::FileDialog::new()
+                        .set_title("Save encrypted file (large file — streamed)")
+                        .set_file_name(&default_name)
+                        .add_filter("Encrypted files", &["enc"])
+                        .save_file()
+                },
+            );
+            return;
+        }
+
+        // Small files stay in-memory; no save dialog needed up front, so
+        // this path is unaffected by the dialog-threading concern above.
+        self.busy_ops.insert("encrypt");
         let (tx, rx) = channel();
         self.encrypt_job = Some(BackgroundJob {
             rx,
             last_status: "Starting…".into(),
             progress: None,
         });
-
         std::thread::spawn(move || {
-            run_encrypt_job(in_path, out_path, pwd, kdf_id, shred_after, tx);
+            run_encrypt_job(in_path, None, pwd, kdf_id, shred_after, tx);
         });
     }
 
@@ -1408,7 +1540,7 @@ impl UnigenApp {
             self.dec_status = "Enter the passphrase.".to_string();
             return;
         }
-        if self.busy_ops.contains("decrypt") {
+        if self.busy_ops.contains("decrypt") || self.pending_pick.is_some() {
             return;
         }
 
@@ -1427,27 +1559,20 @@ impl UnigenApp {
             .file_stem()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "decrypted".to_string());
-        let out_path = rfd::FileDialog::new()
-            .set_title("Save decrypted file")
-            .set_file_name(&default_name)
-            .save_file();
-        let Some(out_path) = out_path else {
-            self.dec_status = "Cancelled.".to_string();
-            return;
-        };
-
-        self.busy_ops.insert("decrypt");
-        let pwd = Zeroizing::new(self.dec_pwd.clone());
-        let (tx, rx) = channel();
-        self.decrypt_job = Some(BackgroundJob {
-            rx,
-            last_status: "Starting…".into(),
-            progress: None,
-        });
-
-        std::thread::spawn(move || {
-            run_decrypt_job(in_path, out_path, pwd, is_streaming, tx);
-        });
+        let pwd = Zeroizing::new(self.dec_pwd.as_str().to_string());
+        self.spawn_dialog(
+            PendingPick::DecryptSaveOutput {
+                in_path,
+                pwd,
+                is_streaming,
+            },
+            move || {
+                rfd::FileDialog::new()
+                    .set_title("Save decrypted file")
+                    .set_file_name(&default_name)
+                    .save_file()
+            },
+        );
     }
 
     fn start_shred(&mut self) {
@@ -1478,7 +1603,7 @@ impl UnigenApp {
     /// never touches disk with plaintext. Small text files only (password
     /// lists), so this runs synchronously rather than on a background
     /// thread; Argon2id adds at most a fraction of a second.
-    fn open_editor_decrypt(&mut self, path: PathBuf, pwd: String) {
+    fn open_editor_decrypt(&mut self, path: PathBuf, pwd: SecretString) {
         let result = (|| -> anyhow::Result<(String, Option<u8>, bool)> {
             crypto::check_blob_file_size(&path)?;
             let file_contents = std::fs::read(&path)?;
@@ -1503,8 +1628,12 @@ impl UnigenApp {
         match result {
             Ok((text, source_kdf, legacy_no_aad)) => {
                 self.editor_source = Some(path);
-                self.editor_content = text.clone();
-                self.editor_original_content = text;
+                // `SecretString::from(String)` copies into the controlled
+                // buffer and zeroizes the source `String` afterward, so
+                // neither the `.clone()` below nor `text` itself is left
+                // as a stray unzeroized plaintext copy on the heap.
+                self.editor_content = SecretString::from(text.clone());
+                self.editor_original_content = SecretString::from(text);
                 self.editor_pwd = pwd;
                 self.editor_source_kdf = source_kdf;
                 // Default the "will save as" KDF to whatever the file was
@@ -1526,11 +1655,11 @@ impl UnigenApp {
                 };
                 self.editor_open_prompt = false;
                 self.editor_open_target = None;
-                zeroize_string(&mut self.editor_open_pwd);
+                self.editor_open_pwd.clear();
                 self.editor_open_error.clear();
             }
             Err(e) => {
-                zeroize_string(&mut self.editor_open_pwd);
+                self.editor_open_pwd.clear();
                 self.editor_open_error = format!("Error: {e}");
             }
         }
@@ -1597,9 +1726,9 @@ impl UnigenApp {
     /// calls this too) so decrypted plaintext never lingers in memory
     /// longer than the editor stays open.
     fn close_editor(&mut self) {
-        zeroize_string(&mut self.editor_content);
-        zeroize_string(&mut self.editor_original_content);
-        zeroize_string(&mut self.editor_pwd);
+        self.editor_content.clear();
+        self.editor_original_content.clear();
+        self.editor_pwd.clear();
         self.editor_search.clear();
         self.editor_status.clear();
         self.editor_source = None;
@@ -1616,14 +1745,261 @@ impl UnigenApp {
         self.clear_clipboard();
     }
 
+    /// Runs a native file/save dialog on a dedicated background thread
+    /// instead of calling `rfd::FileDialog` directly from inside an
+    /// `egui`/`eframe` UI callback.
+    ///
+    /// On Linux, `rfd`'s blocking `pick_file()`/`save_file()` pumps its
+    /// own (GTK, or portal-backed) event loop to show the dialog and
+    /// wait for a result. Calling that *from inside* `update()` — i.e.
+    /// from the same thread that's driving `winit`'s event loop — means
+    /// two event loops are competing for the same thread: `winit` is
+    /// blocked waiting for `update()` to return, while the dialog's own
+    /// loop can end up waiting on window-manager/compositor events that
+    /// only `winit`'s loop would normally pump. Depending on the desktop
+    /// environment this deadlocks outright (no dialog ever appears, the
+    /// whole app just hangs) rather than merely glitching — which is
+    /// exactly the "every Browse/Open/Save button freezes the app"
+    /// symptom this fixes. Running the dialog on its own OS thread lets
+    /// `winit`'s loop keep pumping on the main thread while the dialog
+    /// runs independently; the result comes back over `mpsc` and is
+    /// picked up by `poll_pending_pick` on a later frame, the same
+    /// pattern already used for the encrypt/decrypt/shred background
+    /// jobs elsewhere in this file.
+    ///
+    /// Only one dialog is tracked at a time (`self.pending_pick`); UI
+    /// code should guard the triggering button with
+    /// `self.pending_pick.is_none()` so a second click can't spawn a
+    /// second native dialog while one is already open.
+    fn spawn_dialog(
+        &mut self,
+        kind: PendingPick,
+        dialog: impl FnOnce() -> Option<PathBuf> + Send + 'static,
+    ) {
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(dialog());
+        });
+        self.pending_pick = Some((rx, kind));
+    }
+
+    /// Checks whether a dialog spawned by `spawn_dialog` has reported
+    /// back yet, and if so, runs whatever follow-up action was pending
+    /// for it. Called every frame from `poll_jobs`.
+    /// Called when a `spawn_dialog` worker thread disappears without
+    /// sending a result (see the `Disconnected` arm in
+    /// `poll_pending_pick`). Surfaces a status message on whichever tab
+    /// owns `kind` instead of leaving the user staring at a button that
+    /// just silently does nothing.
+    fn report_dialog_failure(&mut self, kind: PendingPick) {
+        const MSG: &str = "Couldn't open the file dialog. Please try again.";
+        match kind {
+            PendingPick::OpenVault | PendingPick::NewVault => {
+                self.vault_status = MSG.to_string();
+            }
+            PendingPick::ImportCsv => {
+                self.vault_status = MSG.to_string();
+            }
+            PendingPick::EncryptSelectFile | PendingPick::EncryptSaveOutput { .. } => {
+                self.enc_status = MSG.to_string();
+            }
+            PendingPick::DecryptSelectFile | PendingPick::DecryptSaveOutput { .. } => {
+                self.dec_status = MSG.to_string();
+            }
+            PendingPick::ShredSelectFile => {
+                self.shred_status = MSG.to_string();
+            }
+            PendingPick::EditorSelectFile => {
+                self.editor_status = MSG.to_string();
+            }
+            PendingPick::SaveGeneratedPasswords => {
+                self.gen_status = MSG.to_string();
+            }
+            PendingPick::EncryptSmallFileSavePath(reply) => {
+                // The background encrypt job is blocked on this reply
+                // channel; tell it to bail out cleanly rather than hang
+                // forever waiting for a save path that will never come.
+                let _ = reply.send(None);
+            }
+        }
+    }
+
+    fn poll_pending_pick(&mut self) {
+        let Some((rx, _)) = &self.pending_pick else {
+            return;
+        };
+        let path = match rx.try_recv() {
+            Ok(path) => path,
+            // Dialog thread hasn't reported back yet — keep waiting,
+            // buttons stay disabled via `pending_pick.is_some()` until
+            // next frame.
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            // The dialog thread is gone without ever sending a result
+            // (e.g. it panicked — no working GTK/portal backend, a
+            // `rfd` failure, etc). If we treat this the same as "still
+            // waiting" (as a bare `Err(_) => return` does), `pending_pick`
+            // is never cleared and, since every Open/Browse/New button is
+            // gated on `pending_pick.is_none()`, the *entire app's* file
+            // buttons go permanently dead after this single failure —
+            // this is the bug behind the "buttons to open files don't
+            // work" report. Clear the pending pick and surface it so the
+            // UI recovers instead of silently locking up.
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                let (_, kind) = self.pending_pick.take().expect("checked Some above");
+                self.report_dialog_failure(kind);
+                return;
+            }
+        };
+        let (_, kind) = self.pending_pick.take().expect("checked Some above");
+        match kind {
+            PendingPick::OpenVault => {
+                if let Some(path) = path {
+                    self.lock_vault(true);
+                    self.vault_path = Some(path);
+                }
+            }
+            PendingPick::NewVault => {
+                if let Some(path) = path {
+                    self.lock_vault(true);
+                    self.vault_path = Some(path);
+                }
+            }
+            PendingPick::ImportCsv => {
+                if let Some(path) = path {
+                    self.run_csv_import(path);
+                }
+            }
+            PendingPick::EncryptSelectFile => {
+                if let Some(path) = path {
+                    self.enc_file = Some(path);
+                }
+            }
+            PendingPick::EncryptSaveOutput {
+                in_path,
+                pwd,
+                kdf_id,
+                shred_after,
+            } => {
+                let Some(out_path) = path else {
+                    self.enc_status = "Cancelled.".to_string();
+                    return;
+                };
+                // `mlock()` on `pwd` (if enabled) already happened back
+                // in `start_encrypt`, right after this `Zeroizing<String>`
+                // was created — no need to repeat it here.
+                self.busy_ops.insert("encrypt");
+                let (tx, rx) = channel();
+                self.encrypt_job = Some(BackgroundJob {
+                    rx,
+                    last_status: "Starting…".into(),
+                    progress: None,
+                });
+                std::thread::spawn(move || {
+                    run_encrypt_job(in_path, Some(out_path), pwd, kdf_id, shred_after, tx);
+                });
+            }
+            PendingPick::DecryptSelectFile => {
+                if let Some(path) = path {
+                    self.dec_file = Some(path);
+                }
+            }
+            PendingPick::DecryptSaveOutput {
+                in_path,
+                pwd,
+                is_streaming,
+            } => {
+                let Some(out_path) = path else {
+                    self.dec_status = "Cancelled.".to_string();
+                    return;
+                };
+                self.busy_ops.insert("decrypt");
+                let (tx, rx) = channel();
+                self.decrypt_job = Some(BackgroundJob {
+                    rx,
+                    last_status: "Starting…".into(),
+                    progress: None,
+                });
+                std::thread::spawn(move || {
+                    run_decrypt_job(in_path, out_path, pwd, is_streaming, tx);
+                });
+            }
+            PendingPick::ShredSelectFile => {
+                if let Some(path) = path {
+                    // `pick_file()` can still return a directory on some
+                    // platforms/window managers even though it requests
+                    // a file picker.
+                    if path.is_dir() {
+                        self.shred_target = None;
+                        self.shred_status =
+                            "That's a folder, not a file — please pick a single file to shred."
+                                .to_string();
+                    } else {
+                        self.shred_status.clear();
+                        self.shred_target = Some(path);
+                    }
+                }
+            }
+            PendingPick::EditorSelectFile => {
+                if let Some(path) = path {
+                    self.editor_open_target = Some(path);
+                    self.editor_open_error.clear();
+                    self.editor_open_prompt = true;
+                }
+            }
+            PendingPick::EncryptSmallFileSavePath(reply) => {
+                // Forward whatever was chosen (or `None` if cancelled)
+                // back to the waiting `run_encrypt_job` thread. If it's
+                // gone already (e.g. the job errored out some other way
+                // first) the send just fails silently — nothing to do.
+                let _ = reply.send(path);
+            }
+            PendingPick::SaveGeneratedPasswords => {
+                let Some(path) = path else {
+                    return;
+                };
+                let content = Zeroizing::new(
+                    self.generated
+                        .iter()
+                        .map(|p| p.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                );
+                let tmp = crypto::unique_tmp_path(&path);
+                let ok = crypto::write_durable(&tmp, content.as_bytes())
+                    .and_then(|_| crypto::replace_file(&tmp, &path))
+                    .is_ok();
+                if !ok {
+                    let _ = std::fs::remove_file(&tmp);
+                }
+                self.gen_status = if ok {
+                    crypto::restrict_permissions(&path);
+                    self.last_saved_password_path = Some(path.clone());
+                    format!("Saved to: {path:?}")
+                } else {
+                    "Save failed.".to_string()
+                };
+            }
+        }
+    }
+
     fn poll_jobs(&mut self, ctx: &egui::Context) {
+        self.poll_pending_pick();
         if let Some(job) = self.encrypt_job.as_mut() {
             let mut finished = None;
+            let mut need_save_path = None;
             while let Ok(msg) = job.rx.try_recv() {
                 match msg {
                     JobMsg::Progress(p, s) => {
                         job.progress = Some(p);
                         job.last_status = s;
+                    }
+                    JobMsg::NeedSavePath(default_name, reply) => {
+                        // Just stash this — can't call `self.spawn_dialog`
+                        // (needs `&mut self`) while `job` (borrowed from
+                        // `self.encrypt_job`) is still alive. Handled just
+                        // below, once this `if let` block (and `job`'s
+                        // borrow with it) has ended.
+                        need_save_path = Some((default_name, reply));
                     }
                     JobMsg::Done(res) => finished = Some(res),
                 }
@@ -1636,6 +2012,15 @@ impl UnigenApp {
                 };
                 self.encrypt_job = None;
             }
+            if let Some((default_name, reply)) = need_save_path {
+                self.spawn_dialog(PendingPick::EncryptSmallFileSavePath(reply), move || {
+                    rfd::FileDialog::new()
+                        .set_title("Save encrypted file")
+                        .set_file_name(default_name)
+                        .add_filter("Encrypted files", &["enc"])
+                        .save_file()
+                });
+            }
         }
         if let Some(job) = self.decrypt_job.as_mut() {
             let mut finished = None;
@@ -1644,6 +2029,13 @@ impl UnigenApp {
                     JobMsg::Progress(p, s) => {
                         job.progress = Some(p);
                         job.last_status = s;
+                    }
+                    // `run_decrypt_job` never sends this — only the
+                    // small-file branch of `run_encrypt_job` does — but
+                    // `JobMsg` is shared across all three job kinds, so
+                    // the match still has to be exhaustive here.
+                    JobMsg::NeedSavePath(_, reply) => {
+                        let _ = reply.send(None);
                     }
                     JobMsg::Done(res) => finished = Some(res),
                 }
@@ -1664,6 +2056,11 @@ impl UnigenApp {
                     JobMsg::Progress(p, s) => {
                         job.progress = Some(p);
                         job.last_status = s;
+                    }
+                    // Same rationale as the `decrypt_job` loop above:
+                    // `run_shred_job` never actually sends this variant.
+                    JobMsg::NeedSavePath(_, reply) => {
+                        let _ = reply.send(None);
                     }
                     JobMsg::Done(res) => finished = Some(res),
                 }
@@ -1690,9 +2087,55 @@ impl UnigenApp {
         // would leave an unlocked vault decrypted in memory indefinitely
         // while the app sits idle, defeating the point of auto-lock.
         let vault_autolock_pending = self.vault_unlocked && self.vault_autolock_seconds > 0;
-        if !self.busy_ops.is_empty() || autoclear_pending || vault_autolock_pending {
+        if !self.busy_ops.is_empty()
+            || autoclear_pending
+            || vault_autolock_pending
+            || self.pending_pick.is_some()
+        {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
+    }
+}
+
+/// Best-effort: tell the Linux kernel this process should never produce a
+/// core dump (`prctl(PR_SET_DUMPABLE, 0)`), so a crash can't leave a file
+/// on disk containing whatever secrets happened to be live in memory at
+/// the time. Silently does nothing if the kernel refuses the request —
+/// there's no user-facing consequence to react to either way, since this
+/// only affects post-crash forensics, not normal operation. Also lowers
+/// `RLIMIT_CORE` to 0 as a second, independent line of defense: even a
+/// child process or a future code path that re-enables dumpable (e.g. via
+/// `PR_SET_DUMPABLE` after a `setuid`-style transition, which the kernel
+/// does automatically and which this app doesn't do, but which some
+/// libraries can trigger) still can't write a dump if the size limit is
+/// zero.
+#[cfg(target_os = "linux")]
+fn disable_core_dumps() {
+    const PR_SET_DUMPABLE: i32 = 4;
+    extern "C" {
+        fn prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i32;
+    }
+    // SAFETY: `prctl` with `PR_SET_DUMPABLE` only reads its integer
+    // arguments; no pointers are passed, and a nonzero return (failure)
+    // is intentionally ignored since this is best-effort.
+    unsafe {
+        prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+    }
+
+    #[repr(C)]
+    struct RLimit {
+        cur: u64,
+        max: u64,
+    }
+    const RLIMIT_CORE: i32 = 4;
+    extern "C" {
+        fn setrlimit(resource: i32, rlim: *const RLimit) -> i32;
+    }
+    let limit = RLimit { cur: 0, max: 0 };
+    // SAFETY: `limit` is a valid, initialized `RLimit` for the duration
+    // of this call; `setrlimit` does not retain the pointer afterward.
+    unsafe {
+        setrlimit(RLIMIT_CORE, &limit);
     }
 }
 
@@ -1826,16 +2269,35 @@ fn run_encrypt_job(
                 s.push(".enc");
                 PathBuf::from(s)
             };
-            let save_path = rfd::FileDialog::new()
-                .set_title("Save encrypted file")
-                .set_file_name(
-                    default_out
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_else(|| "encrypted.enc".to_string()),
-                )
-                .add_filter("Encrypted files", &["enc"])
-                .save_file();
+            let default_name = default_out
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "encrypted.enc".to_string());
+            // Ask the main/UI thread to run the save-file dialog instead
+            // of calling `rfd::FileDialog` directly here. This thread
+            // isn't the UI thread, so it wouldn't hit the winit-vs-
+            // dialog-event-loop deadlock other call sites in this file
+            // had — but GTK (the backend `rfd` normally uses on Linux)
+            // isn't thread-safe and isn't generally supported outside
+            // the thread that initialized it (which, given `eframe`
+            // brings up its window on the main thread, is the main
+            // thread). Routing the actual dialog call back through
+            // `spawn_dialog` — which always launches it from a thread
+            // spawned off the main thread, consistently — avoids that.
+            // Blocking on `reply_rx.recv()` here costs nothing: this
+            // thread has no other work to do until it knows the save
+            // path anyway, and the UI thread stays fully responsive
+            // (the dialog itself runs on yet another thread; this one
+            // just waits on a channel).
+            let (reply_tx, reply_rx) = channel();
+            if tx
+                .send(JobMsg::NeedSavePath(default_name, reply_tx))
+                .is_err()
+            {
+                // UI side is gone (app closing) — nothing left to do.
+                return Ok("Cancelled.".to_string());
+            }
+            let save_path = reply_rx.recv().ok().flatten();
             let Some(save_path) = save_path else {
                 return Ok("Cancelled (encryption result was discarded).".to_string());
             };
@@ -1979,9 +2441,9 @@ impl eframe::App for UnigenApp {
         // let the close proceed.
         if ctx.input(|i| i.viewport().close_requested()) {
             if self.busy_ops.is_empty() {
-                zeroize_string(&mut self.enc_pwd);
-                zeroize_string(&mut self.dec_pwd);
-                zeroize_string(&mut self.editor_open_pwd);
+                self.enc_pwd.clear();
+                self.dec_pwd.clear();
+                self.editor_open_pwd.clear();
                 self.close_editor();
                 self.clear_clipboard();
                 self.lock_vault(false);
@@ -2002,7 +2464,7 @@ impl eframe::App for UnigenApp {
                     ui.add(egui::TextEdit::singleline(&mut self.encrypt_shred_pwd).password(true));
                     ui.horizontal(|ui| {
                         if ui.button("Cancel").clicked() {
-                            zeroize_string(&mut self.encrypt_shred_pwd);
+                            self.encrypt_shred_pwd.clear();
                             self.encrypt_shred_prompt_open = false;
                         }
                         let can_go = self.encrypt_shred_pwd.chars().count() >= 8;
@@ -2040,7 +2502,7 @@ impl eframe::App for UnigenApp {
                     }
                     ui.horizontal(|ui| {
                         if ui.button("Cancel").clicked() {
-                            zeroize_string(&mut self.editor_open_pwd);
+                            self.editor_open_pwd.clear();
                             self.editor_open_error.clear();
                             self.editor_open_prompt = false;
                             self.editor_open_target = None;
@@ -2103,9 +2565,9 @@ impl eframe::App for UnigenApp {
                             // next to the intended output, never a
                             // corrupted "finished" file and never someone
                             // else's unrelated `.tmp` file.
-                            zeroize_string(&mut self.enc_pwd);
-                            zeroize_string(&mut self.dec_pwd);
-                            zeroize_string(&mut self.editor_open_pwd);
+                            self.enc_pwd.clear();
+                            self.dec_pwd.clear();
+                            self.editor_open_pwd.clear();
                             self.close_editor();
                             self.clear_clipboard();
                             std::process::exit(0);
@@ -2273,28 +2735,20 @@ impl UnigenApp {
                         let text = Zeroizing::new(self.generated.iter().map(|p| p.as_str()).collect::<Vec<_>>().join("\n"));
                         self.copy_to_clipboard(&text);
                     }
-                    if ui.add_enabled(!self.generated.is_empty(), egui::Button::new("Save to File")).clicked() {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .set_file_name(format!("passwords_{}.txt", self.generated.len()))
-                            .add_filter("Text files", &["txt"])
-                            .save_file()
-                        {
-                            let content = Zeroizing::new(self.generated.iter().map(|p| p.as_str()).collect::<Vec<_>>().join("\n"));
-                            let tmp = crypto::unique_tmp_path(&path);
-                            let ok = crypto::write_durable(&tmp, content.as_bytes())
-                                .and_then(|_| crypto::replace_file(&tmp, &path))
-                                .is_ok();
-                            if !ok {
-                                let _ = std::fs::remove_file(&tmp);
-                            }
-                            self.gen_status = if ok {
-                                crypto::restrict_permissions(&path);
-                                self.last_saved_password_path = Some(path.clone());
-                                format!("Saved to: {path:?}")
-                            } else {
-                                "Save failed.".to_string()
-                            };
-                        }
+                    if ui
+                        .add_enabled(
+                            !self.generated.is_empty() && self.pending_pick.is_none(),
+                            egui::Button::new("Save to File"),
+                        )
+                        .clicked()
+                    {
+                        let default_name = format!("passwords_{}.txt", self.generated.len());
+                        self.spawn_dialog(PendingPick::SaveGeneratedPasswords, move || {
+                            rfd::FileDialog::new()
+                                .set_file_name(default_name)
+                                .add_filter("Text files", &["txt"])
+                                .save_file()
+                        });
                     }
                     if ui.button("Clear Clipboard").clicked() {
                         self.clear_clipboard();
@@ -2359,10 +2813,13 @@ impl UnigenApp {
                         .map(|p| p.display().to_string())
                         .unwrap_or_else(|| "(no file selected)".to_string());
                     ui.label(label);
-                    if ui.button("Browse…").clicked() {
-                        if let Some(path) = rfd::FileDialog::new().set_title("Select file to encrypt").pick_file() {
-                            self.enc_file = Some(path);
-                        }
+                    if ui
+                        .add_enabled(self.pending_pick.is_none(), egui::Button::new("Browse…"))
+                        .clicked()
+                    {
+                        self.spawn_dialog(PendingPick::EncryptSelectFile, || {
+                            rfd::FileDialog::new().set_title("Select file to encrypt").pick_file()
+                        });
                     }
                 });
 
@@ -2393,6 +2850,17 @@ impl UnigenApp {
                 let resp = ui.add(egui::TextEdit::singleline(&mut self.enc_pwd).password(true));
                 if resp.changed() {
                     self.enc_pwd_last_edit = Instant::now();
+                    // Best-effort: keep re-locking the field's *live*
+                    // buffer into physical RAM after every edit (not just
+                    // the one-off clone handed to the background job at
+                    // encrypt time — see `SecretString::mlock_best_effort`
+                    // doc comment for why the live field needs its own
+                    // lock, re-applied on each edit since growth moves
+                    // the buffer).
+                    #[cfg(target_os = "linux")]
+                    if self.linux_try_exclusion {
+                        self.enc_pwd.mlock_best_effort();
+                    }
                 }
                 if !self.enc_pwd.is_empty() {
                     let bits = estimate_passphrase_entropy(&self.enc_pwd);
@@ -2448,14 +2916,16 @@ impl UnigenApp {
                         .map(|p| p.display().to_string())
                         .unwrap_or_else(|| "(no file selected)".to_string());
                     ui.label(label);
-                    if ui.button("Browse…").clicked() {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .set_title("Select encrypted file")
-                            .add_filter("Encrypted files", &["enc"])
-                            .pick_file()
-                        {
-                            self.dec_file = Some(path);
-                        }
+                    if ui
+                        .add_enabled(self.pending_pick.is_none(), egui::Button::new("Browse…"))
+                        .clicked()
+                    {
+                        self.spawn_dialog(PendingPick::DecryptSelectFile, || {
+                            rfd::FileDialog::new()
+                                .set_title("Select encrypted file")
+                                .add_filter("Encrypted files", &["enc"])
+                                .pick_file()
+                        });
                     }
                 });
 
@@ -2463,6 +2933,10 @@ impl UnigenApp {
                 let resp = ui.add(egui::TextEdit::singleline(&mut self.dec_pwd).password(true));
                 if resp.changed() {
                     self.dec_pwd_last_edit = Instant::now();
+                    #[cfg(target_os = "linux")]
+                    if self.linux_try_exclusion {
+                        self.dec_pwd.mlock_best_effort();
+                    }
                 }
                 ui.checkbox(
                     &mut self.dec_pwd_autoclear,
@@ -2497,22 +2971,13 @@ impl UnigenApp {
                         .map(|p| p.display().to_string())
                         .unwrap_or_else(|| "(no file selected)".to_string());
                     ui.label(label);
-                    if ui.button("Browse…").clicked() {
-                        if let Some(path) = rfd::FileDialog::new().set_title("Select file to shred").pick_file() {
-                            // `pick_file()` can still return a directory on
-                            // some platforms/window managers even though it
-                            // requests a file picker. Reject it up front
-                            // with a clear message instead of letting the
-                            // user discover it only after clicking "Shred".
-                            if path.is_dir() {
-                                self.shred_target = None;
-                                self.shred_status =
-                                    "That's a folder, not a file — please pick a single file to shred.".to_string();
-                            } else {
-                                self.shred_status.clear();
-                                self.shred_target = Some(path);
-                            }
-                        }
+                    if ui
+                        .add_enabled(self.pending_pick.is_none(), egui::Button::new("Browse…"))
+                        .clicked()
+                    {
+                        self.spawn_dialog(PendingPick::ShredSelectFile, || {
+                            rfd::FileDialog::new().set_title("Select file to shred").pick_file()
+                        });
                     }
                 });
 
@@ -2571,16 +3036,19 @@ impl UnigenApp {
 
         if !self.editor_open {
             ui.horizontal(|ui| {
-                if ui.button("Open .enc file to edit…").clicked() {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .set_title("Select encrypted password file to edit")
-                        .add_filter("Encrypted files", &["enc"])
-                        .pick_file()
-                    {
-                        self.editor_open_target = Some(path);
-                        self.editor_open_error.clear();
-                        self.editor_open_prompt = true;
-                    }
+                if ui
+                    .add_enabled(
+                        self.pending_pick.is_none(),
+                        egui::Button::new("Open .enc file to edit…"),
+                    )
+                    .clicked()
+                {
+                    self.spawn_dialog(PendingPick::EditorSelectFile, || {
+                        rfd::FileDialog::new()
+                            .set_title("Select encrypted password file to edit")
+                            .add_filter("Encrypted files", &["enc"])
+                            .pick_file()
+                    });
                 }
                 ui.small("Best for small text password lists, not large streamed archives.");
             });
@@ -2588,6 +3056,11 @@ impl UnigenApp {
         }
 
         // ---- Editor is open ----
+        ui.small(
+            "Note: this file's decrypted content is only ever kept in memory, but sleep/\
+             hibernate can still write RAM (including this) to disk — close the editor before \
+             letting the machine sleep if that matters for this file.",
+        );
         ui.horizontal(|ui| {
             if let Some(p) = &self.editor_source {
                 ui.label(format!("Editing: {}", p.display()));
