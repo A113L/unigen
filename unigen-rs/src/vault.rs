@@ -246,20 +246,19 @@ pub fn change_master_password(
 /// place instead of scattered across call sites that build `VaultEntry`
 /// directly (and would each need to remember to fill in `id`/timestamps).
 pub struct ImportedRow {
-    pub title: String,
-    pub username: String,
-    pub password: String,
-    pub url: String,
-    pub notes: String,
+    pub title: SecretString,
+    pub username: SecretString,
+    pub password: SecretString,
+    pub url: SecretString,
+    pub notes: SecretString,
 }
 
-// Imported rows carry plaintext passwords from another password
-// manager's export until they're folded into a `VaultEntry`. This impl
-// lets a caller explicitly scrub a row it's discarding (e.g. on a parse
-// error, or a row a future filter step decides not to import) — it's
-// deliberately *not* wired up as `Drop`, because `into_entry` below
-// needs to move fields out of `self`, which Rust disallows for any type
-// that implements `Drop`.
+// Imported rows keep all mapped fields in SecretString from the moment
+// the parser finishes each row. This impl lets a caller explicitly scrub
+// a row it's discarding (e.g. on a parse error, or a row a future filter
+// step decides not to import) — it's deliberately *not* wired up as
+// `Drop`, because `into_entry` below needs to move fields out of `self`,
+// which Rust disallows for any type that implements `Drop`.
 impl Zeroize for ImportedRow {
     fn zeroize(&mut self) {
         self.title.zeroize();
@@ -275,15 +274,16 @@ impl ImportedRow {
         let now = now_unix();
         VaultEntry {
             id,
-            // `From<String> for SecretString` copies into the new
-            // controlled buffer and zeroizes the source `String`'s
-            // buffer afterward, so the plaintext CSV-parsed field
-            // doesn't linger unzeroized once it's folded into the entry.
-            title: self.title.into(),
-            username: self.username.into(),
-            password: self.password.into(),
-            url: self.url.into(),
-            notes: self.notes.into(),
+            // Fields are already SecretString, so the import staging vector
+            // never has to hand a plaintext String to the vault entry layer.
+            // Moving these values transfers ownership of their controlled,
+            // wipe-on-relocation buffers without creating another plaintext
+            // allocation.
+            title: self.title,
+            username: self.username,
+            password: self.password,
+            url: self.url,
+            notes: self.notes,
             created_at: now,
             updated_at: now,
         }
@@ -469,7 +469,7 @@ pub fn parse_csv(contents: &str, source: CsvSource) -> Result<Vec<ImportedRow>> 
         if line.trim().is_empty() {
             continue;
         }
-        let fields = split_csv_line(line);
+        let mut fields = split_csv_line(line);
         let mut title = get(&fields, title_i);
         let username = get(&fields, user_i);
         let password = get(&fields, pass_i);
@@ -506,12 +506,17 @@ pub fn parse_csv(contents: &str, source: CsvSource) -> Result<Vec<ImportedRow>> 
         }
 
         rows.push(ImportedRow {
-            title,
-            username,
-            password,
-            url,
-            notes,
+            title: title.into(),
+            username: username.into(),
+            password: password.into(),
+            url: url.into(),
+            notes: notes.into(),
         });
+        // `get()` necessarily creates owned String temporaries because the
+        // CSV parser works on borrowed input. Fold them into SecretString
+        // above, then scrub every parser field immediately so the per-row
+        // staging vector cannot retain plaintext after the row is built.
+        fields.iter_mut().for_each(|field| field.zeroize());
     }
     Ok(rows)
 }
@@ -631,18 +636,18 @@ mod tests {
         let mut entries: Vec<Box<VaultEntry>> = Vec::new();
         let rows = vec![
             ImportedRow {
-                title: "a".to_string(),
-                username: "ua".to_string(),
-                password: "pa".to_string(),
-                url: "".to_string(),
-                notes: "".to_string(),
+                title: "a".into(),
+                username: "ua".into(),
+                password: "pa".into(),
+                url: "".into(),
+                notes: "".into(),
             },
             ImportedRow {
-                title: "b".to_string(),
-                username: "ub".to_string(),
-                password: "pb".to_string(),
-                url: "".to_string(),
-                notes: "".to_string(),
+                title: "b".into(),
+                username: "ub".into(),
+                password: "pb".into(),
+                url: "".into(),
+                notes: "".into(),
             },
         ];
         let added = append_imported(&mut entries, rows);
