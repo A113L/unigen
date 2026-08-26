@@ -1153,13 +1153,39 @@ impl UnigenApp {
             ui.label("Title");
             ui.text_edit_singleline(&mut self.vault_edit_title);
             ui.label("Username");
-            ui.text_edit_singleline(&mut self.vault_edit_username);
+            let user_resp = ui.text_edit_singleline(&mut self.vault_edit_username);
+            let mut user_copy: Option<SecretString> = None;
+            user_resp.context_menu(|ui| {
+                if ui.button("Copy").clicked() {
+                    user_copy = Some(self.vault_edit_username.clone());
+                    ui.close_menu();
+                }
+            });
+            if let Some(v) = user_copy {
+                self.copy_to_clipboard(&v);
+            }
             ui.label("Password");
             ui.horizontal(|ui| {
-                ui.add(
+                let pwd_field_resp = ui.add(
                     egui::TextEdit::singleline(&mut self.vault_edit_password)
                         .password(!self.vault_reveal_password),
                 );
+                // Right-click "Copy" as an alternative to the "Copy" button / Ctrl+C.
+                // Deliberately calls the same `copy_to_clipboard` used by the button
+                // (respects the auto-clear toggle/timer) rather than doing a raw
+                // clipboard write, so the field stays masked when hidden and the
+                // auto-clear guarantee still applies regardless of how the copy
+                // was triggered.
+                let mut ctx_copy: Option<SecretString> = None;
+                pwd_field_resp.context_menu(|ui| {
+                    if ui.button("Copy").clicked() {
+                        ctx_copy = Some(self.vault_edit_password.clone());
+                        ui.close_menu();
+                    }
+                });
+                if let Some(pwd) = ctx_copy {
+                    self.copy_to_clipboard(&pwd);
+                }
                 if ui
                     .button(if self.vault_reveal_password {
                         "Hide"
@@ -1189,9 +1215,30 @@ impl UnigenApp {
                 }
             });
             ui.label("URL");
-            ui.text_edit_singleline(&mut self.vault_edit_url);
+            let url_resp = ui.text_edit_singleline(&mut self.vault_edit_url);
+            let mut url_copy: Option<SecretString> = None;
+            url_resp.context_menu(|ui| {
+                if ui.button("Copy").clicked() {
+                    url_copy = Some(self.vault_edit_url.clone());
+                    ui.close_menu();
+                }
+            });
+            if let Some(v) = url_copy {
+                self.copy_to_clipboard(&v);
+            }
             ui.label("Notes");
-            ui.add(egui::TextEdit::multiline(&mut self.vault_edit_notes).desired_rows(4));
+            let notes_resp =
+                ui.add(egui::TextEdit::multiline(&mut self.vault_edit_notes).desired_rows(4));
+            let mut notes_copy: Option<SecretString> = None;
+            notes_resp.context_menu(|ui| {
+                if ui.button("Copy").clicked() {
+                    notes_copy = Some(self.vault_edit_notes.clone());
+                    ui.close_menu();
+                }
+            });
+            if let Some(v) = notes_copy {
+                self.copy_to_clipboard(&v);
+            }
 
             ui.horizontal(|ui| {
                 let has_title = !self.vault_edit_title.trim().is_empty();
@@ -2720,7 +2767,21 @@ impl UnigenApp {
                                         {
                                             to_copy = Some(pwd.as_str().to_owned());
                                         }
-                                        ui.monospace(format!("#{}: {}", i + 1, pwd.as_str()));
+                                        let label_resp =
+                                            ui.monospace(format!("#{}: {}", i + 1, pwd.as_str()));
+                                        // Right-click menu as an alternative to the "Copy"
+                                        // button / Ctrl+C. Routed through the same
+                                        // `to_copy` + `copy_to_clipboard_20s` path used by
+                                        // the button above, so it gets the identical
+                                        // always-auto-clear behaviour — this is just another
+                                        // entry point into the existing secure copy, not a
+                                        // separate unguarded clipboard write.
+                                        label_resp.context_menu(|ui| {
+                                            if ui.button("Copy").clicked() {
+                                                to_copy = Some(pwd.as_str().to_owned());
+                                                ui.close_menu();
+                                            }
+                                        });
                                     });
                                 }
                                 if let Some(pwd) = to_copy {
@@ -3166,18 +3227,36 @@ impl UnigenApp {
                         ui.small("No matches.");
                     } else {
                         for (line_no, line) in &matches {
-                            ui.horizontal(|ui| {
-                                if ui.button("Copy").on_hover_text(format!("Copy just the password (the first word on the line); auto-clears from the clipboard in {}s.", self.autoclear_seconds)).clicked() {
-                                    to_copy = Some(password_part(line));
-                                }
-                                ui.add(
-                                    egui::Label::new(
-                                        egui::RichText::new(format!("{:>4}: {line}", line_no + 1))
-                                            .font(egui::FontId::monospace(13.0)),
-                                    )
-                                    .selectable(true),
-                                );
-                            });
+                                ui.horizontal(|ui| {
+                                    if ui.button("Copy").on_hover_text(format!("Copy just the password (the first word on the line); auto-clears from the clipboard in {}s.", self.autoclear_seconds)).clicked() {
+                                        to_copy = Some(password_part(line));
+                                    }
+                                    let line_resp = ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(format!("{:>4}: {line}", line_no + 1))
+                                                .font(egui::FontId::monospace(13.0)),
+                                        )
+                                        .selectable(true),
+                                    );
+                                    // Right-click menu mirroring the "Copy" button above:
+                                    // "Copy password" copies just the first word (via the
+                                    // same auto-clearing path as the button), "Copy line"
+                                    // copies the whole displayed line (label + password) for
+                                    // when the surrounding comment/label is also wanted —
+                                    // that one still auto-clears too, since anything copied
+                                    // out of a decrypted password file is sensitive.
+                                    let full_line = line.clone();
+                                    line_resp.context_menu(|ui| {
+                                        if ui.button("Copy password").clicked() {
+                                            to_copy = Some(password_part(&full_line));
+                                            ui.close_menu();
+                                        }
+                                        if ui.button("Copy line").clicked() {
+                                            to_copy = Some(full_line.clone());
+                                            ui.close_menu();
+                                        }
+                                    });
+                                });
                         }
                     }
                 });
@@ -3188,17 +3267,39 @@ impl UnigenApp {
             // Below a certain length this used to give a cramped ~120px
             // box; now that the window is taller by default (see main())
             // it gets a proper full-height editing area.
+            let mut editor_resp_opt = None;
             egui::ScrollArea::vertical()
                 .id_source("editor_main_scroll")
                 .max_height(340.0)
                 .show(ui, |ui| {
-                    ui.add(
+                    let r = ui.add(
                         egui::TextEdit::multiline(&mut self.editor_content)
                             .font(egui::TextStyle::Monospace)
                             .desired_rows(10)
                             .desired_width(f32::INFINITY),
                     );
+                    editor_resp_opt = Some(r);
                 });
+            // Selecting text inside the box and using the built-in
+            // Ctrl+C/right-click-select already works via egui's own
+            // TextEdit handling. This adds a plain right-click "Copy all"
+            // for grabbing the whole decrypted buffer without having to
+            // select-all first — routed through the same auto-clearing
+            // `copy_to_clipboard_20s` as the rest of the editor's copy
+            // actions, since this is decrypted file content.
+            if let Some(r) = editor_resp_opt {
+                let mut copy_all = false;
+                r.context_menu(|ui| {
+                    if ui.button("Copy all").clicked() {
+                        copy_all = true;
+                        ui.close_menu();
+                    }
+                });
+                if copy_all {
+                    let text = self.editor_content.as_str().to_owned();
+                    self.copy_to_clipboard_20s(&text);
+                }
+            }
         }
 
         if !self.editor_status.is_empty() {
