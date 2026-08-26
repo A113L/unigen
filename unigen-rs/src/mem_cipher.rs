@@ -127,11 +127,16 @@ pub fn apply_keystream(nonce: &[u8; NONCE_LEN], buf: &mut [u8]) {
     if buf.is_empty() {
         return;
     }
-    // `Key::try_from` (rather than the deprecated `Key::from_slice`) —
-    // panics via `.expect` on a length mismatch, which can't happen here
-    // since `MemKey` always allocates exactly `KEY_LEN` (32) bytes.
-    let key = Key::try_from(key().as_slice()).expect("MemKey: key is always KEY_LEN bytes");
-    let mut cipher = ChaCha20::new(&key, nonce.into());
+    // `Key` (a `GenericArray<u8, U32>`) only converts from a *fixed-size*
+    // `&[u8; 32]`, not an arbitrary `&[u8]` — so go through `try_into` to
+    // get there. `.expect` never fires: `MemKey` always allocates exactly
+    // `KEY_LEN` (32) bytes.
+    let key_arr: &[u8; KEY_LEN] = key()
+        .as_slice()
+        .try_into()
+        .expect("MemKey: key is always KEY_LEN bytes");
+    let key: &Key = key_arr.into();
+    let mut cipher = ChaCha20::new(key, nonce.into());
     cipher.apply_keystream(buf);
 }
 
