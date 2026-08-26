@@ -538,6 +538,228 @@ impl<'de> Deserialize<'de> for SecretString {
     }
 }
 
+/// A secret held **encrypted at rest** in RAM, decrypted only into a
+/// short-lived `SecretString` at the moment it's actually needed.
+///
+/// `SecretString` protects a value from leaving stray unzeroized copies
+/// behind as it's edited — but a value that's simply *sitting* in memory,
+/// like every vault entry's password for the whole time the vault stays
+/// unlocked, is still plain readable UTF-8 at a fixed address for that
+/// entire window. `LockedSecret` closes that gap the way KeePass's
+/// "protected memory" does: the bytes are XOR'd with a per-value ChaCha20
+/// keystream (see `mem_cipher`) whose key lives in an `mlock`ed
+/// allocation, so a memory dump / debugger attach / swapped page sees
+/// ciphertext, not the password.
+///
+/// This is a lightweight *obfuscation-at-rest* layer against passive
+/// memory inspection — not a replacement for the AES-256-GCM envelope
+/// that protects the vault file on disk (`crypto.rs`/`vault.rs`), and not
+/// a defense against an attacker who can already execute code in this
+/// process (they can just call `reveal()` too, or read the key). Its
+/// value is narrowing the window and the surface: instead of every
+/// entry's plaintext password living in RAM for the whole unlocked
+/// session, only the brief `reveal()`'d copy does — and that copy is
+/// itself a `SecretString`, so it gets the same wipe-on-relocate/drop
+/// guarantees as everything else in this module.
+pub struct LockedSecret {
+    /// ChaCha20 ciphertext, same length as the plaintext (stream cipher).
+    /// Stored in a `SecretBytes` too: it's not sensitive on its own, but
+    /// defense in depth is cheap here and it keeps the "never leave a
+    /// stray copy behind on reallocation" guarantee uniform across every
+    /// secret-shaped buffer in this module.
+    ciphertext: SecretBytes,
+    nonce: [u8; crate::mem_cipher::NONCE_LEN],
+    len: usize,
+}
+
+impl LockedSecret {
+    /// Encrypt-and-store `s` without disturbing the source. Used at call
+    /// sites that still need their own `&str`/`SecretString` afterwards
+    /// (e.g. copying an edit-pane buffer into the entry while leaving the
+    /// buffer itself in place for further edits).
+    pub fn from_str(s: &str) -> Self {
+        let nonce = crate::mem_cipher::random_nonce();
+        let mut ciphertext = SecretBytes::with_capacity(s.len());
+        ciphertext.push_slice(s.as_bytes());
+        if ciphertext.len > 0 {
+            // SAFETY: `ciphertext.ptr` is valid for `ciphertext.len`
+            // bytes, just written above by `push_slice`.
+            let slice =
+                unsafe { std::slice::from_raw_parts_mut(ciphertext.ptr.as_ptr(), ciphertext.len) };
+            crate::mem_cipher::apply_keystream(&nonce, slice);
+        }
+        let len = ciphertext.len;
+        Self {
+            ciphertext,
+            nonce,
+            len,
+        }
+    }
+
+    /// Encrypt-and-store `plain`, consuming it. Cheaper than
+    /// `from_str(plain.as_str())` followed by a manual zeroize: the
+    /// plaintext buffer is encrypted in place and its allocation is
+    /// reused directly as the ciphertext buffer, so this never makes a
+    /// second copy of the plaintext bytes.
+    pub fn seal(mut plain: SecretString) -> Self {
+        let nonce = crate::mem_cipher::random_nonce();
+        // Steal `plain`'s backing buffer; leave `plain` holding an empty
+        // (dangling, cap 0) one so its `Drop` is a no-op when it runs.
+        let ciphertext = std::mem::replace(&mut plain.bytes, SecretBytes::new());
+        if ciphertext.len > 0 {
+            // SAFETY: `ciphertext.ptr` is valid for `ciphertext.len`
+            // bytes (invariant carried over from `plain`).
+            let slice =
+                unsafe { std::slice::from_raw_parts_mut(ciphertext.ptr.as_ptr(), ciphertext.len) };
+            crate::mem_cipher::apply_keystream(&nonce, slice);
+        }
+        let len = ciphertext.len;
+        Self {
+            ciphertext,
+            nonce,
+            len,
+        }
+    }
+
+    /// Decrypt into a fresh, independent `SecretString`. Does not modify
+    /// `self` — the value stays encrypted at rest; only the returned copy
+    /// is plaintext, and it carries the same wipe guarantees as any other
+    /// `SecretString` (zeroized on drop or reallocation).
+    pub fn reveal(&self) -> SecretString {
+        let mut bytes = SecretBytes::with_capacity(self.len);
+        if self.len > 0 {
+            bytes.push_slice(self.ciphertext.as_slice());
+            // SAFETY: `bytes.ptr` is valid for `bytes.len` (== self.len)
+            // bytes, just copied above.
+            let slice = unsafe { std::slice::from_raw_parts_mut(bytes.ptr.as_ptr(), bytes.len) };
+            crate::mem_cipher::apply_keystream(&self.nonce, slice);
+        }
+        SecretString { bytes }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+}
+
+impl Default for LockedSecret {
+    fn default() -> Self {
+        Self {
+            ciphertext: SecretBytes::new(),
+            nonce: [0u8; crate::mem_cipher::NONCE_LEN],
+            len: 0,
+        }
+    }
+}
+
+/// Cloning a `LockedSecret` copies the ciphertext bytes and reuses the
+/// same nonce — this does *not* encrypt anything new under that nonce
+/// (which would be the usual nonce-reuse hazard), it just duplicates an
+/// existing (key, nonce, ciphertext) triple, so it decrypts to the same
+/// plaintext without ever touching the plaintext itself.
+impl Clone for LockedSecret {
+    fn clone(&self) -> Self {
+        Self {
+            ciphertext: self.ciphertext.clone_secret(),
+            nonce: self.nonce,
+            len: self.len,
+        }
+    }
+}
+
+impl fmt::Debug for LockedSecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "LockedSecret(REDACTED, len={})", self.len)
+    }
+}
+
+impl Zeroize for LockedSecret {
+    fn zeroize(&mut self) {
+        self.ciphertext.zeroize_in_place();
+        self.nonce = [0u8; crate::mem_cipher::NONCE_LEN];
+        self.len = 0;
+    }
+}
+
+/// On-disk / in-transit representation is still the plain string — the
+/// vault's own AES-256-GCM envelope is what protects it at rest on disk
+/// (see `vault.rs`); `LockedSecret` only governs how it sits in RAM
+/// between that envelope and the UI. Serializing briefly reveals the
+/// plaintext to hand to the serializer, the same way any encrypted field
+/// must eventually be plaintext for the moment it's written into the JSON
+/// payload that then gets encrypted as a whole.
+impl Serialize for LockedSecret {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.reveal().as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for LockedSecret {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        Ok(LockedSecret::seal(SecretString::from(s)))
+    }
+}
+
+#[cfg(test)]
+mod locked_secret_tests {
+    use super::*;
+
+    #[test]
+    fn seal_then_reveal_round_trips() {
+        let locked = LockedSecret::from_str("correct horse battery staple");
+        assert_eq!(locked.reveal().as_str(), "correct horse battery staple");
+    }
+
+    #[test]
+    fn ciphertext_does_not_contain_plaintext_bytes() {
+        let plain = "hunter2hunter2hunter2";
+        let locked = LockedSecret::from_str(plain);
+        assert_ne!(locked.ciphertext.as_slice(), plain.as_bytes());
+    }
+
+    #[test]
+    fn seal_consumes_source_without_extra_copy_and_round_trips() {
+        let source = SecretString::from_str("swordfish");
+        let locked = LockedSecret::seal(source);
+        assert_eq!(locked.reveal().as_str(), "swordfish");
+    }
+
+    #[test]
+    fn clone_reveals_to_same_plaintext() {
+        let a = LockedSecret::from_str("clone me");
+        let b = a.clone();
+        assert_eq!(a.reveal().as_str(), b.reveal().as_str());
+    }
+
+    #[test]
+    fn zeroize_clears_length_and_ciphertext() {
+        let mut locked = LockedSecret::from_str("wipeme");
+        locked.zeroize();
+        assert!(locked.is_empty());
+        assert_eq!(locked.reveal().as_str(), "");
+    }
+
+    #[test]
+    fn empty_secret_round_trips() {
+        let locked = LockedSecret::from_str("");
+        assert!(locked.is_empty());
+        assert_eq!(locked.reveal().as_str(), "");
+    }
+
+    #[test]
+    fn serde_round_trip() {
+        let locked = LockedSecret::from_str("hunter2");
+        let json = serde_json::to_string(&locked).unwrap();
+        let back: LockedSecret = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.reveal().as_str(), "hunter2");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
