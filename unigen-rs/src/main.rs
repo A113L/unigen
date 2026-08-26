@@ -5,6 +5,7 @@
 //! format with AAD, unique per-run temp file names, real passphrase
 //! zeroization).
 
+mod secure_alloc;
 mod charsets;
 mod crypto;
 mod secret;
