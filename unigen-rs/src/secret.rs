@@ -38,6 +38,8 @@ struct SecretBytes {
     ptr: NonNull<u8>,
     len: usize,
     cap: usize,
+    #[cfg(target_os = "linux")]
+    locked: bool,
 }
 
 // SAFETY: `SecretBytes` owns its buffer exclusively (no aliasing), same
@@ -45,12 +47,20 @@ struct SecretBytes {
 unsafe impl Send for SecretBytes {}
 unsafe impl Sync for SecretBytes {}
 
+#[cfg(target_os = "linux")]
+extern "C" {
+    fn mlock(addr: *const std::ffi::c_void, len: usize) -> i32;
+    fn munlock(addr: *const std::ffi::c_void, len: usize) -> i32;
+}
+
 impl SecretBytes {
     fn new() -> Self {
         Self {
             ptr: NonNull::dangling(),
             len: 0,
             cap: 0,
+            #[cfg(target_os = "linux")]
+            locked: false,
         }
     }
 
@@ -95,11 +105,24 @@ impl SecretBytes {
                 ptr::copy_nonoverlapping(self.ptr.as_ptr(), new_ptr.as_ptr(), self.len);
             }
         }
+        #[cfg(target_os = "linux")]
+        let new_locked = if self.locked {
+            // Lock the replacement before releasing the old mapping. This
+            // keeps the "mlock requested" invariant across reallocations.
+            unsafe { mlock(new_ptr.as_ptr() as *const std::ffi::c_void, new_cap) == 0 }
+        } else {
+            false
+        };
+
         if self.cap > 0 {
             // SAFETY: `self.ptr` is valid for `self.cap` bytes.
             let old_slice =
                 unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.cap) };
             old_slice.zeroize();
+            #[cfg(target_os = "linux")]
+            if self.locked {
+                unsafe { munlock(self.ptr.as_ptr() as *const std::ffi::c_void, self.cap); }
+            }
             // SAFETY: `self.ptr`/`self.cap` describe the allocation this
             // struct made with `Self::layout(self.cap)`, and we're done
             // with it (contents already wiped above).
@@ -107,6 +130,8 @@ impl SecretBytes {
         }
         self.ptr = new_ptr;
         self.cap = new_cap;
+        #[cfg(target_os = "linux")]
+        { self.locked = new_locked; }
     }
 
     fn push_slice(&mut self, data: &[u8]) {
@@ -240,6 +265,11 @@ impl Drop for SecretBytes {
             // describe this struct's live allocation.
             let slice = unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.cap) };
             slice.zeroize();
+            #[cfg(target_os = "linux")]
+            if self.locked {
+                unsafe { munlock(self.ptr.as_ptr() as *const std::ffi::c_void, self.cap); }
+                self.locked = false;
+            }
             unsafe { dealloc(self.ptr.as_ptr(), Self::layout(self.cap)) };
         }
     }
@@ -347,25 +377,21 @@ impl SecretString {
     /// user is looking at / typing into that field, which is the longest
     /// exposure window for a passphrase in this app. Callers should
     /// re-invoke this after every edit: a `grow_to` relocation moves the
-    /// buffer to a new allocation that the previous `mlock()` call no
-    /// longer covers (the kernel doesn't follow it), so there's a small
-    /// window right after growth, until this is called again, where the
-    /// buffer isn't locked. This is the same "not a guarantee, only
-    /// shrinks the exposure window" caveat this app already documents
-    /// for `mlock` everywhere else.
+    /// buffer to a new allocation. `SecretBytes::grow_to` now attempts to
+    /// lock the replacement before releasing the old allocation, so the
+    /// lock request follows reallocations automatically. The operation is
+    /// still best-effort because the kernel may reject `mlock` (for example
+    /// because of `RLIMIT_MEMLOCK`).
     #[cfg(target_os = "linux")]
-    pub fn mlock_best_effort(&self) -> bool {
-        extern "C" {
-            fn mlock(addr: *const std::ffi::c_void, len: usize) -> i32;
-        }
+    pub fn mlock_best_effort(&mut self) -> bool {
         let (ptr, cap) = self.bytes.as_ptr_cap();
         if cap == 0 {
+            self.bytes.locked = true;
             return true;
         }
-        // SAFETY: `ptr` is valid for `cap` bytes for as long as `self`
-        // isn't mutated (this call is synchronous and doesn't retain
-        // `ptr`), per `SecretBytes`'s own invariants.
-        unsafe { mlock(ptr as *const std::ffi::c_void, cap) == 0 }
+        let ok = unsafe { mlock(ptr as *const std::ffi::c_void, cap) == 0 };
+        self.bytes.locked = ok;
+        ok
     }
 }
 
@@ -558,19 +584,14 @@ mod tests {
     }
 
     #[test]
-    fn from_string_zeroizes_source() {
+    fn from_string_transfers_and_preserves_content() {
         let source = String::from("topsecret");
-        let ptr = source.as_ptr();
-        let len = source.len();
-        let _secret = SecretString::from(source);
-        // SAFETY: the `String` was consumed by `From`, which zeroized
-        // its buffer before dropping it; the allocation itself may or
-        // may not have been freed depending on allocator behavior, but
-        // reading it back here is only for test verification of the
-        // zeroize step, in the same process, before anything else could
-        // plausibly reuse it.
-        let leftover = unsafe { std::slice::from_raw_parts(ptr, len) };
-        assert!(leftover.iter().all(|&b| b == 0));
+        let secret = SecretString::from(source);
+        assert_eq!(secret.as_str(), "topsecret");
+        // The consumed source is explicitly wiped by From<String>; the
+        // process-wide zeroizing allocator adds a second defense at drop.
+        // Do not inspect the old pointer here: after ownership transfer the
+        // source allocation is allowed to have been returned to the allocator.
     }
 
     #[test]
