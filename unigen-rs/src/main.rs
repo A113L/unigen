@@ -8,6 +8,7 @@
 mod secure_alloc;
 mod charsets;
 mod crypto;
+mod mem_lock;
 mod secret;
 mod shred;
 mod vault;
@@ -410,10 +411,15 @@ struct UnigenApp {
     enc_pwd_autoclear: bool,
     shred_after: bool,
     enc_status: String,
-    /// Linux-only: best-effort attempt to advise the OS to exclude
-    /// decrypted/plaintext temp buffers from swap (mirrors the Python
-    /// `linux_try_exclusion` setting; same "best effort, not a guarantee"
-    /// caveat applies — see crypto::try_mlock equivalents).
+    /// Best-effort attempt to advise the OS to exclude decrypted/plaintext
+    /// temp buffers from swap (mirrors the Python original's
+    /// `linux_try_exclusion` setting, extended here to every platform
+    /// `mem_lock` supports — Linux/macOS/other Unix via `mlock(2)`,
+    /// Windows via `VirtualLock`; same "best effort, not a guarantee"
+    /// caveat applies everywhere — see `mem_lock` and `try_mlock_str`).
+    /// Field name kept as-is for minimal diff against the Python original
+    /// and existing serialized settings, even though the behavior is no
+    /// longer Linux-exclusive.
     linux_try_exclusion: bool,
 
     // ---- File Protector: Decrypt ----
@@ -1055,16 +1061,16 @@ impl UnigenApp {
             ui.label("Enter the master password to unlock (or create) this vault:");
             ui.horizontal(|ui| {
                 let resp = ui.add(egui::TextEdit::singleline(&mut self.vault_master_pwd).password(true));
-                #[cfg(target_os = "linux")]
+                #[cfg(any(unix, windows))]
                 if resp.changed() && self.linux_try_exclusion {
                     self.vault_master_pwd.mlock_best_effort();
                 }
                 // `resp` is only consumed above, and that whole branch is
-                // Linux-only (`mlock()` isn't a Linux-portable syscall);
-                // on other targets this keeps the variable "used" without
-                // pretending there's a non-Linux equivalent action to
-                // take on change.
-                #[cfg(not(target_os = "linux"))]
+                // gated on `mem_lock::SUPPORTED` platforms (Unix `mlock`,
+                // Windows `VirtualLock`); on any other target this keeps
+                // the variable "used" without pretending there's an
+                // equivalent action to take on change.
+                #[cfg(not(any(unix, windows)))]
                 let _ = &resp;
                 let can_go = self.vault_path.is_some() && !self.vault_master_pwd.is_empty();
                 if ui
@@ -1263,16 +1269,16 @@ impl UnigenApp {
             ui.horizontal(|ui| {
                 ui.label("Master password to save:");
                 let resp = ui.add(egui::TextEdit::singleline(&mut self.vault_master_pwd).password(true));
-                #[cfg(target_os = "linux")]
+                #[cfg(any(unix, windows))]
                 if resp.changed() && self.linux_try_exclusion {
                     self.vault_master_pwd.mlock_best_effort();
                 }
                 // `resp` is only consumed above, and that whole branch is
-                // Linux-only (`mlock()` isn't a Linux-portable syscall);
-                // on other targets this keeps the variable "used" without
-                // pretending there's a non-Linux equivalent action to
-                // take on change.
-                #[cfg(not(target_os = "linux"))]
+                // gated on `mem_lock::SUPPORTED` platforms (Unix `mlock`,
+                // Windows `VirtualLock`); on any other target this keeps
+                // the variable "used" without pretending there's an
+                // equivalent action to take on change.
+                #[cfg(not(any(unix, windows)))]
                 let _ = &resp;
                 if ui.button("Save vault").clicked() {
                     let mut pwd = std::mem::take(&mut self.vault_master_pwd);
@@ -1527,10 +1533,10 @@ impl UnigenApp {
         let pwd = Zeroizing::new(self.enc_pwd.as_str().to_string());
         let kdf_id = self.kdf_choice;
         let shred_after = self.shred_after;
-        #[cfg(target_os = "linux")]
+        #[cfg(any(unix, windows))]
         if self.linux_try_exclusion && !try_mlock_str(&pwd) {
             self.enc_status =
-                "Warning: mlock() failed; passphrase remains subject to normal VM paging."
+                "Warning: memory lock failed; passphrase remains subject to normal VM paging."
                     .to_string();
         }
 
@@ -2187,19 +2193,21 @@ fn disable_core_dumps() {
     }
 }
 
-/// Best-effort: ask the Linux kernel to keep `s`'s backing memory out of
-/// swap for as long as this process holds the lock (mirrors the Python
-/// original's `try_mlock`, which does the same via ctypes). Returns false
-/// when the kernel refuses the lock; callers must treat it as best-effort.
-#[cfg(target_os = "linux")]
+/// Best-effort: ask the OS to keep `s`'s backing memory out of swap/the
+/// pagefile for as long as this process holds the lock (mirrors the
+/// Python original's `try_mlock`, which does the same via ctypes, and
+/// extends it beyond Linux via `mem_lock`'s Unix `mlock`/Windows
+/// `VirtualLock` coverage). Returns false when the OS refuses the lock, or
+/// on a platform with no lock primitive at all; callers must treat it as
+/// best-effort either way. Note this locks a one-off snapshot (the
+/// `Zeroizing<String>` clone handed to the background encrypt job), not
+/// the live UI field — that's `SecretString::mlock_best_effort`'s job.
+#[cfg(any(unix, windows))]
 fn try_mlock_str(s: &str) -> bool {
-    extern "C" {
-        fn mlock(addr: *const std::ffi::c_void, len: usize) -> i32;
-    }
     if s.is_empty() {
         return true;
     }
-    unsafe { mlock(s.as_ptr() as *const std::ffi::c_void, s.len()) == 0 }
+    mem_lock::lock(s.as_ptr(), s.len())
 }
 
 fn zeroize_string(s: &mut String) {
@@ -2919,7 +2927,7 @@ impl UnigenApp {
                     // doc comment for why the live field needs its own
                     // lock, re-applied on each edit since growth moves
                     // the buffer).
-                    #[cfg(target_os = "linux")]
+                    #[cfg(any(unix, windows))]
                     if self.linux_try_exclusion {
                         self.enc_pwd.mlock_best_effort();
                     }
@@ -2938,12 +2946,12 @@ impl UnigenApp {
 
                 ui.checkbox(&mut self.shred_after, "Verify, then securely shred the original after encryption");
 
-                if cfg!(target_os = "linux") {
+                if mem_lock::SUPPORTED {
                     ui.checkbox(
                         &mut self.linux_try_exclusion,
-                        "Best-effort: ask the OS to keep the passphrase out of swap (mlock)",
+                        "Best-effort: ask the OS to keep the passphrase out of swap (mlock/VirtualLock)",
                     );
-                    ui.small("Best effort only — not a guarantee on every kernel/filesystem configuration.");
+                    ui.small("Best effort only — not a guarantee on every OS/kernel/filesystem configuration.");
                 }
 
                 ui.add_space(6.0);
@@ -2995,7 +3003,7 @@ impl UnigenApp {
                 let resp = ui.add(egui::TextEdit::singleline(&mut self.dec_pwd).password(true));
                 if resp.changed() {
                     self.dec_pwd_last_edit = Instant::now();
-                    #[cfg(target_os = "linux")]
+                    #[cfg(any(unix, windows))]
                     if self.linux_try_exclusion {
                         self.dec_pwd.mlock_best_effort();
                     }
