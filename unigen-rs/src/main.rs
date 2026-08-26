@@ -8,6 +8,7 @@
 mod secure_alloc;
 mod charsets;
 mod crypto;
+mod mem_cipher;
 mod mem_lock;
 mod secret;
 mod shred;
@@ -21,7 +22,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
-use secret::SecretString;
+use secret::{LockedSecret, SecretString};
 use vault::VaultEntry;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -791,7 +792,11 @@ impl UnigenApp {
         if let Some(e) = self.vault_entries.iter().find(|e| e.id == id) {
             self.vault_edit_title = e.title.clone();
             self.vault_edit_username = e.username.clone();
-            self.vault_edit_password = e.password.clone();
+            // `e.password` is a `LockedSecret` (encrypted at rest in
+            // RAM); `.reveal()` decrypts it into a fresh, independent
+            // plaintext `SecretString` for the edit pane without
+            // disturbing the entry's own encrypted-at-rest copy.
+            self.vault_edit_password = e.password.reveal();
             self.vault_edit_url = e.url.clone();
             self.vault_edit_notes = e.notes.clone();
             self.vault_selected = Some(id);
@@ -835,7 +840,10 @@ impl UnigenApp {
                 // along the way.
                 e.title = SecretString::from_str(self.vault_edit_title.as_str());
                 e.username = SecretString::from_str(self.vault_edit_username.as_str());
-                e.password = SecretString::from_str(self.vault_edit_password.as_str());
+                // Re-seal into the encrypted-at-rest form on the way back
+                // out of the edit pane (see `LockedSecret`/`vault_select`
+                // above for the matching `.reveal()` on the way in).
+                e.password = LockedSecret::from_str(self.vault_edit_password.as_str());
                 e.url = SecretString::from_str(self.vault_edit_url.as_str());
                 e.notes = SecretString::from_str(self.vault_edit_notes.as_str());
                 e.updated_at = now;
@@ -849,7 +857,7 @@ impl UnigenApp {
                 id,
                 title: SecretString::from_str(self.vault_edit_title.as_str()),
                 username: SecretString::from_str(self.vault_edit_username.as_str()),
-                password: SecretString::from_str(self.vault_edit_password.as_str()),
+                password: LockedSecret::from_str(self.vault_edit_password.as_str()),
                 url: SecretString::from_str(self.vault_edit_url.as_str()),
                 notes: SecretString::from_str(self.vault_edit_notes.as_str()),
                 created_at: now,
