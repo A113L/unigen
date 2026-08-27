@@ -5,12 +5,10 @@
 //! format with AAD, unique per-run temp file names, real passphrase
 //! zeroization).
 
-mod secure_alloc;
 mod charsets;
 mod crypto;
-mod mem_cipher;
-mod mem_lock;
 mod secret;
+mod secure_text_edit;
 mod shred;
 mod vault;
 
@@ -22,7 +20,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
-use secret::{LockedSecret, SecretString};
+use secret::SecretString;
 use vault::VaultEntry;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -118,6 +116,19 @@ mod theme {
 }
 
 fn main() -> eframe::Result<()> {
+    // Wire up `log`'s output to stderr so RUST_LOG=debug (or =trace) actually
+    // shows something. Without this call, every log::warn!/error! emitted by
+    // eframe/glow/egui_glow (e.g. GL context creation details, shader
+    // compile/link failures, fallback paths taken on buggy/software
+    // drivers) has nowhere to go — the `log` crate is a facade with no
+    // effect until *some* logger implementation is installed, so the
+    // terminal stays completely silent even when something is actually
+    // going wrong internally. This was the missing piece behind "the
+    // program runs with a terminal window open but nothing is ever
+    // printed", independent of whatever the underlying rendering issue
+    // turns out to be.
+    env_logger::init();
+
     // MEMORY-RESIDUE fix: ask the kernel not to write a core dump for this
     // process. Without this, a crash (segfault, panic-induced abort, an
     // operator running `kill -SEGV`/`gcore` against the PID, etc.) can
@@ -174,6 +185,19 @@ fn main() -> eframe::Result<()> {
         // seen as tearing or stale/partial frames) on virtualized display
         // adapters that don't implement swap-interval correctly.
         vsync: false,
+        // Force the legacy GLSL 1.20 shader path instead of letting glow
+        // auto-detect a "modern" core-profile GLSL version (140+). Software
+        // rasterizers like Mesa's SVGA3D/llvmpipe backend (seen in
+        // VirtualBox VMs without real GPU passthrough) have historically
+        // buggy core-profile shader compilation/linking, which manifests as
+        // garbled/warped glyph and color rendering rather than an outright
+        // failure — exactly what the multisampling workaround above didn't
+        // fix. GLSL 1.20 uses the old compatibility-style pipeline that
+        // these software drivers handle far more reliably. This has no
+        // downside on real GPUs (AMD/NVIDIA/Intel all support GLSL 1.20
+        // trivially) so it's safe to force unconditionally rather than
+        // trying to detect "are we in a VM" at runtime.
+        shader_version: Some(eframe::egui_glow::ShaderVersion::Gl120),
         ..Default::default()
     };
     eframe::run_native(
@@ -182,6 +206,22 @@ fn main() -> eframe::Result<()> {
         Box::new(|cc| {
             theme::apply(&cc.egui_ctx, true);
             load_custom_fonts(&cc.egui_ctx);
+            // Disable "feathering" — the extra partially-transparent pixels
+            // egui's tessellator adds along shape edges (text glyphs,
+            // button rounded corners, etc.) to soften aliasing. This is an
+            // alpha-blending-heavy technique, and software GL rasterizers
+            // like Mesa's SVGA3D backend (seen in VirtualBox VMs without
+            // real GPU passthrough) have shown buggy alpha blending here —
+            // consistent with the warping being far more visible in dark
+            // mode / on saturated button colors (high contrast exposes
+            // blending errors) than in light mode (low contrast masks
+            // them). Turning feathering off makes edges very slightly more
+            // aliased/jagged on a *correctly* behaving driver, but that's a
+            // minor cosmetic trade-off, whereas on a buggy driver it should
+            // remove the warped-edge artifacts entirely since there's no
+            // blended edge pixel left to render incorrectly.
+            cc.egui_ctx
+                .tessellation_options_mut(|o| o.feathering = false);
             Ok(Box::new(UnigenApp::new()))
         }),
     )
@@ -412,15 +452,10 @@ struct UnigenApp {
     enc_pwd_autoclear: bool,
     shred_after: bool,
     enc_status: String,
-    /// Best-effort attempt to advise the OS to exclude decrypted/plaintext
-    /// temp buffers from swap (mirrors the Python original's
-    /// `linux_try_exclusion` setting, extended here to every platform
-    /// `mem_lock` supports — Linux/macOS/other Unix via `mlock(2)`,
-    /// Windows via `VirtualLock`; same "best effort, not a guarantee"
-    /// caveat applies everywhere — see `mem_lock` and `try_mlock_str`).
-    /// Field name kept as-is for minimal diff against the Python original
-    /// and existing serialized settings, even though the behavior is no
-    /// longer Linux-exclusive.
+    /// Linux-only: best-effort attempt to advise the OS to exclude
+    /// decrypted/plaintext temp buffers from swap (mirrors the Python
+    /// `linux_try_exclusion` setting; same "best effort, not a guarantee"
+    /// caveat applies — see crypto::try_mlock equivalents).
     linux_try_exclusion: bool,
 
     // ---- File Protector: Decrypt ----
@@ -792,11 +827,7 @@ impl UnigenApp {
         if let Some(e) = self.vault_entries.iter().find(|e| e.id == id) {
             self.vault_edit_title = e.title.clone();
             self.vault_edit_username = e.username.clone();
-            // `e.password` is a `LockedSecret` (encrypted at rest in
-            // RAM); `.reveal()` decrypts it into a fresh, independent
-            // plaintext `SecretString` for the edit pane without
-            // disturbing the entry's own encrypted-at-rest copy.
-            self.vault_edit_password = e.password.reveal();
+            self.vault_edit_password = e.password.clone();
             self.vault_edit_url = e.url.clone();
             self.vault_edit_notes = e.notes.clone();
             self.vault_selected = Some(id);
@@ -840,10 +871,7 @@ impl UnigenApp {
                 // along the way.
                 e.title = SecretString::from_str(self.vault_edit_title.as_str());
                 e.username = SecretString::from_str(self.vault_edit_username.as_str());
-                // Re-seal into the encrypted-at-rest form on the way back
-                // out of the edit pane (see `LockedSecret`/`vault_select`
-                // above for the matching `.reveal()` on the way in).
-                e.password = LockedSecret::from_str(self.vault_edit_password.as_str());
+                e.password = SecretString::from_str(self.vault_edit_password.as_str());
                 e.url = SecretString::from_str(self.vault_edit_url.as_str());
                 e.notes = SecretString::from_str(self.vault_edit_notes.as_str());
                 e.updated_at = now;
@@ -857,7 +885,7 @@ impl UnigenApp {
                 id,
                 title: SecretString::from_str(self.vault_edit_title.as_str()),
                 username: SecretString::from_str(self.vault_edit_username.as_str()),
-                password: LockedSecret::from_str(self.vault_edit_password.as_str()),
+                password: SecretString::from_str(self.vault_edit_password.as_str()),
                 url: SecretString::from_str(self.vault_edit_url.as_str()),
                 notes: SecretString::from_str(self.vault_edit_notes.as_str()),
                 created_at: now,
@@ -1068,17 +1096,17 @@ impl UnigenApp {
         if !self.vault_unlocked {
             ui.label("Enter the master password to unlock (or create) this vault:");
             ui.horizontal(|ui| {
-                let resp = ui.add(egui::TextEdit::singleline(&mut self.vault_master_pwd).password(true));
-                #[cfg(any(unix, windows))]
+                let resp = ui.add(secure_text_edit::SecurePasswordEdit::new("vault_master_pwd", &mut self.vault_master_pwd));
+                #[cfg(target_os = "linux")]
                 if resp.changed() && self.linux_try_exclusion {
                     self.vault_master_pwd.mlock_best_effort();
                 }
                 // `resp` is only consumed above, and that whole branch is
-                // gated on `mem_lock::SUPPORTED` platforms (Unix `mlock`,
-                // Windows `VirtualLock`); on any other target this keeps
-                // the variable "used" without pretending there's an
-                // equivalent action to take on change.
-                #[cfg(not(any(unix, windows)))]
+                // Linux-only (`mlock()` isn't a Linux-portable syscall);
+                // on other targets this keeps the variable "used" without
+                // pretending there's a non-Linux equivalent action to
+                // take on change.
+                #[cfg(not(target_os = "linux"))]
                 let _ = &resp;
                 let can_go = self.vault_path.is_some() && !self.vault_master_pwd.is_empty();
                 if ui
@@ -1182,8 +1210,11 @@ impl UnigenApp {
             ui.label("Password");
             ui.horizontal(|ui| {
                 let pwd_field_resp = ui.add(
-                    egui::TextEdit::singleline(&mut self.vault_edit_password)
-                        .password(!self.vault_reveal_password),
+                    secure_text_edit::SecurePasswordEdit::new(
+                        "vault_edit_password",
+                        &mut self.vault_edit_password,
+                    )
+                    .masked(!self.vault_reveal_password),
                 );
                 // Right-click "Copy" as an alternative to the "Copy" button / Ctrl+C.
                 // Deliberately calls the same `copy_to_clipboard` used by the button
@@ -1276,17 +1307,17 @@ impl UnigenApp {
             ui.separator();
             ui.horizontal(|ui| {
                 ui.label("Master password to save:");
-                let resp = ui.add(egui::TextEdit::singleline(&mut self.vault_master_pwd).password(true));
-                #[cfg(any(unix, windows))]
+                let resp = ui.add(secure_text_edit::SecurePasswordEdit::new("vault_master_pwd", &mut self.vault_master_pwd));
+                #[cfg(target_os = "linux")]
                 if resp.changed() && self.linux_try_exclusion {
                     self.vault_master_pwd.mlock_best_effort();
                 }
                 // `resp` is only consumed above, and that whole branch is
-                // gated on `mem_lock::SUPPORTED` platforms (Unix `mlock`,
-                // Windows `VirtualLock`); on any other target this keeps
-                // the variable "used" without pretending there's an
-                // equivalent action to take on change.
-                #[cfg(not(any(unix, windows)))]
+                // Linux-only (`mlock()` isn't a Linux-portable syscall);
+                // on other targets this keeps the variable "used" without
+                // pretending there's a non-Linux equivalent action to
+                // take on change.
+                #[cfg(not(target_os = "linux"))]
                 let _ = &resp;
                 if ui.button("Save vault").clicked() {
                     let mut pwd = std::mem::take(&mut self.vault_master_pwd);
@@ -1321,17 +1352,24 @@ impl UnigenApp {
                 .show(ui.ctx(), |ui| {
                     ui.label("Current master password:");
                     ui.add(
-                        egui::TextEdit::singleline(&mut self.vault_change_pwd_current)
-                            .password(true),
+                        secure_text_edit::SecurePasswordEdit::new(
+                            "vault_change_pwd_current",
+                            &mut self.vault_change_pwd_current,
+                        ),
                     );
                     ui.label("New master password (min 8 characters):");
                     ui.add(
-                        egui::TextEdit::singleline(&mut self.vault_change_pwd_new).password(true),
+                        secure_text_edit::SecurePasswordEdit::new(
+                            "vault_change_pwd_new",
+                            &mut self.vault_change_pwd_new,
+                        ),
                     );
                     ui.label("Confirm new master password:");
                     ui.add(
-                        egui::TextEdit::singleline(&mut self.vault_change_pwd_confirm)
-                            .password(true),
+                        secure_text_edit::SecurePasswordEdit::new(
+                            "vault_change_pwd_confirm",
+                            &mut self.vault_change_pwd_confirm,
+                        ),
                     );
                     if !self.vault_change_pwd_error.is_empty() {
                         ui.colored_label(pal.danger, &self.vault_change_pwd_error);
@@ -1541,10 +1579,10 @@ impl UnigenApp {
         let pwd = Zeroizing::new(self.enc_pwd.as_str().to_string());
         let kdf_id = self.kdf_choice;
         let shred_after = self.shred_after;
-        #[cfg(any(unix, windows))]
+        #[cfg(target_os = "linux")]
         if self.linux_try_exclusion && !try_mlock_str(&pwd) {
             self.enc_status =
-                "Warning: memory lock failed; passphrase remains subject to normal VM paging."
+                "Warning: mlock() failed; passphrase remains subject to normal VM paging."
                     .to_string();
         }
 
@@ -2201,21 +2239,19 @@ fn disable_core_dumps() {
     }
 }
 
-/// Best-effort: ask the OS to keep `s`'s backing memory out of swap/the
-/// pagefile for as long as this process holds the lock (mirrors the
-/// Python original's `try_mlock`, which does the same via ctypes, and
-/// extends it beyond Linux via `mem_lock`'s Unix `mlock`/Windows
-/// `VirtualLock` coverage). Returns false when the OS refuses the lock, or
-/// on a platform with no lock primitive at all; callers must treat it as
-/// best-effort either way. Note this locks a one-off snapshot (the
-/// `Zeroizing<String>` clone handed to the background encrypt job), not
-/// the live UI field — that's `SecretString::mlock_best_effort`'s job.
-#[cfg(any(unix, windows))]
+/// Best-effort: ask the Linux kernel to keep `s`'s backing memory out of
+/// swap for as long as this process holds the lock (mirrors the Python
+/// original's `try_mlock`, which does the same via ctypes). Returns false
+/// when the kernel refuses the lock; callers must treat it as best-effort.
+#[cfg(target_os = "linux")]
 fn try_mlock_str(s: &str) -> bool {
+    extern "C" {
+        fn mlock(addr: *const std::ffi::c_void, len: usize) -> i32;
+    }
     if s.is_empty() {
         return true;
     }
-    mem_lock::lock(s.as_ptr(), s.len())
+    unsafe { mlock(s.as_ptr() as *const std::ffi::c_void, s.len()) == 0 }
 }
 
 fn zeroize_string(s: &mut String) {
@@ -2525,7 +2561,7 @@ impl eframe::App for UnigenApp {
                     ui.label(
                         "Enter a passphrase (min 8 characters) to protect this password file:",
                     );
-                    ui.add(egui::TextEdit::singleline(&mut self.encrypt_shred_pwd).password(true));
+                    ui.add(secure_text_edit::SecurePasswordEdit::new("encrypt_shred_pwd", &mut self.encrypt_shred_pwd));
                     ui.horizontal(|ui| {
                         if ui.button("Cancel").clicked() {
                             self.encrypt_shred_pwd.clear();
@@ -2560,7 +2596,7 @@ impl eframe::App for UnigenApp {
                     if let Some(p) = &self.editor_open_target {
                         ui.small(p.display().to_string());
                     }
-                    ui.add(egui::TextEdit::singleline(&mut self.editor_open_pwd).password(true));
+                    ui.add(secure_text_edit::SecurePasswordEdit::new("editor_open_pwd", &mut self.editor_open_pwd));
                     if !self.editor_open_error.is_empty() {
                         ui.colored_label(self.palette().danger, &self.editor_open_error);
                     }
@@ -2925,7 +2961,7 @@ impl UnigenApp {
 
                 ui.add_space(6.0);
                 ui.label(format!("Passphrase (min {} characters)", crypto::MIN_PASSPHRASE_LEN));
-                let resp = ui.add(egui::TextEdit::singleline(&mut self.enc_pwd).password(true));
+                let resp = ui.add(secure_text_edit::SecurePasswordEdit::new("enc_pwd", &mut self.enc_pwd));
                 if resp.changed() {
                     self.enc_pwd_last_edit = Instant::now();
                     // Best-effort: keep re-locking the field's *live*
@@ -2935,7 +2971,7 @@ impl UnigenApp {
                     // doc comment for why the live field needs its own
                     // lock, re-applied on each edit since growth moves
                     // the buffer).
-                    #[cfg(any(unix, windows))]
+                    #[cfg(target_os = "linux")]
                     if self.linux_try_exclusion {
                         self.enc_pwd.mlock_best_effort();
                     }
@@ -2954,12 +2990,12 @@ impl UnigenApp {
 
                 ui.checkbox(&mut self.shred_after, "Verify, then securely shred the original after encryption");
 
-                if mem_lock::SUPPORTED {
+                if cfg!(target_os = "linux") {
                     ui.checkbox(
                         &mut self.linux_try_exclusion,
-                        "Best-effort: ask the OS to keep the passphrase out of swap (mlock/VirtualLock)",
+                        "Best-effort: ask the OS to keep the passphrase out of swap (mlock)",
                     );
-                    ui.small("Best effort only — not a guarantee on every OS/kernel/filesystem configuration.");
+                    ui.small("Best effort only — not a guarantee on every kernel/filesystem configuration.");
                 }
 
                 ui.add_space(6.0);
@@ -3008,10 +3044,10 @@ impl UnigenApp {
                 });
 
                 ui.label("Passphrase");
-                let resp = ui.add(egui::TextEdit::singleline(&mut self.dec_pwd).password(true));
+                let resp = ui.add(secure_text_edit::SecurePasswordEdit::new("dec_pwd", &mut self.dec_pwd));
                 if resp.changed() {
                     self.dec_pwd_last_edit = Instant::now();
-                    #[cfg(any(unix, windows))]
+                    #[cfg(target_os = "linux")]
                     if self.linux_try_exclusion {
                         self.dec_pwd.mlock_best_effort();
                     }
