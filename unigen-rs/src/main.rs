@@ -7,6 +7,7 @@
 
 mod charsets;
 mod crypto;
+mod mem_cipher;
 mod mem_lock;
 mod secret;
 mod secure_text_edit;
@@ -21,7 +22,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
-use secret::SecretString;
+use secret::{LockedSecret, SecretString};
 use vault::VaultEntry;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -453,13 +454,10 @@ struct UnigenApp {
     enc_pwd_autoclear: bool,
     shred_after: bool,
     enc_status: String,
-    /// Best-effort attempt to advise the OS to exclude decrypted/plaintext
-    /// temp buffers from swap (mirrors the Python `linux_try_exclusion`
-    /// setting, extended here to every platform `mem_lock` supports —
-    /// Linux/macOS/other Unix via `mlock(2)`, Windows via `VirtualLock`;
-    /// same "best effort, not a guarantee" caveat applies everywhere —
-    /// see `mem_lock` and `try_mlock_str`). The field keeps its original
-    /// name for on-disk settings compatibility with earlier releases.
+    /// Linux-only: best-effort attempt to advise the OS to exclude
+    /// decrypted/plaintext temp buffers from swap (mirrors the Python
+    /// `linux_try_exclusion` setting; same "best effort, not a guarantee"
+    /// caveat applies — see crypto::try_mlock equivalents).
     linux_try_exclusion: bool,
 
     // ---- File Protector: Decrypt ----
@@ -831,7 +829,7 @@ impl UnigenApp {
         if let Some(e) = self.vault_entries.iter().find(|e| e.id == id) {
             self.vault_edit_title = e.title.clone();
             self.vault_edit_username = e.username.clone();
-            self.vault_edit_password = e.password.clone();
+            self.vault_edit_password = e.password.reveal();
             self.vault_edit_url = e.url.clone();
             self.vault_edit_notes = e.notes.clone();
             self.vault_selected = Some(id);
@@ -875,7 +873,7 @@ impl UnigenApp {
                 // along the way.
                 e.title = SecretString::from_str(self.vault_edit_title.as_str());
                 e.username = SecretString::from_str(self.vault_edit_username.as_str());
-                e.password = SecretString::from_str(self.vault_edit_password.as_str());
+                e.password = LockedSecret::from_str(self.vault_edit_password.as_str());
                 e.url = SecretString::from_str(self.vault_edit_url.as_str());
                 e.notes = SecretString::from_str(self.vault_edit_notes.as_str());
                 e.updated_at = now;
@@ -889,7 +887,7 @@ impl UnigenApp {
                 id,
                 title: SecretString::from_str(self.vault_edit_title.as_str()),
                 username: SecretString::from_str(self.vault_edit_username.as_str()),
-                password: SecretString::from_str(self.vault_edit_password.as_str()),
+                password: LockedSecret::from_str(self.vault_edit_password.as_str()),
                 url: SecretString::from_str(self.vault_edit_url.as_str()),
                 notes: SecretString::from_str(self.vault_edit_notes.as_str()),
                 created_at: now,
@@ -1104,13 +1102,6 @@ impl UnigenApp {
                 if resp.changed() && self.linux_try_exclusion {
                     self.vault_master_pwd.mlock_best_effort();
                 }
-                // `resp` is consumed above; the lock attempt itself is
-                // gated on `mem_lock::SUPPORTED` platforms (Unix `mlock`,
-                // Windows `VirtualLock`); on any other target this keeps
-                // the variable "used" without pretending there's an
-                // equivalent action to take on change.
-                #[cfg(not(any(unix, windows)))]
-                let _ = &resp;
                 let can_go = self.vault_path.is_some() && !self.vault_master_pwd.is_empty();
                 if ui
                     .add_enabled(can_go, egui::Button::new("Unlock"))
@@ -1314,13 +1305,6 @@ impl UnigenApp {
                 if resp.changed() && self.linux_try_exclusion {
                     self.vault_master_pwd.mlock_best_effort();
                 }
-                // `resp` is consumed above; the lock attempt itself is
-                // gated on `mem_lock::SUPPORTED` platforms (Unix `mlock`,
-                // Windows `VirtualLock`); on any other target this keeps
-                // the variable "used" without pretending there's an
-                // equivalent action to take on change.
-                #[cfg(not(any(unix, windows)))]
-                let _ = &resp;
                 if ui.button("Save vault").clicked() {
                     let mut pwd = std::mem::take(&mut self.vault_master_pwd);
                     self.save_vault_with(&pwd);
@@ -1583,7 +1567,7 @@ impl UnigenApp {
         let shred_after = self.shred_after;
         if self.linux_try_exclusion && !try_mlock_str(&pwd) {
             self.enc_status =
-                "Warning: mlock()/VirtualLock failed; passphrase remains subject to normal VM/pagefile paging."
+                "Warning: mlock()/VirtualLock failed; passphrase remains subject to normal VM paging."
                     .to_string();
         }
 
@@ -2242,13 +2226,12 @@ fn disable_core_dumps() {
 
 /// Best-effort: ask the OS to keep `s`'s backing memory out of swap/the
 /// pagefile for as long as this process holds the lock (mirrors the
-/// Python original's `try_mlock`, which does the same via ctypes, and
-/// extends it beyond Linux via `mem_lock`'s Unix `mlock`/Windows
-/// `VirtualLock` coverage). Returns false when the OS refuses the lock, or
-/// when the current platform has no such primitive at all. Callers must
-/// treat it as best-effort. Note this only locks a one-off copy handed to
-/// a background op — it doesn't follow the live UI field — that's
-/// `SecretString::mlock_best_effort`'s job.
+/// Python original's `try_mlock`, which does the same via ctypes on
+/// Linux only, and extends it beyond Linux via `mem_lock`'s Unix
+/// `mlock`/Windows `VirtualLock` — see that module's docs). Returns false
+/// when the OS refuses the lock, or when the platform has no such
+/// primitive (`mem_lock::SUPPORTED == false`); callers must treat it as
+/// best-effort, same as every other lock call site in this app.
 fn try_mlock_str(s: &str) -> bool {
     if s.is_empty() {
         return true;
@@ -2996,7 +2979,7 @@ impl UnigenApp {
                         &mut self.linux_try_exclusion,
                         "Best-effort: ask the OS to keep the passphrase out of swap (mlock/VirtualLock)",
                     );
-                    ui.small("Best effort only — not a guarantee on every kernel/working-set configuration.");
+                    ui.small("Best effort only — not a guarantee on every OS/kernel/filesystem configuration.");
                 }
 
                 ui.add_space(6.0);
