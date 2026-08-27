@@ -38,11 +38,6 @@ struct SecretBytes {
     ptr: NonNull<u8>,
     len: usize,
     cap: usize,
-    /// Whether a lock via `crate::mem_lock::lock` is currently believed to
-    /// be held on `[ptr, ptr + cap)`. Tracked on every platform now (not
-    /// just Linux) since `mem_lock` itself degrades to a no-op/`false` on
-    /// platforms without a lock primitive — see that module's docs.
-    locked: bool,
 }
 
 // SAFETY: `SecretBytes` owns its buffer exclusively (no aliasing), same
@@ -56,7 +51,6 @@ impl SecretBytes {
             ptr: NonNull::dangling(),
             len: 0,
             cap: 0,
-            locked: false,
         }
     }
 
@@ -101,24 +95,11 @@ impl SecretBytes {
                 ptr::copy_nonoverlapping(self.ptr.as_ptr(), new_ptr.as_ptr(), self.len);
             }
         }
-        // Lock the replacement before releasing the old mapping. This
-        // keeps the "lock requested" invariant across reallocations, on
-        // every platform `mem_lock` supports (Unix `mlock`, Windows
-        // `VirtualLock`); it's a no-op/false on anything else.
-        let new_locked = if self.locked {
-            crate::mem_lock::lock(new_ptr.as_ptr(), new_cap)
-        } else {
-            false
-        };
-
         if self.cap > 0 {
             // SAFETY: `self.ptr` is valid for `self.cap` bytes.
             let old_slice =
                 unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.cap) };
             old_slice.zeroize();
-            if self.locked {
-                crate::mem_lock::unlock(self.ptr.as_ptr(), self.cap);
-            }
             // SAFETY: `self.ptr`/`self.cap` describe the allocation this
             // struct made with `Self::layout(self.cap)`, and we're done
             // with it (contents already wiped above).
@@ -126,7 +107,6 @@ impl SecretBytes {
         }
         self.ptr = new_ptr;
         self.cap = new_cap;
-        self.locked = new_locked;
     }
 
     fn push_slice(&mut self, data: &[u8]) {
@@ -243,10 +223,11 @@ impl SecretBytes {
     }
 
     /// Raw pointer/capacity of the live backing buffer, for callers that
-    /// need to lock it directly via `crate::mem_lock` (best-effort swap
+    /// need to `mlock()` it directly (Linux-only best-effort swap
     /// exclusion — see `SecretString::mlock_best_effort`). Not exposed
     /// more broadly since holding onto this past the next mutation
     /// (which may relocate the buffer via `grow_to`) is unsafe.
+    #[cfg(target_os = "linux")]
     fn as_ptr_cap(&self) -> (*const u8, usize) {
         (self.ptr.as_ptr(), self.cap)
     }
@@ -259,10 +240,6 @@ impl Drop for SecretBytes {
             // describe this struct's live allocation.
             let slice = unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.cap) };
             slice.zeroize();
-            if self.locked {
-                crate::mem_lock::unlock(self.ptr.as_ptr(), self.cap);
-                self.locked = false;
-            }
             unsafe { dealloc(self.ptr.as_ptr(), Self::layout(self.cap)) };
         }
     }
@@ -318,6 +295,14 @@ impl SecretString {
         self.bytes.len
     }
 
+    /// Number of `char`s (not bytes) in the string. Used by
+    /// `secure_text_edit`'s cursor-position math, which — like
+    /// `egui::TextBuffer` — addresses positions in characters, not
+    /// bytes.
+    pub fn len_chars(&self) -> usize {
+        self.as_str().chars().count()
+    }
+
     /// Zeroize the current contents in place (used at call sites that
     /// used to call `.zeroize()` on a plain `String` field right before
     /// overwriting or dropping it). Explicit — most callers can now rely
@@ -332,7 +317,7 @@ impl SecretString {
     /// `str::char_indices`, clamped to `len()` if `char_index` is past
     /// the end — matches the behavior `egui::TextBuffer` implementations
     /// are expected to have for cursor/selection positions).
-    fn byte_index_from_char_index(&self, char_index: usize) -> usize {
+    pub(crate) fn byte_index_from_char_index(&self, char_index: usize) -> usize {
         self.as_str()
             .char_indices()
             .nth(char_index)
@@ -357,13 +342,11 @@ impl SecretString {
         self.bytes.delete_byte_range(range);
     }
 
-    /// Best-effort: ask the OS to keep this buffer's *current* allocation
-    /// out of swap/the pagefile — `mlock(2)` on Linux/macOS/other Unix,
-    /// `VirtualLock` on Windows (see `crate::mem_lock`). Returns `false`
-    /// if the OS refuses (e.g. Unix `RLIMIT_MEMLOCK`, or Windows working-
-    /// set quota) or if the platform has no such primitive — callers must
-    /// treat that as informational, not fatal, same as every other lock
-    /// use in this app.
+    /// Best-effort: ask the Linux kernel to keep this buffer's *current*
+    /// allocation out of swap (`mlock(2)`). Returns `false` if the kernel
+    /// refuses (e.g. `RLIMIT_MEMLOCK` exceeded) — callers must treat that
+    /// as informational, not fatal, same as every other mlock use in this
+    /// app.
     ///
     /// Unlike locking a one-off clone handed to a background thread (the
     /// existing pattern for the passphrase actually used in a crypto
@@ -372,19 +355,25 @@ impl SecretString {
     /// user is looking at / typing into that field, which is the longest
     /// exposure window for a passphrase in this app. Callers should
     /// re-invoke this after every edit: a `grow_to` relocation moves the
-    /// buffer to a new allocation. `SecretBytes::grow_to` now attempts to
-    /// lock the replacement before releasing the old allocation, so the
-    /// lock request follows reallocations automatically. The operation is
-    /// still best-effort because the OS may reject the lock request.
-    pub fn mlock_best_effort(&mut self) -> bool {
+    /// buffer to a new allocation that the previous `mlock()` call no
+    /// longer covers (the kernel doesn't follow it), so there's a small
+    /// window right after growth, until this is called again, where the
+    /// buffer isn't locked. This is the same "not a guarantee, only
+    /// shrinks the exposure window" caveat this app already documents
+    /// for `mlock` everywhere else.
+    #[cfg(target_os = "linux")]
+    pub fn mlock_best_effort(&self) -> bool {
+        extern "C" {
+            fn mlock(addr: *const std::ffi::c_void, len: usize) -> i32;
+        }
         let (ptr, cap) = self.bytes.as_ptr_cap();
         if cap == 0 {
-            self.bytes.locked = true;
             return true;
         }
-        let ok = crate::mem_lock::lock(ptr, cap);
-        self.bytes.locked = ok;
-        ok
+        // SAFETY: `ptr` is valid for `cap` bytes for as long as `self`
+        // isn't mutated (this call is synchronous and doesn't retain
+        // `ptr`), per `SecretBytes`'s own invariants.
+        unsafe { mlock(ptr as *const std::ffi::c_void, cap) == 0 }
     }
 }
 
@@ -507,10 +496,27 @@ impl From<String> for SecretString {
     fn from(s: String) -> Self {
         let mut owned = s;
         let out = Self::from_str(owned.as_str());
-        // SAFETY: we're about to zero every byte and never read `owned`
-        // as text again — `String`'s `Drop` doesn't validate UTF-8, so
-        // leaving it zero-filled is fine.
-        unsafe { owned.as_bytes_mut() }.zeroize();
+        // Zero the *entire* backing allocation, not just the `len()`
+        // live bytes. `owned.as_bytes_mut()` only covers `[0, len)`;
+        // if `owned`'s capacity is larger than its length (e.g. it grew
+        // via `push`/`push_str` at some earlier point and still holds
+        // that larger allocation), the slack bytes in `[len, capacity)`
+        // are never touched by a `len`-only zeroize and go straight to
+        // `dealloc` with the original plaintext intact. This is the
+        // same "capacity beyond len can still hold stale bytes" case
+        // `SecretBytes::grow_to` guards against — this impl needs the
+        // same guarantee.
+        let cap = owned.capacity();
+        // SAFETY: `owned.as_mut_vec()` gives access to the `Vec<u8>`
+        // backing this `String`; that `Vec` is valid for `cap` bytes
+        // (its own allocation invariant), and we're about to zero all
+        // of it and never read `owned` as text again — `String`'s
+        // `Drop` doesn't validate UTF-8, so leaving it zero-filled is
+        // fine.
+        unsafe {
+            let ptr = owned.as_mut_vec().as_mut_ptr();
+            std::slice::from_raw_parts_mut(ptr, cap).zeroize();
+        }
         out
     }
 }
@@ -535,228 +541,6 @@ impl<'de> Deserialize<'de> for SecretString {
         // that intermediate buffer once its contents are copied over.
         let s = String::deserialize(deserializer)?;
         Ok(SecretString::from(s))
-    }
-}
-
-/// A secret held **encrypted at rest** in RAM, decrypted only into a
-/// short-lived `SecretString` at the moment it's actually needed.
-///
-/// `SecretString` protects a value from leaving stray unzeroized copies
-/// behind as it's edited — but a value that's simply *sitting* in memory,
-/// like every vault entry's password for the whole time the vault stays
-/// unlocked, is still plain readable UTF-8 at a fixed address for that
-/// entire window. `LockedSecret` closes that gap the way KeePass's
-/// "protected memory" does: the bytes are XOR'd with a per-value ChaCha20
-/// keystream (see `mem_cipher`) whose key lives in an `mlock`ed
-/// allocation, so a memory dump / debugger attach / swapped page sees
-/// ciphertext, not the password.
-///
-/// This is a lightweight *obfuscation-at-rest* layer against passive
-/// memory inspection — not a replacement for the AES-256-GCM envelope
-/// that protects the vault file on disk (`crypto.rs`/`vault.rs`), and not
-/// a defense against an attacker who can already execute code in this
-/// process (they can just call `reveal()` too, or read the key). Its
-/// value is narrowing the window and the surface: instead of every
-/// entry's plaintext password living in RAM for the whole unlocked
-/// session, only the brief `reveal()`'d copy does — and that copy is
-/// itself a `SecretString`, so it gets the same wipe-on-relocate/drop
-/// guarantees as everything else in this module.
-pub struct LockedSecret {
-    /// ChaCha20 ciphertext, same length as the plaintext (stream cipher).
-    /// Stored in a `SecretBytes` too: it's not sensitive on its own, but
-    /// defense in depth is cheap here and it keeps the "never leave a
-    /// stray copy behind on reallocation" guarantee uniform across every
-    /// secret-shaped buffer in this module.
-    ciphertext: SecretBytes,
-    nonce: [u8; crate::mem_cipher::NONCE_LEN],
-    len: usize,
-}
-
-impl LockedSecret {
-    /// Encrypt-and-store `s` without disturbing the source. Used at call
-    /// sites that still need their own `&str`/`SecretString` afterwards
-    /// (e.g. copying an edit-pane buffer into the entry while leaving the
-    /// buffer itself in place for further edits).
-    pub fn from_str(s: &str) -> Self {
-        let nonce = crate::mem_cipher::random_nonce();
-        let mut ciphertext = SecretBytes::with_capacity(s.len());
-        ciphertext.push_slice(s.as_bytes());
-        if ciphertext.len > 0 {
-            // SAFETY: `ciphertext.ptr` is valid for `ciphertext.len`
-            // bytes, just written above by `push_slice`.
-            let slice =
-                unsafe { std::slice::from_raw_parts_mut(ciphertext.ptr.as_ptr(), ciphertext.len) };
-            crate::mem_cipher::apply_keystream(&nonce, slice);
-        }
-        let len = ciphertext.len;
-        Self {
-            ciphertext,
-            nonce,
-            len,
-        }
-    }
-
-    /// Encrypt-and-store `plain`, consuming it. Cheaper than
-    /// `from_str(plain.as_str())` followed by a manual zeroize: the
-    /// plaintext buffer is encrypted in place and its allocation is
-    /// reused directly as the ciphertext buffer, so this never makes a
-    /// second copy of the plaintext bytes.
-    pub fn seal(mut plain: SecretString) -> Self {
-        let nonce = crate::mem_cipher::random_nonce();
-        // Steal `plain`'s backing buffer; leave `plain` holding an empty
-        // (dangling, cap 0) one so its `Drop` is a no-op when it runs.
-        let ciphertext = std::mem::replace(&mut plain.bytes, SecretBytes::new());
-        if ciphertext.len > 0 {
-            // SAFETY: `ciphertext.ptr` is valid for `ciphertext.len`
-            // bytes (invariant carried over from `plain`).
-            let slice =
-                unsafe { std::slice::from_raw_parts_mut(ciphertext.ptr.as_ptr(), ciphertext.len) };
-            crate::mem_cipher::apply_keystream(&nonce, slice);
-        }
-        let len = ciphertext.len;
-        Self {
-            ciphertext,
-            nonce,
-            len,
-        }
-    }
-
-    /// Decrypt into a fresh, independent `SecretString`. Does not modify
-    /// `self` — the value stays encrypted at rest; only the returned copy
-    /// is plaintext, and it carries the same wipe guarantees as any other
-    /// `SecretString` (zeroized on drop or reallocation).
-    pub fn reveal(&self) -> SecretString {
-        let mut bytes = SecretBytes::with_capacity(self.len);
-        if self.len > 0 {
-            bytes.push_slice(self.ciphertext.as_slice());
-            // SAFETY: `bytes.ptr` is valid for `bytes.len` (== self.len)
-            // bytes, just copied above.
-            let slice = unsafe { std::slice::from_raw_parts_mut(bytes.ptr.as_ptr(), bytes.len) };
-            crate::mem_cipher::apply_keystream(&self.nonce, slice);
-        }
-        SecretString { bytes }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    pub fn len(&self) -> usize {
-        self.len
-    }
-}
-
-impl Default for LockedSecret {
-    fn default() -> Self {
-        Self {
-            ciphertext: SecretBytes::new(),
-            nonce: [0u8; crate::mem_cipher::NONCE_LEN],
-            len: 0,
-        }
-    }
-}
-
-/// Cloning a `LockedSecret` copies the ciphertext bytes and reuses the
-/// same nonce — this does *not* encrypt anything new under that nonce
-/// (which would be the usual nonce-reuse hazard), it just duplicates an
-/// existing (key, nonce, ciphertext) triple, so it decrypts to the same
-/// plaintext without ever touching the plaintext itself.
-impl Clone for LockedSecret {
-    fn clone(&self) -> Self {
-        Self {
-            ciphertext: self.ciphertext.clone_secret(),
-            nonce: self.nonce,
-            len: self.len,
-        }
-    }
-}
-
-impl fmt::Debug for LockedSecret {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "LockedSecret(REDACTED, len={})", self.len)
-    }
-}
-
-impl Zeroize for LockedSecret {
-    fn zeroize(&mut self) {
-        self.ciphertext.zeroize_in_place();
-        self.nonce = [0u8; crate::mem_cipher::NONCE_LEN];
-        self.len = 0;
-    }
-}
-
-/// On-disk / in-transit representation is still the plain string — the
-/// vault's own AES-256-GCM envelope is what protects it at rest on disk
-/// (see `vault.rs`); `LockedSecret` only governs how it sits in RAM
-/// between that envelope and the UI. Serializing briefly reveals the
-/// plaintext to hand to the serializer, the same way any encrypted field
-/// must eventually be plaintext for the moment it's written into the JSON
-/// payload that then gets encrypted as a whole.
-impl Serialize for LockedSecret {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(self.reveal().as_str())
-    }
-}
-
-impl<'de> Deserialize<'de> for LockedSecret {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let s = String::deserialize(deserializer)?;
-        Ok(LockedSecret::seal(SecretString::from(s)))
-    }
-}
-
-#[cfg(test)]
-mod locked_secret_tests {
-    use super::*;
-
-    #[test]
-    fn seal_then_reveal_round_trips() {
-        let locked = LockedSecret::from_str("correct horse battery staple");
-        assert_eq!(locked.reveal().as_str(), "correct horse battery staple");
-    }
-
-    #[test]
-    fn ciphertext_does_not_contain_plaintext_bytes() {
-        let plain = "hunter2hunter2hunter2";
-        let locked = LockedSecret::from_str(plain);
-        assert_ne!(locked.ciphertext.as_slice(), plain.as_bytes());
-    }
-
-    #[test]
-    fn seal_consumes_source_without_extra_copy_and_round_trips() {
-        let source = SecretString::from_str("swordfish");
-        let locked = LockedSecret::seal(source);
-        assert_eq!(locked.reveal().as_str(), "swordfish");
-    }
-
-    #[test]
-    fn clone_reveals_to_same_plaintext() {
-        let a = LockedSecret::from_str("clone me");
-        let b = a.clone();
-        assert_eq!(a.reveal().as_str(), b.reveal().as_str());
-    }
-
-    #[test]
-    fn zeroize_clears_length_and_ciphertext() {
-        let mut locked = LockedSecret::from_str("wipeme");
-        locked.zeroize();
-        assert!(locked.is_empty());
-        assert_eq!(locked.reveal().as_str(), "");
-    }
-
-    #[test]
-    fn empty_secret_round_trips() {
-        let locked = LockedSecret::from_str("");
-        assert!(locked.is_empty());
-        assert_eq!(locked.reveal().as_str(), "");
-    }
-
-    #[test]
-    fn serde_round_trip() {
-        let locked = LockedSecret::from_str("hunter2");
-        let json = serde_json::to_string(&locked).unwrap();
-        let back: LockedSecret = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.reveal().as_str(), "hunter2");
     }
 }
 
@@ -799,14 +583,19 @@ mod tests {
     }
 
     #[test]
-    fn from_string_transfers_and_preserves_content() {
+    fn from_string_zeroizes_source() {
         let source = String::from("topsecret");
-        let secret = SecretString::from(source);
-        assert_eq!(secret.as_str(), "topsecret");
-        // The consumed source is explicitly wiped by From<String>; the
-        // process-wide zeroizing allocator adds a second defense at drop.
-        // Do not inspect the old pointer here: after ownership transfer the
-        // source allocation is allowed to have been returned to the allocator.
+        let ptr = source.as_ptr();
+        let len = source.len();
+        let _secret = SecretString::from(source);
+        // SAFETY: the `String` was consumed by `From`, which zeroized
+        // its buffer before dropping it; the allocation itself may or
+        // may not have been freed depending on allocator behavior, but
+        // reading it back here is only for test verification of the
+        // zeroize step, in the same process, before anything else could
+        // plausibly reuse it.
+        let leftover = unsafe { std::slice::from_raw_parts(ptr, len) };
+        assert!(leftover.iter().all(|&b| b == 0));
     }
 
     #[test]
