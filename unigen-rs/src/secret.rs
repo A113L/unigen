@@ -38,6 +38,11 @@ struct SecretBytes {
     ptr: NonNull<u8>,
     len: usize,
     cap: usize,
+    /// Whether a lock via `crate::mem_lock::lock` is currently believed to
+    /// be held on `[ptr, ptr + cap)`. Tracked on every platform now (not
+    /// just Linux) since `mem_lock` itself degrades to a no-op/`false` on
+    /// platforms without a lock primitive — see that module's docs.
+    locked: bool,
 }
 
 // SAFETY: `SecretBytes` owns its buffer exclusively (no aliasing), same
@@ -51,6 +56,7 @@ impl SecretBytes {
             ptr: NonNull::dangling(),
             len: 0,
             cap: 0,
+            locked: false,
         }
     }
 
@@ -95,11 +101,24 @@ impl SecretBytes {
                 ptr::copy_nonoverlapping(self.ptr.as_ptr(), new_ptr.as_ptr(), self.len);
             }
         }
+        // Lock the replacement before releasing the old mapping. This
+        // keeps the "lock requested" invariant across reallocations, on
+        // every platform `mem_lock` supports (Unix `mlock`, Windows
+        // `VirtualLock`); it's a no-op/false on anything else.
+        let new_locked = if self.locked {
+            crate::mem_lock::lock(new_ptr.as_ptr(), new_cap)
+        } else {
+            false
+        };
+
         if self.cap > 0 {
             // SAFETY: `self.ptr` is valid for `self.cap` bytes.
             let old_slice =
                 unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.cap) };
             old_slice.zeroize();
+            if self.locked {
+                crate::mem_lock::unlock(self.ptr.as_ptr(), self.cap);
+            }
             // SAFETY: `self.ptr`/`self.cap` describe the allocation this
             // struct made with `Self::layout(self.cap)`, and we're done
             // with it (contents already wiped above).
@@ -107,6 +126,7 @@ impl SecretBytes {
         }
         self.ptr = new_ptr;
         self.cap = new_cap;
+        self.locked = new_locked;
     }
 
     fn push_slice(&mut self, data: &[u8]) {
@@ -223,11 +243,10 @@ impl SecretBytes {
     }
 
     /// Raw pointer/capacity of the live backing buffer, for callers that
-    /// need to `mlock()` it directly (Linux-only best-effort swap
+    /// need to lock it directly via `crate::mem_lock` (best-effort swap
     /// exclusion — see `SecretString::mlock_best_effort`). Not exposed
     /// more broadly since holding onto this past the next mutation
     /// (which may relocate the buffer via `grow_to`) is unsafe.
-    #[cfg(target_os = "linux")]
     fn as_ptr_cap(&self) -> (*const u8, usize) {
         (self.ptr.as_ptr(), self.cap)
     }
@@ -240,6 +259,10 @@ impl Drop for SecretBytes {
             // describe this struct's live allocation.
             let slice = unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.cap) };
             slice.zeroize();
+            if self.locked {
+                crate::mem_lock::unlock(self.ptr.as_ptr(), self.cap);
+                self.locked = false;
+            }
             unsafe { dealloc(self.ptr.as_ptr(), Self::layout(self.cap)) };
         }
     }
@@ -342,11 +365,13 @@ impl SecretString {
         self.bytes.delete_byte_range(range);
     }
 
-    /// Best-effort: ask the Linux kernel to keep this buffer's *current*
-    /// allocation out of swap (`mlock(2)`). Returns `false` if the kernel
-    /// refuses (e.g. `RLIMIT_MEMLOCK` exceeded) — callers must treat that
-    /// as informational, not fatal, same as every other mlock use in this
-    /// app.
+    /// Best-effort: ask the OS to keep this buffer's *current* allocation
+    /// out of swap/the pagefile — `mlock(2)` on Linux/macOS/other Unix,
+    /// `VirtualLock` on Windows (see `crate::mem_lock`). Returns `false`
+    /// if the OS refuses (e.g. Unix `RLIMIT_MEMLOCK`, or Windows working-
+    /// set quota) or if the platform has no such primitive — callers must
+    /// treat that as informational, not fatal, same as every other lock
+    /// use in this app.
     ///
     /// Unlike locking a one-off clone handed to a background thread (the
     /// existing pattern for the passphrase actually used in a crypto
@@ -354,26 +379,20 @@ impl SecretString {
     /// — the buffer that exists, unencrypted, for the entire time the
     /// user is looking at / typing into that field, which is the longest
     /// exposure window for a passphrase in this app. Callers should
-    /// re-invoke this after every edit: a `grow_to` relocation moves the
-    /// buffer to a new allocation that the previous `mlock()` call no
-    /// longer covers (the kernel doesn't follow it), so there's a small
-    /// window right after growth, until this is called again, where the
-    /// buffer isn't locked. This is the same "not a guarantee, only
-    /// shrinks the exposure window" caveat this app already documents
-    /// for `mlock` everywhere else.
-    #[cfg(target_os = "linux")]
-    pub fn mlock_best_effort(&self) -> bool {
-        extern "C" {
-            fn mlock(addr: *const std::ffi::c_void, len: usize) -> i32;
-        }
+    /// re-invoke this after every edit: `SecretBytes::grow_to` now
+    /// attempts to lock the replacement before releasing the old
+    /// allocation, so the lock request follows reallocations
+    /// automatically. The operation is still best-effort because the OS
+    /// may reject the lock request.
+    pub fn mlock_best_effort(&mut self) -> bool {
         let (ptr, cap) = self.bytes.as_ptr_cap();
         if cap == 0 {
+            self.bytes.locked = true;
             return true;
         }
-        // SAFETY: `ptr` is valid for `cap` bytes for as long as `self`
-        // isn't mutated (this call is synchronous and doesn't retain
-        // `ptr`), per `SecretBytes`'s own invariants.
-        unsafe { mlock(ptr as *const std::ffi::c_void, cap) == 0 }
+        let ok = crate::mem_lock::lock(ptr, cap);
+        self.bytes.locked = ok;
+        ok
     }
 }
 
