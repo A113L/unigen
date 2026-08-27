@@ -10,7 +10,7 @@
 //! future-format-version handling as encrypted regular files.
 
 use crate::crypto;
-use crate::secret::SecretString;
+use crate::secret::{LockedSecret, SecretString};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -33,7 +33,15 @@ pub struct VaultEntry {
     pub id: u64,
     pub title: SecretString,
     pub username: SecretString,
-    pub password: SecretString,
+    /// Kept encrypted-at-rest in RAM (see `secret::LockedSecret`) rather
+    /// than as a plain `SecretString`: unlike the other fields, this one
+    /// sits in memory for the entire time the vault stays unlocked (not
+    /// just while actively being edited), which is by far the longest
+    /// plaintext-exposure window for a credential in this app. Use
+    /// `.reveal()` to get a short-lived plaintext `SecretString` (e.g.
+    /// for the edit pane or "show password"/copy actions) and re-`seal`
+    /// it back on commit — see `UnigenApp::vault_select`/edit-commit.
+    pub password: LockedSecret,
     pub url: SecretString,
     pub notes: SecretString,
     pub created_at: u64,
@@ -281,7 +289,14 @@ impl ImportedRow {
             // doesn't linger unzeroized once it's folded into the entry.
             title: self.title.into(),
             username: self.username.into(),
-            password: self.password.into(),
+            // Seal on the way into long-term storage: once a plaintext
+            // imported row becomes a real `VaultEntry` its password
+            // inherits the same "encrypted at rest in RAM" treatment
+            // every other entry's password gets. `String -> SecretString`
+            // zeroizes the source `String`'s buffer (see the note above),
+            // and `LockedSecret::seal` then consumes that `SecretString`
+            // without creating any further plaintext copy.
+            password: LockedSecret::seal(self.password.into()),
             url: self.url.into(),
             notes: self.notes.into(),
             created_at: now,
@@ -556,7 +571,7 @@ mod tests {
             id,
             title: title.into(),
             username: "user@example.com".into(),
-            password: "s3cr3t-password".into(),
+            password: LockedSecret::from_str("s3cr3t-password"),
             url: "https://example.com".into(),
             notes: "some notes".into(),
             created_at: 1,
@@ -571,7 +586,7 @@ mod tests {
         let decrypted = decrypt_vault(PWD, &combined).unwrap();
         assert_eq!(decrypted.len(), 2);
         assert_eq!(decrypted[0].title, "first");
-        assert_eq!(decrypted[1].password, "s3cr3t-password");
+        assert_eq!(decrypted[1].password.reveal(), "s3cr3t-password");
     }
 
     #[test]
