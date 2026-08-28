@@ -67,55 +67,134 @@ mod theme {
         text: Color32::from_rgb(0xe8, 0xeb, 0xf2),
         text_secondary: Color32::from_rgb(0x8b, 0x93, 0xa5),
         text_faint: Color32::from_rgb(0x5b, 0x64, 0x78),
-        accent: Color32::from_rgb(0xf5, 0xa6, 0x23),
-        accent_hover: Color32::from_rgb(0xd8, 0x8f, 0x14),
+        accent: Color32::from_rgb(0x4a, 0x90, 0xd9),
+        accent_hover: Color32::from_rgb(0x35, 0x78, 0xb8),
         success: Color32::from_rgb(0x2d, 0xd4, 0xbf),
         danger: Color32::from_rgb(0xf0, 0x57, 0x6b),
-        warning: Color32::from_rgb(0xf5, 0xa6, 0x23),
+        warning: Color32::from_rgb(0xd6, 0x8a, 0x19),
         button_bg: Color32::from_rgb(0x23, 0x28, 0x38),
-    };
-
-    pub const LIGHT: Palette = Palette {
-        bg: Color32::from_rgb(0xf4, 0xf5, 0xf7),
-        surface: Color32::from_rgb(0xff, 0xff, 0xff),
-        surface_alt: Color32::from_rgb(0xee, 0xf0, 0xf4),
-        border: Color32::from_rgb(0xdd, 0xe1, 0xe8),
-        input_bg: Color32::from_rgb(0xee, 0xf0, 0xf4),
-        text: Color32::from_rgb(0x12, 0x15, 0x1d),
-        text_secondary: Color32::from_rgb(0x5b, 0x64, 0x78),
-        text_faint: Color32::from_rgb(0x8b, 0x93, 0xa5),
-        accent: Color32::from_rgb(0xb4, 0x74, 0x0e),
-        accent_hover: Color32::from_rgb(0x96, 0x60, 0x0b),
-        success: Color32::from_rgb(0x0d, 0x94, 0x88),
-        danger: Color32::from_rgb(0xdc, 0x26, 0x26),
-        warning: Color32::from_rgb(0xb4, 0x74, 0x0e),
-        button_bg: Color32::from_rgb(0xdd, 0xe1, 0xe8),
     };
 
     /// Apply the palette to egui's global Visuals so every default-styled
     /// widget (panels, buttons, inputs, separators) picks it up, matching
     /// how the Python version recolors every ttk/tk widget via its theme
     /// dict rather than special-casing three accent colors.
+    ///
+    /// Dark-only build: light mode has been removed, so this always applies
+    /// the `DARK` palette. The `dark` parameter is kept (always `true` at
+    /// call sites) so the function signature and its call sites didn't need
+    /// to be reworked beyond removing the toggle itself.
     pub fn apply(ctx: &eframe::egui::Context, dark: bool) {
-        let p = if dark { &DARK } else { &LIGHT };
-        let mut visuals = if dark {
-            eframe::egui::Visuals::dark()
-        } else {
-            eframe::egui::Visuals::light()
-        };
+        let p = &DARK;
+        let mut visuals = eframe::egui::Visuals::dark();
+        let _ = dark;
+
+        // Clearlooks-inspired styling: restrained 3px corners, crisp 1px
+        // borders, subtle shadows, compact controls and a calm blue accent.
+        // This keeps egui's accessibility/interaction model intact while
+        // getting rid of the default "flat web app" feel.
         visuals.override_text_color = Some(p.text);
         visuals.panel_fill = p.bg;
         visuals.window_fill = p.surface;
+        visuals.window_rounding = eframe::egui::Rounding::same(4.0);
+        visuals.window_stroke = eframe::egui::Stroke::new(1.0, p.border);
         visuals.faint_bg_color = p.surface_alt;
         visuals.extreme_bg_color = p.input_bg;
+        visuals.code_bg_color = p.surface_alt;
+        visuals.warn_fg_color = p.warning;
+        visuals.error_fg_color = p.danger;
+        visuals.popup_shadow = eframe::egui::Shadow {
+            offset: eframe::egui::vec2(2.0, 3.0),
+            blur: 8.0,
+            spread: 1.0,
+            color: eframe::egui::Color32::from_black_alpha(100),
+        };
+        visuals.window_shadow = eframe::egui::Shadow {
+            offset: eframe::egui::vec2(0.0, 4.0),
+            blur: 12.0,
+            spread: 1.0,
+            color: eframe::egui::Color32::from_black_alpha(120),
+        };
+        visuals.menu_rounding = eframe::egui::Rounding::same(4.0);
+        visuals.button_frame = true;
+        visuals.collapsing_header_frame = true;
+        visuals.striped = true;
+        visuals.slider_trailing_fill = true;
+
+        // Base widget states. Clearlooks buttons are readable and bounded,
+        // rather than relying on large filled rounded rectangles.
+        for w in [
+            &mut visuals.widgets.inactive,
+            &mut visuals.widgets.hovered,
+            &mut visuals.widgets.active,
+            &mut visuals.widgets.open,
+        ] {
+            w.rounding = eframe::egui::Rounding::same(3.0);
+        }
+        visuals.widgets.noninteractive.rounding = eframe::egui::Rounding::same(3.0);
         visuals.widgets.noninteractive.bg_fill = p.surface;
-        visuals.widgets.noninteractive.bg_stroke.color = p.border;
+        visuals.widgets.noninteractive.bg_stroke = eframe::egui::Stroke::new(1.0, p.border);
+        // Plain (non-strong) labels, checkbox captions and slider text all
+        // resolve their color from this noninteractive fg_stroke rather
+        // than always going through `override_text_color` — leaving it at
+        // its `Visuals::dark()`/`Visuals::light()` default made that text
+        // render at a much lower-contrast gray than the rest of the UI.
+        visuals.widgets.noninteractive.fg_stroke = eframe::egui::Stroke::new(1.0, p.text);
+
         visuals.widgets.inactive.bg_fill = p.button_bg;
-        visuals.widgets.hovered.bg_fill = p.accent_hover;
+        visuals.widgets.inactive.weak_bg_fill = p.button_bg;
+        visuals.widgets.inactive.bg_stroke = eframe::egui::Stroke::new(1.0, p.border);
+        visuals.widgets.inactive.fg_stroke.color = p.text;
+
+        visuals.widgets.hovered.bg_fill = p.surface_alt;
+        visuals.widgets.hovered.weak_bg_fill = p.surface_alt;
+        visuals.widgets.hovered.bg_stroke = eframe::egui::Stroke::new(1.0, p.accent);
+        visuals.widgets.hovered.fg_stroke.color = p.text;
+        visuals.widgets.hovered.expansion = 0.0;
+
         visuals.widgets.active.bg_fill = p.accent;
+        visuals.widgets.active.weak_bg_fill = p.accent;
+        visuals.widgets.active.bg_stroke = eframe::egui::Stroke::new(1.0, p.accent_hover);
+        visuals.widgets.active.fg_stroke.color = eframe::egui::Color32::WHITE;
+
+        visuals.widgets.open.bg_fill = p.surface_alt;
+        visuals.widgets.open.weak_bg_fill = p.surface_alt;
+        visuals.widgets.open.bg_stroke = eframe::egui::Stroke::new(1.0, p.accent);
+
         visuals.selection.bg_fill = p.accent;
+        visuals.selection.stroke = eframe::egui::Stroke::new(1.0, p.accent_hover);
         visuals.hyperlink_color = p.accent;
-        ctx.set_visuals(visuals);
+        visuals.text_cursor.stroke = eframe::egui::Stroke::new(1.5, p.accent);
+
+        let mut style = (*ctx.style()).clone();
+        style.spacing.item_spacing = eframe::egui::vec2(7.0, 5.0);
+        style.spacing.window_margin = eframe::egui::Margin::same(10.0);
+        style.spacing.menu_margin = eframe::egui::Margin::same(6.0);
+        style.spacing.button_padding = eframe::egui::vec2(9.0, 4.0);
+        style.spacing.interact_size = eframe::egui::vec2(40.0, 26.0);
+        style.spacing.slider_width = 160.0;
+        style.spacing.combo_width = 150.0;
+        style.spacing.text_edit_width = 300.0;
+        style.spacing.icon_width = 14.0;
+        style.visuals = visuals;
+
+        // The default egui sizes (Heading 18 / Body & Button & Monospace 14
+        // / Small 10) read a little large for a dense utility app like this
+        // one. Trimmed down a notch — still comfortably readable. The
+        // decrypted-file editor (File Protector tab) now takes at least
+        // 3/4 of the window's height, so this sizing keeps it dense rather
+        // than sparse even at that larger area.
+        use eframe::egui::{FontId, FontFamily, TextStyle};
+        style.text_styles = [
+            (TextStyle::Heading, FontId::new(17.0, FontFamily::Proportional)),
+            (TextStyle::Body, FontId::new(13.0, FontFamily::Proportional)),
+            (TextStyle::Button, FontId::new(13.0, FontFamily::Proportional)),
+            (TextStyle::Monospace, FontId::new(13.0, FontFamily::Monospace)),
+            (TextStyle::Small, FontId::new(11.0, FontFamily::Proportional)),
+        ]
+        .into();
+
+        ctx.set_style(style);
     }
 }
 
@@ -163,10 +242,14 @@ fn main() -> eframe::Result<()> {
     // space (see auto_shrink fix above) rather than needing extra window
     // height to avoid feeling cramped. Still resizable/centered, with a
     // min size that keeps both tabs usable without overflow.
-    // Taller than before to make room for the in-app decrypted password
-    // editor at the bottom of the File Protector tab without cramping the
-    // Encrypt/Decrypt columns above it.
-    let (win_w, win_h) = (940.0_f32, 760.0_f32);
+    // The smaller default text size (see `theme::apply`) means every tab's
+    // content is noticeably shorter than it used to be at the old font
+    // sizes the 780px height was tuned for — trimmed back down so short
+    // tabs like the password generator don't sit in a sea of empty space
+    // below their content, while the File Protector tab (still the
+    // tallest, thanks to the in-app decrypted password editor at the
+    // bottom) remains comfortably scrollable rather than clipped.
+    let (win_w, win_h) = (980.0_f32, 700.0_f32);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([win_w, win_h])
@@ -427,7 +510,6 @@ struct BackgroundJob {
 
 struct UnigenApp {
     tab: Tab,
-    dark_mode: bool,
 
     // ---- Generator tab ----
     charsets: Vec<CharSet>,
@@ -455,7 +537,7 @@ struct UnigenApp {
     autoclear_enabled: bool,
     autoclear_seconds: u32,
     autoclear_deadline: Option<Instant>,
-    autoclear_expected: Option<String>,
+    autoclear_expected: Option<Zeroizing<String>>,
     clip_status: String,
 
     // ---- File Protector: Encrypt ----
@@ -609,7 +691,6 @@ impl UnigenApp {
         let enabled: Vec<bool> = sets.iter().map(|s| s.enabled_by_default).collect();
         Self {
             tab: Tab::Generator,
-            dark_mode: true,
             charsets: sets,
             charset_enabled: enabled,
             length: 20,
@@ -694,11 +775,7 @@ impl UnigenApp {
     }
 
     fn palette(&self) -> &'static theme::Palette {
-        if self.dark_mode {
-            &theme::DARK
-        } else {
-            &theme::LIGHT
-        }
+        &theme::DARK
     }
 
     fn active_pool(&self) -> Vec<char> {
@@ -718,12 +795,23 @@ impl UnigenApp {
     /// `copy_to_clipboard` — "always clears" and "clears using the
     /// configured delay" are independent choices, and only the former is
     /// intentional here.
+    ///
+    /// Builds exactly one owned copy of `text` (`Zeroizing<String>`) and
+    /// hands the OS clipboard crate its own separate owned `String` (that
+    /// second copy is unavoidable — `arboard` needs ownership, and once
+    /// it's in the OS clipboard it's outside this app's control anyway,
+    /// same accepted residual risk documented in `secret.rs`). Previously
+    /// this called `text.to_string()` twice independently — once for the
+    /// clipboard, once stored in `autoclear_expected` — and both were
+    /// plain `String`s that leaked unscrubbed plaintext into freed heap
+    /// memory on drop/overwrite instead of just the one unavoidable copy.
     fn copy_to_clipboard_20s(&mut self, text: &str) {
+        let owned = Zeroizing::new(text.to_string());
         if let Some(cb) = self.clipboard.as_mut() {
-            if cb.set_text(text.to_string()).is_ok() {
+            if cb.set_text(owned.as_str().to_string()).is_ok() {
                 self.autoclear_deadline =
                     Some(Instant::now() + Duration::from_secs(self.autoclear_seconds as u64));
-                self.autoclear_expected = Some(text.to_string());
+                self.autoclear_expected = Some(owned);
                 self.editor_status = format!(
                     "Copied line. Clipboard clears in {}s.",
                     self.autoclear_seconds
@@ -735,12 +823,13 @@ impl UnigenApp {
     }
 
     fn copy_to_clipboard(&mut self, text: &str) {
+        let owned = Zeroizing::new(text.to_string());
         if let Some(cb) = self.clipboard.as_mut() {
-            if cb.set_text(text.to_string()).is_ok() {
+            if cb.set_text(owned.as_str().to_string()).is_ok() {
                 self.clip_status = if self.autoclear_enabled {
                     self.autoclear_deadline =
                         Some(Instant::now() + Duration::from_secs(self.autoclear_seconds as u64));
-                    self.autoclear_expected = Some(text.to_string());
+                    self.autoclear_expected = Some(owned);
                     format!("Copied. Auto-clears in {}s.", self.autoclear_seconds)
                 } else {
                     self.autoclear_deadline = None;
@@ -1376,12 +1465,50 @@ impl UnigenApp {
                 self.copy_to_clipboard(&v);
             }
             ui.label("Notes");
-            let notes_resp =
-                ui.add(egui::TextEdit::multiline(&mut self.vault_edit_notes).desired_rows(4));
-            let mut notes_copy: Option<SecretString> = None;
+            let notes_resp = ui.add(
+                secure_text_edit::SecureNotesEdit::new("vault_edit_notes", &mut self.vault_edit_notes)
+                    .desired_rows(6),
+            );
+
+            // Ctrl/Cmd+C inside the field itself: the widget never
+            // touches the clipboard directly (see its doc comments) —
+            // it only flags the request, so the actual copy still goes
+            // through `copy_to_clipboard` here, same autoclear timer as
+            // every other copy action in the app.
+            if secure_text_edit::take_copy_request(ui, "vault_edit_notes") {
+                let to_copy = match secure_text_edit::selected_range(ui, "vault_edit_notes") {
+                    Some(range) => secure_text_edit::extract_range(&self.vault_edit_notes, range),
+                    None => Zeroizing::new(self.vault_edit_notes.as_str().to_string()),
+                };
+                self.copy_to_clipboard(&to_copy);
+            }
+
+            let has_selection =
+                secure_text_edit::selected_range(ui, "vault_edit_notes").is_some();
+            let mut notes_copy: Option<Zeroizing<String>> = None;
             notes_resp.context_menu(|ui| {
-                if ui.button("Copy").clicked() {
-                    notes_copy = Some(self.vault_edit_notes.clone());
+                if ui.button("Copy all").clicked() {
+                    notes_copy = Some(Zeroizing::new(self.vault_edit_notes.as_str().to_string()));
+                    ui.close_menu();
+                }
+                if ui
+                    .add_enabled(has_selection, egui::Button::new("Copy selection"))
+                    .clicked()
+                {
+                    if let Some(range) =
+                        secure_text_edit::selected_range(ui, "vault_edit_notes")
+                    {
+                        notes_copy = Some(secure_text_edit::extract_range(&self.vault_edit_notes, range));
+                    }
+                    ui.close_menu();
+                }
+                if ui.button("Copy line").clicked() {
+                    let range = secure_text_edit::current_line_range(
+                        ui,
+                        "vault_edit_notes",
+                        &self.vault_edit_notes,
+                    );
+                    notes_copy = Some(secure_text_edit::extract_range(&self.vault_edit_notes, range));
                     ui.close_menu();
                 }
             });
@@ -1611,12 +1738,22 @@ impl UnigenApp {
                 // Only clear if the clipboard still holds what we put
                 // there (best-effort — arboard's read-back is a plain
                 // text compare, same idea as the Python original).
-                let still_ours = self
+                // The read-back itself is wrapped in `Zeroizing` too: it's
+                // a fresh plaintext copy of whatever's on the clipboard
+                // (secret, if `still_ours` turns out true) and would
+                // otherwise leak the same way the old `autoclear_expected`
+                // did before this file's copy-to-clipboard paths were
+                // fixed to zeroize on drop.
+                let cur = self
                     .clipboard
                     .as_mut()
                     .and_then(|cb| cb.get_text().ok())
-                    .map(|cur| Some(cur) == self.autoclear_expected)
-                    .unwrap_or(true);
+                    .map(Zeroizing::new);
+                let still_ours = match (&cur, &self.autoclear_expected) {
+                    (Some(c), Some(e)) => c.as_str() == e.as_str(),
+                    (None, _) => true,
+                    (Some(_), None) => false,
+                };
                 if still_ours {
                     if let Some(cb) = self.clipboard.as_mut() {
                         let _ = cb.set_text(String::new());
@@ -2622,6 +2759,21 @@ fn run_decrypt_job(
 }
 
 impl eframe::App for UnigenApp {
+    /// By default eframe saves the whole `egui::Context` memory —
+    /// including its `Style`/`Visuals`, since `ctx.set_style()` writes
+    /// there too — to disk and restores it on the next launch, layered on
+    /// top of whatever `theme::apply()` sets in `main()`. That is what
+    /// made this app's very first frame after an update sometimes render
+    /// with a stale, previously-saved theme (wrong accent color, uncompacted
+    /// spacing) until the in-app dark/light toggle was clicked once and
+    /// reapplied the current theme at runtime. Nothing here benefits from
+    /// surviving a restart anyway (scroll offsets, collapsing-header state,
+    /// etc., for a password vault app), so persistence is switched off
+    /// entirely and `theme::apply()` is always the sole source of truth.
+    fn persist_egui_memory(&self) -> bool {
+        false
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.tick_autoclear();
         self.tick_pwd_autoclear();
@@ -2770,36 +2922,49 @@ impl eframe::App for UnigenApp {
                 });
         }
 
-        egui::TopBottomPanel::top("header").show(ctx, |ui| {
+        egui::TopBottomPanel::top("header").frame(
+            egui::Frame::none()
+                .fill(self.palette().surface)
+                .inner_margin(egui::Margin::symmetric(14.0, 9.0))
+                .stroke(egui::Stroke::new(1.0, self.palette().border)),
+        ).show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.heading("UNIGEN");
-                ui.label("Unicode password generation & file protection");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    // ☾ (U+263E) isn't a real emoji codepoint, so most
-                    // fonts — including egui's bundled emoji font — have no
-                    // glyph for it and render nothing. 🌙 (U+1F319, an
-                    // actual emoji) is the equivalent that reliably shows.
-                    if ui
-                        .button(if self.dark_mode {
-                            "☀ Light"
-                        } else {
-                            "🌙 Dark"
-                        })
-                        .clicked()
-                    {
-                        self.dark_mode = !self.dark_mode;
-                        theme::apply(ctx, self.dark_mode);
-                    }
-                });
+                ui.heading(
+                    egui::RichText::new("UNIGEN").strong().size(22.0),
+                );
+                ui.separator();
+                ui.label(
+                    egui::RichText::new("Unicode password generation & file protection")
+                        .color(self.palette().text_secondary),
+                );
             });
+            ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.tab, Tab::Generator, "Password Generator");
-                ui.selectable_value(&mut self.tab, Tab::FileProtector, "File Protector");
-                ui.selectable_value(&mut self.tab, Tab::Vault, "Vault");
+                let tabs = [
+                    (Tab::Generator, "Password Generator"),
+                    (Tab::FileProtector, "File Protector"),
+                    (Tab::Vault, "Vault"),
+                ];
+                for (tab, label) in tabs {
+                    let selected = self.tab == tab;
+                    let button = egui::SelectableLabel::new(
+                        selected,
+                        egui::RichText::new(label).strong(),
+                    );
+                    if ui.add(button).clicked() {
+                        self.tab = tab;
+                    }
+                }
             });
         });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::none()
+                    .fill(self.palette().bg)
+                    .inner_margin(egui::Margin::symmetric(12.0, 10.0)),
+            )
+            .show(ctx, |ui| {
             // The File Protector tab's content (three panels + the
             // password editor, which itself grows with search results)
             // can be taller than the window, especially at the min window
@@ -2824,7 +2989,7 @@ impl UnigenApp {
     fn ui_generator_tab(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_top(|ui| {
             ui.vertical(|ui| {
-                ui.set_width(300.0);
+                ui.set_width(270.0);
                 ui.group(|ui| {
                     ui.strong("Generation Settings");
                     ui.separator();
@@ -2904,7 +3069,7 @@ impl UnigenApp {
                             if self.generated.is_empty() {
                                 ui.label("Click “Generate Passwords” to begin.");
                             } else {
-                                let mut to_copy: Option<String> = None;
+                                let mut to_copy: Option<Zeroizing<String>> = None;
                                 for (i, pwd) in self.generated.iter().enumerate() {
                                     ui.horizontal(|ui| {
                                         if ui
@@ -2912,7 +3077,7 @@ impl UnigenApp {
                                             .on_hover_text(format!("Copy just this password; auto-clears from the clipboard in {}s.", self.autoclear_seconds))
                                             .clicked()
                                         {
-                                            to_copy = Some(pwd.as_str().to_owned());
+                                            to_copy = Some(Zeroizing::new(pwd.as_str().to_owned()));
                                         }
                                         let label_resp =
                                             ui.monospace(format!("#{}: {}", i + 1, pwd.as_str()));
@@ -2925,7 +3090,7 @@ impl UnigenApp {
                                         // separate unguarded clipboard write.
                                         label_resp.context_menu(|ui| {
                                             if ui.button("Copy").clicked() {
-                                                to_copy = Some(pwd.as_str().to_owned());
+                                                to_copy = Some(Zeroizing::new(pwd.as_str().to_owned()));
                                                 ui.close_menu();
                                             }
                                         });
@@ -3363,10 +3528,12 @@ impl UnigenApp {
                 matches.len(),
                 self.autoclear_seconds
             ));
-            let mut to_copy: Option<String> = None;
+            let mut to_copy: Option<Zeroizing<String>> = None;
+            let min_editor_height = ui.ctx().screen_rect().height() * 0.75;
             egui::ScrollArea::vertical()
                 .id_source("editor_search_scroll")
-                .max_height(340.0)
+                .min_scrolled_height(min_editor_height)
+                .max_height(f32::INFINITY)
                 .show(ui, |ui| {
                     if matches.is_empty() {
                         ui.small("No matches.");
@@ -3397,7 +3564,7 @@ impl UnigenApp {
                                             ui.close_menu();
                                         }
                                         if ui.button("Copy line").clicked() {
-                                            to_copy = Some(full_line.clone());
+                                            to_copy = Some(Zeroizing::new(full_line.clone()));
                                             ui.close_menu();
                                         }
                                     });
@@ -3409,19 +3576,22 @@ impl UnigenApp {
                 self.copy_to_clipboard_20s(&line);
             }
         } else {
-            // Below a certain length this used to give a cramped ~120px
-            // box; now that the window is taller by default (see main())
-            // it gets a proper full-height editing area.
+            // Editor should take up at least 3/4 of the window's height so
+            // it's the dominant element on screen rather than a cramped
+            // fixed-size box.
+            let min_editor_height = ui.ctx().screen_rect().height() * 0.75;
             let mut editor_resp_opt = None;
             egui::ScrollArea::vertical()
                 .id_source("editor_main_scroll")
-                .max_height(340.0)
+                .min_scrolled_height(min_editor_height)
+                .max_height(f32::INFINITY)
                 .show(ui, |ui| {
                     let r = ui.add(
                         egui::TextEdit::multiline(&mut self.editor_content)
                             .font(egui::TextStyle::Monospace)
                             .desired_rows(10)
-                            .desired_width(f32::INFINITY),
+                            .desired_width(f32::INFINITY)
+                            .min_size(egui::vec2(0.0, min_editor_height)),
                     );
                     editor_resp_opt = Some(r);
                 });
@@ -3441,7 +3611,7 @@ impl UnigenApp {
                     }
                 });
                 if copy_all {
-                    let text = self.editor_content.as_str().to_owned();
+                    let text = Zeroizing::new(self.editor_content.as_str().to_owned());
                     self.copy_to_clipboard_20s(&text);
                 }
             }
@@ -3461,8 +3631,15 @@ impl UnigenApp {
 /// `charsets.rs`), so whitespace is an unambiguous separator — unlike '#',
 /// which could collide with a '#' that legitimately appears inside the
 /// password itself and silently truncate it.
-fn password_part(line: &str) -> String {
-    line.split_whitespace().next().unwrap_or("").to_string()
+///
+/// Returns `Zeroizing<String>`, not a plain `String`: this pulls a real
+/// password out of decrypted editor content, and callers hand it straight
+/// to `copy_to_clipboard_20s`. A plain `String` here would leave that
+/// password sitting in unscrubbed freed heap memory indefinitely once
+/// dropped — see `secure_text_edit::extract_range`'s doc comment for the
+/// same issue found (and fixed) on the Notes copy path.
+fn password_part(line: &str) -> Zeroizing<String> {
+    Zeroizing::new(line.split_whitespace().next().unwrap_or("").to_string())
 }
 
 /// HIGH fix: previously used `rand::thread_rng()`. That's already a

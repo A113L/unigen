@@ -29,6 +29,7 @@
 //! feature isn't available" as an acceptable degraded mode, not a fatal
 //! error, exactly like `mem_lock::SUPPORTED == false` elsewhere.
 
+#[cfg(not(windows))]
 use anyhow::{anyhow, Result};
 
 /// Whether this platform actually has DPAPI. Mirrors `mem_lock::SUPPORTED`

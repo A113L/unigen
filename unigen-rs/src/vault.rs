@@ -343,6 +343,7 @@ pub fn change_master_password(
 /// a subset of fields, and this keeps the parsing/mapping logic in one
 /// place instead of scattered across call sites that build `VaultEntry`
 /// directly (and would each need to remember to fill in `id`/timestamps).
+#[derive(Debug)]
 pub struct ImportedRow {
     pub title: String,
     pub username: String,
@@ -473,6 +474,58 @@ fn split_csv_line(line: &str) -> Vec<String> {
     fields
 }
 
+/// Split raw CSV `contents` into logical records, merging together any
+/// physical lines that fall *inside* a quoted field.
+///
+/// `split_csv_line` only ever sees one physical line at a time, so on
+/// its own it can't handle exports (KeePassXC's CSV exporter is the
+/// common case) that write multi-line Notes fields as a single quoted
+/// field containing literal `\n` characters. Splitting purely on
+/// `contents.lines()` — as this function used to — chops such a field
+/// into multiple bogus "records": the remainder of the real row (and
+/// whatever comes after, e.g. a `Last Modified`/`Created` timestamp
+/// column KeePassXC includes) gets reinterpreted with the header's
+/// column order, which is how a timestamp ends up parsed straight into
+/// `title` as an orphaned entry.
+///
+/// This tracks the running double-quote parity across line boundaries
+/// (the same "toggle on every unescaped `"`" rule `split_csv_line` uses
+/// within a line — a doubled `""` toggles twice, i.e. net no-op, so it
+/// stays consistent whether or not the pair straddles a line break) and
+/// only closes a record once parity is even, i.e. no field is left open.
+fn split_csv_records(contents: &str) -> Vec<String> {
+    let mut records = Vec::new();
+    let mut current = String::new();
+    let mut quote_count = 0usize;
+
+    for line in contents.lines() {
+        if !current.is_empty() {
+            current.push('\n');
+        }
+        current.push_str(line);
+        quote_count += line.chars().filter(|&c| c == '"').count();
+
+        // Even quote count => every opened field on this record has
+        // also been closed, so the record is complete. Odd => we're
+        // still inside a quoted field and the next physical line is a
+        // continuation of the same record, not a new one.
+        if quote_count % 2 == 0 {
+            if !current.trim().is_empty() {
+                records.push(std::mem::take(&mut current));
+            } else {
+                current.clear();
+            }
+            quote_count = 0;
+        }
+    }
+    // Leftover with an unterminated quote (malformed/truncated export):
+    // still surface it rather than silently dropping data.
+    if !current.trim().is_empty() {
+        records.push(current);
+    }
+    records
+}
+
 fn header_index(header: &[String], candidates: &[&str]) -> Option<usize> {
     header.iter().position(|h| {
         let h = h.trim().to_lowercase();
@@ -497,9 +550,9 @@ fn header_index_contains(header: &[String], candidates: &[&str]) -> Option<usize
 /// fields are blank, since a partially-filled entry is still more useful
 /// than silently dropping it.
 pub fn parse_csv(contents: &str, source: CsvSource) -> Result<Vec<ImportedRow>> {
-    let mut lines = contents.lines();
-    let header_line = lines.next().context("CSV file is empty")?;
-    let header: Vec<String> = split_csv_line(header_line);
+    let mut records = split_csv_records(contents).into_iter();
+    let header_line = records.next().context("CSV file is empty")?;
+    let header: Vec<String> = split_csv_line(&header_line);
 
     let (title_i, user_i, pass_i, url_i, notes_i) = match source {
         CsvSource::Chromium => (
@@ -570,11 +623,11 @@ pub fn parse_csv(contents: &str, source: CsvSource) -> Result<Vec<ImportedRow>> 
     };
 
     let mut rows = Vec::new();
-    for line in lines {
-        if line.trim().is_empty() {
+    for record in records {
+        if record.trim().is_empty() {
             continue;
         }
-        let fields = split_csv_line(line);
+        let fields = split_csv_line(&record);
         let mut title = get(&fields, title_i);
         let username = get(&fields, user_i);
         let password = get(&fields, pass_i);
@@ -582,8 +635,16 @@ pub fn parse_csv(contents: &str, source: CsvSource) -> Result<Vec<ImportedRow>> 
         let mut notes = get(&fields, notes_i);
 
         if let Some(gi) = group_i {
-            let group = get(&fields, Some(gi));
-            if !group.is_empty() {
+            let raw_group = get(&fields, Some(gi));
+            // KeePass's default top-level group is always literally named
+            // "Root" for every entry that isn't filed into a sub-folder
+            // (and nested groups export as "Root/Sub/Folder"), so a bare
+            // "Root" carries no information — folding it in unconditionally
+            // just prefixes every single imported entry's notes with
+            // "Group: Root\n" noise. Only fold the group in when it names
+            // an actual sub-folder.
+            let group = raw_group.strip_prefix("Root/").unwrap_or(&raw_group);
+            if !group.is_empty() && !group.eq_ignore_ascii_case("root") {
                 notes = if notes.is_empty() {
                     format!("Group: {group}")
                 } else {
@@ -755,6 +816,76 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_ne!(entries[0].id, entries[1].id);
         assert!(entries.capacity() >= 2);
+    }
+
+    #[test]
+    fn keepass_csv_with_singleline_notes_parses_one_row_per_entry() {
+        let csv = "\"Group\",\"Title\",\"Username\",\"Password\",\"URL\",\"Notes\"\n\
+                    \"Root\",\"Bank\",\"alice\",\"hunter2\",\"https://bank.example\",\"plain note\"\n\
+                    \"Root\",\"Email\",\"bob\",\"swordfish\",\"https://mail.example\",\"another note\"\n";
+        let rows = parse_csv(csv, CsvSource::KeePass).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].title, "Bank");
+        assert_eq!(rows[1].title, "Email");
+    }
+
+    /// Reproduces the "orphaned timestamp entries" bug: KeePassXC's CSV
+    /// exporter writes multi-line Notes as a single quoted field
+    /// containing literal newlines, plus a trailing timestamp-like
+    /// column. Splitting records purely by `contents.lines()` used to
+    /// chop that field apart, producing a bogus extra row whose `title`
+    /// ended up being the timestamp column's value.
+    #[test]
+    fn keepass_csv_with_multiline_notes_does_not_produce_orphaned_rows() {
+        let csv = "\"Group\",\"Title\",\"Username\",\"Password\",\"URL\",\"Notes\",\"Last Modified\"\n\
+                    \"Root\",\"Recovery codes\",\"alice\",\"hunter2\",\"https://example.com\",\"line one\nline two\nline three\",\"2024-01-02 03:04:05\"\n\
+                    \"Root\",\"Email\",\"bob\",\"swordfish\",\"https://mail.example\",\"no newline here\",\"2024-02-03 04:05:06\"\n";
+
+        let rows = parse_csv(csv, CsvSource::KeePass).unwrap();
+
+        // Exactly two real entries — no extra row spawned from the
+        // second half of the multi-line note / the timestamp column.
+        assert_eq!(rows.len(), 2, "unexpected rows: {:#?}", rows);
+
+        assert_eq!(rows[0].title, "Recovery codes");
+        assert_eq!(rows[0].notes, "line one\nline two\nline three");
+
+        assert_eq!(rows[1].title, "Email");
+        assert_eq!(rows[1].notes, "no newline here");
+
+        // Nothing that looks like the bare timestamp should have leaked
+        // into a title on its own.
+        assert!(rows.iter().all(|r| r.title != "2024-01-02 03:04:05"));
+    }
+
+    /// A bare "Root" group (KeePass's unavoidable default for every
+    /// top-level entry) carries no information and must not be folded
+    /// into notes. An actual sub-folder — exported as "Root/Sub" — does
+    /// carry information and should show up, with the redundant "Root/"
+    /// prefix stripped.
+    #[test]
+    fn keepass_csv_root_group_is_not_folded_into_notes_but_subfolders_are() {
+        let csv = "\"Group\",\"Title\",\"Username\",\"Password\",\"URL\",\"Notes\"\n\
+                    \"Root\",\"Top-level entry\",\"alice\",\"hunter2\",\"\",\"\"\n\
+                    \"Root/Banking\",\"Sub-folder entry\",\"bob\",\"swordfish\",\"\",\"existing note\"\n";
+
+        let rows = parse_csv(csv, CsvSource::KeePass).unwrap();
+        assert_eq!(rows.len(), 2);
+
+        assert_eq!(rows[0].title, "Top-level entry");
+        assert_eq!(rows[0].notes, "");
+
+        assert_eq!(rows[1].title, "Sub-folder entry");
+        assert_eq!(rows[1].notes, "Group: Banking\nexisting note");
+    }
+
+    #[test]
+    fn split_csv_records_merges_embedded_newlines() {
+        let contents = "a,\"b\nc\",d\ne,f,g\n";
+        let records = split_csv_records(contents);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0], "a,\"b\nc\",d");
+        assert_eq!(records[1], "e,f,g");
     }
 }
 
