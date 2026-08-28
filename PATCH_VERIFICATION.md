@@ -59,3 +59,51 @@ This directly fixes the limitation called out in 2.0.4 above.
 This fully closes the gap identified in the previous version — no dedicated tool or extra engineering effort beyond building this one new safe-storage type was needed.
 
 ---
+
+## Version 2.0.8: Locking memory, encrypting passwords in RAM, and a safer save path
+
+### Re-confirmed: cleared passwords still leave no trace in memory
+
+We repeated the memory-residue test from the section above, but this time using a full core dump instead of a live snapshot:
+
+1. Typed a unique marker password into the app
+2. Cleared the field
+3. Took a full core dump of the running process (`gdb generate-core-file`)
+4. Searched the dump for the marker text
+
+**Result: no matches found.** ✅ This confirms the zeroization behavior and the undo-history-free password field are still working correctly after all the changes below.
+
+### Passwords in the vault are now encrypted while the app is running, not just scrambled
+
+Previously (as of 2.0.5), a saved password sat in memory as plain readable text the whole time the vault was unlocked, just protected from leaving stray copies behind. Now, each vault password is kept **encrypted in memory** at all times, and is only decrypted for the brief moment it's actually needed (showing it on screen, editing it, or copying it to the clipboard) — immediately after which it's put back in its encrypted form. This is the same technique used by other well-known password managers. It's an extra layer of protection against someone inspecting the app's memory (e.g. via a crash dump or debugger); it doesn't change how the vault file itself is encrypted on disk, which is unchanged and still as strong as before.
+
+We also fixed a subtle gap: if a piece of protected text needed to grow while it was locked in memory, the new, larger copy wasn't being re-protected — meaning that protection could silently lapse after further typing. That's now fixed.
+
+### Extra protection against a "peeping" process, on every platform
+
+The app now applies several operating-system-level defenses, on Windows and Mac as well as Linux, that make it harder for another program (or a crash report) to peek at its memory:
+- Turns off automatic crash dumps/core dumps
+- Restricts which other processes are allowed to attach a debugger to it
+- On Windows specifically, also blocks a couple of known code-injection techniques
+
+As before, if the operating system refuses one of these protections for some reason, the app simply continues without it rather than failing.
+
+### New optional feature: staying unlocked after auto-lock, without retyping your password (Windows only)
+
+Windows users can now opt in to a setting where, after the vault auto-locks from inactivity, clicking "Unlock" doesn't require retyping the master password. This works by having Windows itself (via a feature called DPAPI, tied to your Windows user account) securely remember it for you — the password is never stored as plain readable text while waiting to be reused. Locking manually, changing your master password, or switching to a different vault file all immediately erase this remembered password. The setting doesn't exist on Mac or Linux.
+
+### Fixed: vault could sometimes fail to reopen after auto-lock, even with the correct password
+
+This was a real bug, more noticeable in larger vaults (several hundred entries). Previously, when saving the vault, the app wrote the new encrypted file to disk and trusted that a successful write meant the file was actually saved correctly — but that's not always a safe assumption. Occasionally, something could go wrong between "the app finished writing" and "the file is fully, correctly saved," and the vault wouldn't be noticed as broken until the next time it tried to reopen — which, because of auto-lock, could be soon after.
+
+**What changed:** before replacing your real vault file with the newly saved version, the app now double-checks its own work — it decrypts the new file twice (once right after saving, once again after reading it back off disk) and confirms both match. If anything looks wrong, the save is stopped immediately with a clear error, and your existing, working vault file is left completely untouched.
+
+### Fixed: unhelpful error messages
+
+If unlocking or saving the vault failed, the app used to show a generic error that didn't distinguish "wrong password" from other problems (like the save-path issue above, or a corrupted file). Error messages now show the full, specific reason for the failure.
+
+### Also fixed
+- A crash that could happen when clicking into a password field, caused by a mismatch in some internal tracking of which field was focused
+- Password fields displayed an oversized dot for each character; switched to the standard, smaller bullet character
+
+---
