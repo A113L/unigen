@@ -62,17 +62,6 @@ This fully closes the gap identified in the previous version — no dedicated to
 
 ## Version 2.0.8: Locking memory, encrypting passwords in RAM, and a safer save path
 
-### Re-confirmed: cleared passwords still leave no trace in memory
-
-We repeated the memory-residue test from the section above, but this time using a full core dump instead of a live snapshot:
-
-1. Typed a unique marker password into the app
-2. Cleared the field
-3. Took a full core dump of the running process (`gdb generate-core-file`)
-4. Searched the dump for the marker text
-
-**Result: no matches found.** ✅ This confirms the zeroization behavior and the undo-history-free password field are still working correctly after all the changes below.
-
 ### Passwords in the vault are now encrypted while the app is running, not just scrambled
 
 Previously (as of 2.0.5), a saved password sat in memory as plain readable text the whole time the vault was unlocked, just protected from leaving stray copies behind. Now, each vault password is kept **encrypted in memory** at all times, and is only decrypted for the brief moment it's actually needed (showing it on screen, editing it, or copying it to the clipboard) — immediately after which it's put back in its encrypted form. This is the same technique used by other well-known password managers. It's an extra layer of protection against someone inspecting the app's memory (e.g. via a crash dump or debugger); it doesn't change how the vault file itself is encrypted on disk, which is unchanged and still as strong as before.
