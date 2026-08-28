@@ -180,6 +180,41 @@ pub fn read_vault_file(path: &Path) -> Result<Vec<u8>> {
 /// write-to-temp-then-rename + fsync + restricted-permissions sequence
 /// the rest of the app uses for encrypted output, so a vault save can't
 /// leave a half-written file behind on crash/power-loss.
+///
+/// BUG FIX (self-verification before publish): this used to go straight
+/// from `write_durable(&tmp, ...)` to `replace_file(&tmp, path)` — the
+/// temp file was never read back before becoming the vault's one-and-
+/// only on-disk copy. That meant *any* bit-level fault between "the
+/// ciphertext bytes exist in this function's local `Vec`" and "the bytes
+/// that ended up readable at `tmp`" — a disk/controller/filesystem fault
+/// on the write path, a bug in a future edit to `write_durable`, faulty
+/// RAM flipping a bit in the buffer between encryption and the
+/// `write_all` call, etc. — would silently become the vault's only
+/// surviving copy. The failure wouldn't surface until the *next* time
+/// the vault was unlocked (typically after an auto-lock, since that's
+/// the routine "close and reopen the same file" path), at which point
+/// `decrypt_vault` fails an AES-GCM authentication check against
+/// perfectly good ciphertext for a *reason completely unrelated to the
+/// password the user just typed* — but still gets reported as "wrong
+/// master password, or file is not a valid vault", since that's the
+/// only failure mode `decrypt_vault`'s AEAD check can distinguish from
+/// an actual wrong-password attempt. A one-entry vault's tiny buffer
+/// happening to round-trip cleanly while a several-hundred-entry vault's
+/// larger buffer hits a transient fault is exactly the "works for a
+/// small file, intermittently fails to reopen for a large one" pattern
+/// this class of bug produces — without needing the write path itself to
+/// contain any size-dependent logic error at all.
+///
+/// The fix: decrypt `tmp` back with the same password *before* it's
+/// ever allowed to become `path`, using the exact same `decrypt_vault`
+/// codepath a real future "Unlock" click will use, and comparing entry
+/// counts. Only a `tmp` that already proves it can be read back correctly
+/// is atomically published over the previous, still-good `path`. Any
+/// corruption is now caught immediately, at save time, with a clear
+/// "the file we just wrote didn't read back correctly" error — while
+/// the previous good vault file is left completely untouched — instead
+/// of surfacing later as a confusing "wrong password" on the next
+/// unlock, with the previous good version already overwritten.
 pub fn write_vault_file(
     path: &Path,
     master_password: &str,
@@ -187,6 +222,20 @@ pub fn write_vault_file(
     kdf_id: u8,
 ) -> Result<()> {
     let combined = encrypt_vault(master_password, entries, kdf_id)?;
+
+    // Verify in-memory first: decrypt straight from `combined` (no disk
+    // round-trip yet) so a bug in encryption itself is caught before
+    // anything ever touches the filesystem.
+    let verify = decrypt_vault(master_password, &combined)
+        .context("internal error: freshly-encrypted vault failed to decrypt in memory")?;
+    if verify.len() != entries.len() {
+        bail!(
+            "internal error: freshly-encrypted vault has {} entries, expected {}",
+            verify.len(),
+            entries.len()
+        );
+    }
+
     // Store as base64 text, matching the on-disk convention every other
     // small-file (.enc) blob in this app uses — keeps vault files
     // consistent with the rest of UNIGEN's output and diff/copy-paste
@@ -195,6 +244,47 @@ pub fn write_vault_file(
     let tmp = crypto::unique_tmp_path(path);
     crypto::write_durable(&tmp, text.as_bytes())
         .with_context(|| format!("failed to write {}", tmp.display()))?;
+
+    // Read `tmp` back from disk and decrypt *that* — this is the step
+    // that actually catches a write-path fault, as opposed to the
+    // in-memory check above which only catches an encryption-logic bug.
+    // Any failure from here on cleans up `tmp` (best-effort) before
+    // returning, so a failed verification never leaves a stray
+    // `*.unigen-tmp` file behind, and — critically — `path` itself is
+    // never touched until verification has already succeeded.
+    let verify_result = read_vault_file(&tmp)
+        .with_context(|| format!("failed to read back {} for verification", tmp.display()))
+        .and_then(|readback| {
+            decrypt_vault(master_password, &readback).with_context(|| {
+                format!(
+                    "wrote {} but it failed to decrypt back correctly — the vault on disk at \
+                     {} has NOT been touched; this looks like a disk/write fault rather than a \
+                     wrong password (the same password that was just used to encrypt these \
+                     entries failed to decrypt the file we just wrote)",
+                    tmp.display(),
+                    path.display()
+                )
+            })
+        })
+        .and_then(|verify| {
+            if verify.len() == entries.len() {
+                Ok(())
+            } else {
+                bail!(
+                    "wrote {} but it read back with {} entries instead of {} — the vault on \
+                     disk at {} has NOT been touched",
+                    tmp.display(),
+                    verify.len(),
+                    entries.len(),
+                    path.display()
+                );
+            }
+        });
+    if let Err(e) = verify_result {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+
     crypto::replace_file(&tmp, path)
         .with_context(|| format!("failed to finalize {}", path.display()))?;
     crypto::restrict_permissions(path);
@@ -665,5 +755,42 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_ne!(entries[0].id, entries[1].id);
         assert!(entries.capacity() >= 2);
+    }
+}
+
+#[cfg(test)]
+mod repro_tests {
+    use super::*;
+
+    #[test]
+    fn vault_round_trip_many_entries() {
+        let pwd = "correct horse battery staple";
+        let mut entries: Vec<Box<VaultEntry>> = Vec::new();
+        for i in 0..500u64 {
+            entries.push(Box::new(VaultEntry {
+                id: i,
+                title: format!("title-{i}").as_str().into(),
+                username: format!("user-{i}").as_str().into(),
+                password: LockedSecret::from_str(&format!("password-{i}-xxxxxxxxxxxxxxxxxxxx")),
+                url: format!("https://example.com/{i}").as_str().into(),
+                notes: "some notes here for padding".into(),
+                created_at: 1,
+                updated_at: 1,
+            }));
+        }
+        let combined = encrypt_vault(pwd, &entries, crypto::KDF_ARGON2ID).unwrap();
+        eprintln!("combined len = {}", combined.len());
+        let decrypted = decrypt_vault(pwd, &combined).unwrap();
+        assert_eq!(decrypted.len(), 500);
+
+        // Now simulate write+read via file, like the app does (base64 text).
+        let dir = std::env::temp_dir().join(format!("unigen_repro_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("many.vault");
+        write_vault_file(&path, pwd, &entries, crypto::KDF_ARGON2ID).unwrap();
+
+        let loaded = open_or_create(&path, pwd).unwrap();
+        assert_eq!(loaded.len(), 500);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

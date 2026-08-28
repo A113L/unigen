@@ -7,8 +7,10 @@
 
 mod charsets;
 mod crypto;
+mod dpapi;
 mod mem_cipher;
 mod mem_lock;
+mod process_isolation;
 mod secret;
 mod secure_text_edit;
 mod shred;
@@ -144,6 +146,16 @@ fn main() -> eframe::Result<()> {
     // the "crash leaves a readable file behind" case, and only on Linux).
     #[cfg(target_os = "linux")]
     disable_core_dumps();
+
+    // Cross-platform process hardening (extends the Linux-only core-dump
+    // mitigation above to macOS/Windows, and adds anti-injection/
+    // anti-debug measures on Windows). See `process_isolation` module
+    // docs for exactly what each platform gets and why none of it is a
+    // hard security boundary. Must run before any secret (master
+    // password, vault entries, editor plaintext) ever enters memory,
+    // which is why this is still the very first thing `main` does after
+    // logging setup.
+    process_isolation::init();
 
     // Mirror the Python original: size the window relative to the screen
     // (capped to a sane range) and center it, instead of a fixed size.
@@ -547,6 +559,22 @@ struct UnigenApp {
     /// memory) instead of just clearing a text field.
     vault_last_activity: Instant,
     vault_autolock_seconds: u32,
+    /// User opt-in: on Windows only (`dpapi::SUPPORTED`), remember the
+    /// master password across an *auto-lock* (not a manual "Lock" click,
+    /// and not an app restart) so the next "Unlock" click doesn't
+    /// require retyping it. The password is never kept as plaintext at
+    /// rest for this: see `vault_dpapi_cache` below — this bool is only
+    /// "would the user like that convenience if available".
+    vault_remember_session: bool,
+    /// DPAPI-sealed (`CryptProtectData`) master password, set only when
+    /// `vault_remember_session` is on and an auto-lock just fired.
+    /// `None` on every other platform (`dpapi::SUPPORTED == false`,
+    /// nothing ever populates this) and cleared on manual "Lock", on
+    /// changing the master password, on picking a different vault file,
+    /// and on app exit — it must never outlive the Windows login session
+    /// it was sealed under, and DPAPI itself would refuse to unprotect
+    /// it after that anyway (the OS's own logon-session key rotates).
+    vault_dpapi_cache: Option<Vec<u8>>,
 
     // ---- Vault: change master password ----
     vault_change_pwd_open: bool,
@@ -645,6 +673,8 @@ impl UnigenApp {
             vault_confirm_delete: None,
             vault_last_activity: Instant::now(),
             vault_autolock_seconds: 120,
+            vault_remember_session: false,
+            vault_dpapi_cache: None,
             vault_change_pwd_open: false,
             vault_change_pwd_current: SecretString::new(),
             vault_change_pwd_new: SecretString::new(),
@@ -750,8 +780,42 @@ impl UnigenApp {
             return;
         };
         let mut pwd = std::mem::take(&mut self.vault_master_pwd);
+        // Convenience path: the field was left empty (user just clicked
+        // "Unlock" again after an auto-lock) but we have a DPAPI-sealed
+        // password from before that auto-lock — recover it instead of
+        // making the user retype it. Any failure here (wrong Windows
+        // login session, tampered blob, platform without DPAPI) just
+        // falls through to the normal "ask for the password" flow rather
+        // than being surfaced as an error, since the user never asked
+        // for this to succeed — it's a bonus, not a requirement.
+        if pwd.is_empty() {
+            if let Some(sealed) = &self.vault_dpapi_cache {
+                if let Ok(mut recovered) = dpapi::unprotect(sealed) {
+                    if let Ok(text) = std::str::from_utf8(&recovered) {
+                        pwd = SecretString::from_str(text);
+                    }
+                    recovered.zeroize();
+                }
+            }
+        }
         let is_new = !path.exists();
         let result = vault::open_or_create(&path, &pwd);
+        match &result {
+            Ok(_) if self.vault_remember_session && dpapi::SUPPORTED && !is_new => {
+                // Re-seal (rather than reuse whatever was already
+                // cached): this keeps the cache in sync with whatever
+                // password just proved correct, including the case
+                // where the user typed a *different* password than the
+                // one previously cached (e.g. after "Change master
+                // password" while a stale cache from before the change
+                // would otherwise have gone silently unused forever).
+                match dpapi::protect(pwd.as_str().as_bytes(), "unigen-vault-session") {
+                    Ok(sealed) => self.vault_dpapi_cache = Some(sealed),
+                    Err(_) => self.vault_dpapi_cache = None,
+                }
+            }
+            _ => {}
+        }
         pwd.zeroize();
         match result {
             Ok(entries) => {
@@ -767,7 +831,22 @@ impl UnigenApp {
                 self.vault_touch();
             }
             Err(e) => {
-                self.vault_status = format!("Unlock failed: {e}");
+                // Show the *full* error chain (`{:#}`), not just the
+                // outermost `.context()` message. `decrypt_vault` wraps
+                // the real cause ("AES-GCM auth tag failed", "Argon2id
+                // key derivation failed: memory allocation error", a
+                // truncated/corrupted file, etc.) behind a generic
+                // "wrong master password, or file is not a valid vault"
+                // context note — that note is *useful* context, but
+                // discarding the underlying cause entirely (the old
+                // `{e}` behavior, anyhow's default `Display`) actively
+                // hid the real reason from anyone trying to diagnose a
+                // failed unlock, which matters most for exactly the
+                // failures that *aren't* a typo'd password.
+                self.vault_status = format!("Unlock failed: {e:#}");
+                // A failed unlock attempt must not leave a stale cached
+                // password around claiming to unlock this vault.
+                self.vault_dpapi_cache = None;
             }
         }
     }
@@ -788,7 +867,13 @@ impl UnigenApp {
                 self.vault_status = format!("Saved ({} entries).", self.vault_entries.len());
             }
             Err(e) => {
-                self.vault_status = format!("Save failed: {e}");
+                // Full chain again (see the matching note in
+                // `unlock_vault`) — a save failure's real cause (disk
+                // full, permissions, the new self-verification step in
+                // `write_vault_file` catching a write that didn't
+                // round-trip) is exactly what a user needs to see to do
+                // anything useful about it.
+                self.vault_status = format!("Save failed: {e:#}");
             }
         }
     }
@@ -968,6 +1053,11 @@ impl UnigenApp {
                 self.vault_change_pwd_open = false;
                 self.vault_change_pwd_error.clear();
                 self.vault_status = "Master password changed.".to_string();
+                // A cache sealed under the *old* password would silently
+                // fail to unlock (harmlessly — `unlock_vault` falls back
+                // to asking for the password) but there's no reason to
+                // keep a now-wrong cached credential around at all.
+                self.vault_dpapi_cache = None;
                 self.vault_touch();
             }
             Err(e) => {
@@ -1078,6 +1168,18 @@ impl UnigenApp {
             ui.add(egui::DragValue::new(&mut self.vault_autolock_seconds).range(0..=3600));
             ui.label("seconds of inactivity (0 = never)");
         });
+        if dpapi::SUPPORTED {
+            ui.checkbox(
+                &mut self.vault_remember_session,
+                "Remember master password after auto-lock (this Windows session only, DPAPI-protected)",
+            );
+            ui.small(
+                "When on, an auto-lock still hides your entries, but the next \"Unlock\" click \
+                 won't ask for the master password again — Windows' own DPAPI keeps it sealed \
+                 to your login, not this app. A manual \"Lock\" click, changing the master \
+                 password, or logging out still clears it.",
+            );
+        }
         // Auto-lock (and every other in-memory-only protection in this
         // app) only runs while the process is scheduled and executing
         // normally. Sleep/hibernate can write the *entire* RAM contents
@@ -1119,6 +1221,13 @@ impl UnigenApp {
             }
             if ui.button("Lock").clicked() {
                 self.lock_vault(true);
+                // Unlike auto-lock (see `tick_vault_autolock`), a
+                // deliberate manual lock means the user explicitly wants
+                // the vault shut, so the DPAPI-remembered password (if
+                // any) is discarded too — re-locking is only meant to
+                // survive an *inactivity* auto-lock transparently, not
+                // to be a no-op the user has to consciously work around.
+                self.vault_dpapi_cache = None;
             }
             if ui.button("Change master password…").clicked() {
                 self.vault_change_pwd_open = true;
