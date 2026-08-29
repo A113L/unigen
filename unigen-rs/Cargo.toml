@@ -1,8 +1,8 @@
 [package]
 name = "unigen"
-version = "2.0.9"
+version = "2.1.0"
 edition = "2021"
-description = "UNIGEN - Unicode Password Utility (Rust Edition)"
+description = "UNIGEN - Unicode Password Utility"
 default-run = "unigen"
 
 [[bin]]
