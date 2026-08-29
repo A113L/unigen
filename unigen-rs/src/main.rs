@@ -641,22 +641,15 @@ struct UnigenApp {
     /// memory) instead of just clearing a text field.
     vault_last_activity: Instant,
     vault_autolock_seconds: u32,
-    /// User opt-in: on Windows only (`dpapi::SUPPORTED`), remember the
-    /// master password across an *auto-lock* (not a manual "Lock" click,
-    /// and not an app restart) so the next "Unlock" click doesn't
-    /// require retyping it. The password is never kept as plaintext at
-    /// rest for this: see `vault_dpapi_cache` below — this bool is only
-    /// "would the user like that convenience if available".
-    vault_remember_session: bool,
-    /// DPAPI-sealed (`CryptProtectData`) master password, set only when
-    /// `vault_remember_session` is on and an auto-lock just fired.
-    /// `None` on every other platform (`dpapi::SUPPORTED == false`,
-    /// nothing ever populates this) and cleared on manual "Lock", on
-    /// changing the master password, on picking a different vault file,
-    /// and on app exit — it must never outlive the Windows login session
-    /// it was sealed under, and DPAPI itself would refuse to unprotect
-    /// it after that anyway (the OS's own logon-session key rotates).
-    vault_dpapi_cache: Option<Vec<u8>>,
+    /// U-05: how long (if at all) to remember the master password after
+    /// a lock, and the DPAPI-sealed cache itself — see
+    /// `vault::SessionUnlockCache`'s doc comment for the full policy.
+    /// Replaces the previous `vault_remember_session: bool` +
+    /// `vault_dpapi_cache: Option<Vec<u8>>` pair, which only ever
+    /// implemented one fixed policy and — unlike this type — never
+    /// cleared a stale cache when the user switched to a different
+    /// vault file.
+    vault_session_cache: vault::SessionUnlockCache,
 
     // ---- Vault: change master password ----
     vault_change_pwd_open: bool,
@@ -754,8 +747,7 @@ impl UnigenApp {
             vault_confirm_delete: None,
             vault_last_activity: Instant::now(),
             vault_autolock_seconds: 120,
-            vault_remember_session: false,
-            vault_dpapi_cache: None,
+            vault_session_cache: vault::SessionUnlockCache::new(),
             vault_change_pwd_open: false,
             vault_change_pwd_current: SecretString::new(),
             vault_change_pwd_new: SecretString::new(),
@@ -870,40 +862,33 @@ impl UnigenApp {
         };
         let mut pwd = std::mem::take(&mut self.vault_master_pwd);
         // Convenience path: the field was left empty (user just clicked
-        // "Unlock" again after an auto-lock) but we have a DPAPI-sealed
-        // password from before that auto-lock — recover it instead of
-        // making the user retype it. Any failure here (wrong Windows
-        // login session, tampered blob, platform without DPAPI) just
-        // falls through to the normal "ask for the password" flow rather
-        // than being surfaced as an error, since the user never asked
-        // for this to succeed — it's a bonus, not a requirement.
+        // "Unlock" again after an auto-lock, or is reopening the app
+        // after one under `UntilLogout`) but `vault_session_cache` has a
+        // remembered password for this vault — recover it instead of
+        // making the user retype it. Any failure inside `recover()`
+        // (wrong Windows login session, tampered blob, platform without
+        // DPAPI, mode is `Never`) just returns `None` rather than being
+        // surfaced as an error, since the user never asked for this to
+        // succeed — it's a bonus, not a requirement.
         if pwd.is_empty() {
-            if let Some(sealed) = &self.vault_dpapi_cache {
-                if let Ok(mut recovered) = dpapi::unprotect(sealed) {
-                    if let Ok(text) = std::str::from_utf8(&recovered) {
-                        pwd = SecretString::from_str(text);
-                    }
-                    recovered.zeroize();
-                }
+            if let Some(recovered) = self.vault_session_cache.recover(&path) {
+                pwd = recovered;
             }
         }
         let is_new = !path.exists();
         let result = vault::open_or_create(&path, &pwd);
-        match &result {
-            Ok(_) if self.vault_remember_session && dpapi::SUPPORTED && !is_new => {
-                // Re-seal (rather than reuse whatever was already
-                // cached): this keeps the cache in sync with whatever
-                // password just proved correct, including the case
-                // where the user typed a *different* password than the
-                // one previously cached (e.g. after "Change master
-                // password" while a stale cache from before the change
-                // would otherwise have gone silently unused forever).
-                match dpapi::protect(pwd.as_str().as_bytes(), "unigen-vault-session") {
-                    Ok(sealed) => self.vault_dpapi_cache = Some(sealed),
-                    Err(_) => self.vault_dpapi_cache = None,
-                }
-            }
-            _ => {}
+        if result.is_ok() && !is_new {
+            // Re-seal (rather than reuse whatever was already
+            // cached): this keeps the cache in sync with whatever
+            // password just proved correct, including the case
+            // where the user typed a *different* password than the
+            // one previously cached (e.g. after "Change master
+            // password" while a stale cache from before the change
+            // would otherwise have gone silently unused forever).
+            // `remember()` itself is a no-op (beyond clearing any
+            // stale cache) when the mode is `Never` or DPAPI isn't
+            // available, so no extra guard is needed here.
+            self.vault_session_cache.remember(&path, pwd.as_str());
         }
         pwd.zeroize();
         match result {
@@ -935,7 +920,7 @@ impl UnigenApp {
                 self.vault_status = format!("Unlock failed: {e:#}");
                 // A failed unlock attempt must not leave a stale cached
                 // password around claiming to unlock this vault.
-                self.vault_dpapi_cache = None;
+                self.vault_session_cache.clear(Some(&path));
             }
         }
     }
@@ -1145,8 +1130,11 @@ impl UnigenApp {
                 // A cache sealed under the *old* password would silently
                 // fail to unlock (harmlessly — `unlock_vault` falls back
                 // to asking for the password) but there's no reason to
-                // keep a now-wrong cached credential around at all.
-                self.vault_dpapi_cache = None;
+                // keep a now-wrong cached credential around at all, and
+                // for `UntilLogout` a stale sidecar file left on disk
+                // sealing the *old* password would be actively
+                // misleading about what "remembered" even means here.
+                self.vault_session_cache.clear(self.vault_path.as_deref());
                 self.vault_touch();
             }
             Err(e) => {
@@ -1258,16 +1246,78 @@ impl UnigenApp {
             ui.label("seconds of inactivity (0 = never)");
         });
         if dpapi::SUPPORTED {
+            let before = self.vault_session_cache.mode;
+            ui.label("Remember master password after lock:");
+            ui.horizontal(|ui| {
+                ui.radio_value(
+                    &mut self.vault_session_cache.mode,
+                    vault::RememberSession::Never,
+                    "Never",
+                );
+                ui.radio_value(
+                    &mut self.vault_session_cache.mode,
+                    vault::RememberSession::UntilAppExit,
+                    "Until app exits",
+                );
+                ui.radio_value(
+                    &mut self.vault_session_cache.mode,
+                    vault::RememberSession::UntilLogout,
+                    "Until logout",
+                );
+            });
+            if self.vault_session_cache.mode != before {
+                // Switching modes invalidates whatever was cached under
+                // the *previous* mode's guarantee — e.g. dropping from
+                // `UntilLogout` to `UntilAppExit` must not leave the
+                // on-disk sidecar file behind, and dropping to `Never`
+                // must not leave anything cached at all.
+                self.vault_session_cache.clear(self.vault_path.as_deref());
+            }
+            ui.small(match self.vault_session_cache.mode {
+                vault::RememberSession::Never => {
+                    "Every unlock — including right after an auto-lock — asks for the master \
+                     password again."
+                }
+                vault::RememberSession::UntilAppExit => {
+                    "An auto-lock still hides your entries, but the next \"Unlock\" click won't \
+                     ask for the master password again, for as long as UNIGEN keeps running. \
+                     Closing UNIGEN, a manual \"Lock\" click, changing the master password, or \
+                     switching vault files all forget it immediately. Windows' own DPAPI keeps \
+                     it sealed to your login — this app never stores it as plaintext, and never \
+                     writes it to disk in this mode."
+                }
+                vault::RememberSession::UntilLogout => {
+                    "Same as \"Until app exits\", but also survives closing and reopening \
+                     UNIGEN — a small DPAPI-sealed file is kept next to the vault for that. A \
+                     manual \"Lock\" click, changing the master password, or switching vault \
+                     files still forgets it immediately (deletes that file, too)."
+                }
+            });
+        }
+        // U-06 fix: this setting (and its live status) previously only
+        // appeared on the Encrypt File tab, even though it also governs
+        // whether the vault master-password field gets `mlock`ed — a
+        // vault-only user had no way to see or control it without
+        // visiting an unrelated tab. Same `linux_try_exclusion` field,
+        // now also surfaced here with a live status label.
+        if mem_lock::SUPPORTED {
             ui.checkbox(
-                &mut self.vault_remember_session,
-                "Remember master password after auto-lock (this Windows session only, DPAPI-protected)",
+                &mut self.linux_try_exclusion,
+                "Best-effort: ask the OS to keep the master password out of swap (mlock/VirtualLock)",
             );
-            ui.small(
-                "When on, an auto-lock still hides your entries, but the next \"Unlock\" click \
-                 won't ask for the master password again — Windows' own DPAPI keeps it sealed \
-                 to your login, not this app. A manual \"Lock\" click, changing the master \
-                 password, or logging out still clears it.",
-            );
+            let (text, kind) =
+                mem_lock::status_label(self.linux_try_exclusion, self.vault_master_pwd.is_locked());
+            let p = self.palette();
+            let color = match kind {
+                "success" => p.success,
+                "danger" => p.danger,
+                "warning" => p.warning,
+                _ => p.text_secondary,
+            };
+            ui.horizontal(|ui| {
+                ui.small("Master password memory-lock status:");
+                ui.colored_label(color, text);
+            });
         }
         // Auto-lock (and every other in-memory-only protection in this
         // app) only runs while the process is scheduled and executing
@@ -1312,11 +1362,13 @@ impl UnigenApp {
                 self.lock_vault(true);
                 // Unlike auto-lock (see `tick_vault_autolock`), a
                 // deliberate manual lock means the user explicitly wants
-                // the vault shut, so the DPAPI-remembered password (if
-                // any) is discarded too — re-locking is only meant to
-                // survive an *inactivity* auto-lock transparently, not
-                // to be a no-op the user has to consciously work around.
-                self.vault_dpapi_cache = None;
+                // the vault shut, so the remembered password (if any —
+                // in memory for `UntilAppExit`, in memory and on disk
+                // for `UntilLogout`) is discarded too — re-locking is
+                // only meant to survive an *inactivity* auto-lock
+                // transparently, not to be a no-op the user has to
+                // consciously work around.
+                self.vault_session_cache.clear(self.vault_path.as_deref());
             }
             if ui.button("Change master password…").clicked() {
                 self.vault_change_pwd_open = true;
@@ -2186,12 +2238,28 @@ impl UnigenApp {
             PendingPick::OpenVault => {
                 if let Some(path) = path {
                     self.lock_vault(true);
+                    // BUG FIX (found while implementing U-05): switching
+                    // to a different vault file never cleared the
+                    // session-remember cache for the *previous* vault —
+                    // `vault_dpapi_cache`'s own doc comment already
+                    // claimed this was cleared "on picking a different
+                    // vault file", but nothing here actually did it. A
+                    // stale cache is harmless on its own (it's keyed to
+                    // the old vault's path and password, so it would
+                    // just silently fail to apply to the new one — see
+                    // `SessionUnlockCache::recover`), but for
+                    // `UntilLogout` it also meant an old vault's sidecar
+                    // cache file was left behind on disk indefinitely
+                    // instead of being cleaned up the moment the user
+                    // moved on to a different vault.
+                    self.vault_session_cache.clear(self.vault_path.as_deref());
                     self.vault_path = Some(path);
                 }
             }
             PendingPick::NewVault => {
                 if let Some(path) = path {
                     self.lock_vault(true);
+                    self.vault_session_cache.clear(self.vault_path.as_deref());
                     self.vault_path = Some(path);
                 }
             }
@@ -3238,7 +3306,7 @@ impl UnigenApp {
                     let bits = estimate_passphrase_entropy(&self.enc_pwd);
                     let (rating, _) = rate_entropy(bits);
                     ui.small(format!(
-                        "Estimated strength: {rating} (~{bits:.0} bits, character-class estimate — not a true entropy measurement)"
+                        "Estimated strength: {rating} (~{bits:.0} bits — pattern-aware heuristic, not a true entropy measurement)"
                     ));
                 }
                 ui.checkbox(
@@ -3254,6 +3322,22 @@ impl UnigenApp {
                         "Best-effort: ask the OS to keep the passphrase out of swap (mlock/VirtualLock)",
                     );
                     ui.small("Best effort only — not a guarantee on every OS/kernel/filesystem configuration.");
+                    // U-06 fix: live status instead of only a one-shot
+                    // failure message shown at encrypt time — see
+                    // `mem_lock::status_label` doc comment.
+                    let (text, kind) =
+                        mem_lock::status_label(self.linux_try_exclusion, self.enc_pwd.is_locked());
+                    let p = self.palette();
+                    let color = match kind {
+                        "success" => p.success,
+                        "danger" => p.danger,
+                        "warning" => p.warning,
+                        _ => p.text_secondary,
+                    };
+                    ui.horizontal(|ui| {
+                        ui.small("Memory-lock status:");
+                        ui.colored_label(color, text);
+                    });
                 }
 
                 ui.add_space(6.0);
@@ -3308,6 +3392,26 @@ impl UnigenApp {
                     if self.linux_try_exclusion {
                         self.dec_pwd.mlock_best_effort();
                     }
+                }
+                // U-06 fix: same live status as the Encrypt tab. No
+                // separate checkbox here — `linux_try_exclusion` is one
+                // shared setting (toggled on the Encrypt tab or the vault
+                // settings panel), so this just reflects its effect on
+                // *this* field.
+                if mem_lock::SUPPORTED {
+                    let (text, kind) =
+                        mem_lock::status_label(self.linux_try_exclusion, self.dec_pwd.is_locked());
+                    let p = self.palette();
+                    let color = match kind {
+                        "success" => p.success,
+                        "danger" => p.danger,
+                        "warning" => p.warning,
+                        _ => p.text_secondary,
+                    };
+                    ui.horizontal(|ui| {
+                        ui.small("Memory-lock status:");
+                        ui.colored_label(color, text);
+                    });
                 }
                 ui.checkbox(
                     &mut self.dec_pwd_autoclear,

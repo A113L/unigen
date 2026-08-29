@@ -103,6 +103,41 @@ pub fn unlock(addr: *const u8, len: usize) {
 /// non-Windows target) there is nothing for the checkbox to do.
 pub const SUPPORTED: bool = cfg!(any(unix, windows));
 
+/// U-06 fix: human-readable status for the "keep secrets out of swap" UI
+/// control, given whether the user has the setting enabled and whether
+/// the field's live buffer is currently believed to be locked (per
+/// `SecretString::is_locked`/`SecretBytes::locked` — the result of the
+/// most recent `mlock`/`VirtualLock` attempt for that specific buffer).
+///
+/// Before this, the checkbox that opts into memory locking had no
+/// feedback loop at all beyond a one-shot warning message shown only if
+/// the very first lock attempt at encrypt-time failed — a user could tick
+/// the box, have every `mlock` call silently fail for the rest of the
+/// session (`RLIMIT_MEMLOCK` exhausted, working-set quota, unsupported
+/// filesystem/config), and have no way to tell the setting wasn't
+/// actually doing anything. This gives every call site that renders the
+/// checkbox (or a password field affected by it) a live, per-field status
+/// label to show next to it.
+///
+/// Returns `(text, kind)` in the same convention as
+/// [`crate::charsets::rate_entropy`] (`kind` is one of `"success"`,
+/// `"warning"`, `"danger"`, `"neutral"`), so call sites can reuse the
+/// same rating-color mapping.
+pub fn status_label(enabled: bool, locked: bool) -> (&'static str, &'static str) {
+    if !SUPPORTED {
+        ("Not available on this platform", "warning")
+    } else if !enabled {
+        ("Disabled", "neutral")
+    } else if locked {
+        ("Locked in RAM (mlock/VirtualLock)", "success")
+    } else {
+        (
+            "Not locked — OS may have refused the request, or nothing to lock yet",
+            "danger",
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,5 +173,36 @@ mod tests {
     #[test]
     fn supported_matches_target_family() {
         assert_eq!(SUPPORTED, cfg!(any(unix, windows)));
+    }
+
+    #[test]
+    fn status_label_disabled_takes_priority_over_locked_state_when_supported() {
+        if SUPPORTED {
+            let (text, kind) = status_label(false, true);
+            assert_eq!(kind, "neutral");
+            assert_eq!(text, "Disabled");
+        }
+    }
+
+    #[test]
+    fn status_label_reports_locked_and_unlocked_when_enabled() {
+        if SUPPORTED {
+            let (_, locked_kind) = status_label(true, true);
+            assert_eq!(locked_kind, "success");
+            let (_, unlocked_kind) = status_label(true, false);
+            assert_eq!(unlocked_kind, "danger");
+        }
+    }
+
+    #[test]
+    fn status_label_reports_unsupported_platform_regardless_of_other_args() {
+        if !SUPPORTED {
+            for enabled in [false, true] {
+                for locked in [false, true] {
+                    let (_, kind) = status_label(enabled, locked);
+                    assert_eq!(kind, "warning");
+                }
+            }
+        }
     }
 }

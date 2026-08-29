@@ -11,16 +11,18 @@
 //! app's "nothing sensitive touches disk unless the user explicitly
 //! exports/saves it" design). This module exists so that the one place
 //! the app *optionally* lets the user trade a little security for
-//! convenience — "keep this vault unlocked across an auto-lock without
-//! retyping the master password, for the rest of this Windows login
-//! session" — can do so without ever storing the password in plaintext:
-//! see `vault::SessionUnlockCache` (main.rs) for the call site, gated
-//! behind an explicit opt-in checkbox and cleared on lock/exit/reboot.
-//! DPAPI is the right primitive for that specific job because it's
-//! already how Windows itself protects saved-Wi-Fi-password-style
-//! "remember this for me" secrets, and it doesn't require this app to
-//! manage or protect a key of its own — the OS does, and ties it to the
-//! user's login session.
+//! convenience — "keep this vault unlocked across a lock without
+//! retyping the master password" (see `vault::RememberSession` for the
+//! exact policies this can mean) — can do so without ever storing the
+//! password in plaintext: see `vault::SessionUnlockCache` for the call
+//! site, gated behind an explicit opt-in and cleared on every event that
+//! should invalidate it. DPAPI is the right primitive for that specific
+//! job because it's already how Windows itself protects saved-Wi-Fi-
+//! password-style "remember this for me" secrets, and it doesn't
+//! require this app to manage or protect a key of its own — the OS
+//! does, tied to the user's own account (see the caveat on
+//! `RememberSession::UntilLogout` about what that guarantees in
+//! practice, and what this app enforces on top of it).
 //!
 //! Non-Windows builds compile this module too (so call sites don't need
 //! `#[cfg(windows)]` scattered through `main.rs`), but every function
@@ -89,12 +91,26 @@ mod imp {
     /// itself (visible without unprotecting, like a filename) purely for
     /// operator/forensic clarity if this blob is ever found on disk —
     /// keep it non-sensitive.
-    pub fn protect(plaintext: &[u8], label: &str) -> Result<Vec<u8>> {
+    ///
+    /// `entropy` is DPAPI's "optional entropy": extra bytes folded into
+    /// the protection so `CryptUnprotectData` only succeeds when the
+    /// *same* entropy is supplied again, on top of the same-user-account
+    /// requirement DPAPI always enforces. Callers should derive this from
+    /// whatever the sealed blob is meant to be tied to (e.g. a specific
+    /// vault file's identity) — see this module's caller in `vault.rs`
+    /// (`SessionUnlockCache`) for why that binding matters: without it, a
+    /// sealed blob is valid for *any* ciphertext under this user account,
+    /// including one copied next to a different vault file.
+    pub fn protect(plaintext: &[u8], label: &str, entropy: &[u8]) -> Result<Vec<u8>> {
         let mut in_blob = DataBlob {
             cb_data: plaintext.len() as u32,
             pb_data: plaintext.as_ptr() as *mut u8,
         };
         let descr: Vec<u16> = label.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut entropy_blob = DataBlob {
+            cb_data: entropy.len() as u32,
+            pb_data: entropy.as_ptr() as *mut u8,
+        };
         let mut out_blob = DataBlob {
             cb_data: 0,
             pb_data: ptr::null_mut(),
@@ -102,14 +118,15 @@ mod imp {
 
         // SAFETY: `in_blob` points at `plaintext`, valid for the call's
         // duration; `descr` is a live, NUL-terminated UTF-16 buffer for
-        // the same duration; `out_blob` is an out-parameter DPAPI fills
-        // in on success, freed via `LocalFree` below once we've copied
-        // its contents into an owned `Vec`.
+        // the same duration; `entropy_blob` points at `entropy`, valid
+        // for the call's duration; `out_blob` is an out-parameter DPAPI
+        // fills in on success, freed via `LocalFree` below once we've
+        // copied its contents into an owned `Vec`.
         let ok = unsafe {
             CryptProtectData(
                 &mut in_blob,
                 descr.as_ptr(),
-                ptr::null(),
+                &mut entropy_blob,
                 ptr::null(),
                 ptr::null(),
                 CRYPTPROTECT_UI_FORBIDDEN,
@@ -140,11 +157,17 @@ mod imp {
     /// garbage) if `blob` wasn't produced by this same Windows user
     /// account via `protect` — DPAPI itself enforces this, the same way
     /// AES-GCM's auth tag enforces "this ciphertext wasn't tampered
-    /// with" for the vault file format elsewhere in this app.
-    pub fn unprotect(blob: &[u8]) -> Result<Vec<u8>> {
+    /// with" for the vault file format elsewhere in this app. `entropy`
+    /// must exactly match what was passed to `protect` when `blob` was
+    /// created, or this fails the same way a wrong user account would.
+    pub fn unprotect(blob: &[u8], entropy: &[u8]) -> Result<Vec<u8>> {
         let mut in_blob = DataBlob {
             cb_data: blob.len() as u32,
             pb_data: blob.as_ptr() as *mut u8,
+        };
+        let mut entropy_blob = DataBlob {
+            cb_data: entropy.len() as u32,
+            pb_data: entropy.as_ptr() as *mut u8,
         };
         let mut out_blob = DataBlob {
             cb_data: 0,
@@ -159,7 +182,7 @@ mod imp {
             CryptUnprotectData(
                 &mut in_blob,
                 &mut descr_out,
-                ptr::null(),
+                &mut entropy_blob,
                 ptr::null(),
                 ptr::null(),
                 CRYPTPROTECT_UI_FORBIDDEN,
@@ -200,12 +223,12 @@ mod imp {
 pub use imp::{protect, unprotect};
 
 #[cfg(not(windows))]
-pub fn protect(_plaintext: &[u8], _label: &str) -> Result<Vec<u8>> {
+pub fn protect(_plaintext: &[u8], _label: &str, _entropy: &[u8]) -> Result<Vec<u8>> {
     Err(anyhow!("DPAPI is only available on Windows"))
 }
 
 #[cfg(not(windows))]
-pub fn unprotect(_blob: &[u8]) -> Result<Vec<u8>> {
+pub fn unprotect(_blob: &[u8], _entropy: &[u8]) -> Result<Vec<u8>> {
     Err(anyhow!("DPAPI is only available on Windows"))
 }
 
@@ -217,16 +240,29 @@ mod tests {
     #[test]
     fn protect_unprotect_round_trip() {
         let plaintext = b"correct horse battery staple";
-        let protected = protect(plaintext, "unigen-test").expect("protect");
+        let entropy = b"vault-a-entropy";
+        let protected = protect(plaintext, "unigen-test", entropy).expect("protect");
         assert_ne!(protected, plaintext, "DPAPI output must not equal input");
-        let recovered = unprotect(&protected).expect("unprotect");
+        let recovered = unprotect(&protected, entropy).expect("unprotect");
         assert_eq!(recovered, plaintext);
     }
 
     #[test]
     fn unprotect_rejects_garbage() {
         let garbage = vec![0u8; 64];
-        assert!(unprotect(&garbage).is_err());
+        assert!(unprotect(&garbage, b"whatever").is_err());
+    }
+
+    #[test]
+    fn unprotect_rejects_wrong_entropy() {
+        // SECURITY REGRESSION TEST: a blob sealed under one vault's
+        // entropy must not unprotect under a different vault's entropy —
+        // this is exactly what stops a copied `.session-cache` sidecar
+        // from unlocking against the wrong vault file.
+        let plaintext = b"correct horse battery staple";
+        let protected = protect(plaintext, "unigen-test", b"vault-a-entropy").expect("protect");
+        let result = unprotect(&protected, b"vault-b-entropy");
+        assert!(result.is_err(), "unprotect must fail under mismatched entropy");
     }
 }
 
@@ -238,7 +274,7 @@ mod non_windows_tests {
     #[test]
     fn unsupported_off_windows() {
         assert!(!SUPPORTED);
-        assert!(protect(b"x", "label").is_err());
-        assert!(unprotect(b"x").is_err());
+        assert!(protect(b"x", "label", b"entropy").is_err());
+        assert!(unprotect(b"x", b"entropy").is_err());
     }
 }

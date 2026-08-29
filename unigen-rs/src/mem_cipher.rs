@@ -172,4 +172,85 @@ mod tests {
         apply_keystream(&nonce, &mut buf);
         assert!(buf.is_empty());
     }
+
+    // ---- Concurrency / race tests -------------------------------------
+    //
+    // `MEM_KEY` (a `OnceLock<MemKey>`) is the one piece of genuinely
+    // shared, cross-thread state in this module: every call to
+    // `apply_keystream`, from whichever thread, reads through the same
+    // lazily-initialized global. The property that actually matters is
+    // "every thread ends up using the exact same key, and concurrent
+    // access never corrupts a buffer" — `OnceLock` is documented to
+    // guarantee the former, but that guarantee is worth pinning down with
+    // an actual concurrent test rather than trusting the doc comment
+    // alone, especially since a future refactor could swap `OnceLock` for
+    // something with weaker guarantees without an obvious compile error.
+
+    #[test]
+    fn concurrent_key_init_is_consistent_across_threads() {
+        // Many threads all race to be the one that initializes `MEM_KEY`
+        // (via `Barrier`, to maximize the odds they actually overlap on
+        // the first call rather than running one-at-a-time). If two
+        // threads ever ended up using *different* keys — the failure mode
+        // a buggy lazy-init would produce — the same (nonce, plaintext)
+        // pair would encrypt to different ciphertext depending on which
+        // thread ran it.
+        const N: usize = 32;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(N));
+        let nonce = [7u8; NONCE_LEN];
+        let plaintext = b"same plaintext, encrypted from many threads at once".to_vec();
+
+        let handles: Vec<_> = (0..N)
+            .map(|_| {
+                let barrier = std::sync::Arc::clone(&barrier);
+                let mut buf = plaintext.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    apply_keystream(&nonce, &mut buf);
+                    buf
+                })
+            })
+            .collect();
+
+        let results: Vec<Vec<u8>> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        for r in &results {
+            assert_ne!(r, &plaintext, "keystream must have changed the buffer");
+            assert_eq!(
+                r, &results[0],
+                "every thread must derive ciphertext from the same process-wide key"
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_seal_unseal_round_trips_correctly_per_thread() {
+        // Each thread works on its own buffer with its own random nonce,
+        // all hammering `apply_keystream` (and therefore the shared
+        // `MEM_KEY`) at the same time. A data race corrupting the key's
+        // backing allocation, or a torn/interleaved read of it, would show
+        // up here as a thread's own round-trip failing to recover its own
+        // plaintext.
+        const N: usize = 32;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(N));
+
+        let handles: Vec<_> = (0..N)
+            .map(|i| {
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let nonce = random_nonce();
+                    let original = format!("secret-for-thread-{i}").into_bytes();
+                    let mut buf = original.clone();
+                    barrier.wait();
+                    apply_keystream(&nonce, &mut buf); // seal
+                    assert_ne!(buf, original, "thread {i}: seal must change the buffer");
+                    apply_keystream(&nonce, &mut buf); // unseal
+                    assert_eq!(buf, original, "thread {i}: unseal must recover the plaintext");
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
 }

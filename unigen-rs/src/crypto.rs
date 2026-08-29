@@ -12,6 +12,15 @@
 //!   ties a ciphertext to its format/version/KDF, so a blob can't be
 //!   silently swapped for a different-context ciphertext without the
 //!   authentication tag failing to verify.
+//! * U-01 fix (format version 3, "UGR2" in the audit spec): the header now
+//!   also carries the actual KDF parameters used for that file (Argon2id
+//!   memory/time/lanes, or PBKDF2 iteration count) instead of relying on
+//!   whatever this build's compile-time constants currently are, and those
+//!   parameters are folded into the AAD (`MAGIC || FORMAT_VERSION || kdf_id
+//!   || kdf_params`) so they're tamper-evident too. See [`KdfParams`] and
+//!   the `FORMAT_VERSION` doc comment for the full rationale. v1/v2 files
+//!   remain fully decryptable (they didn't store params, so decrypt falls
+//!   back to the legacy fixed constants for whichever KDF they used).
 //! * Passphrases are zeroized (via the `zeroize` crate) the moment they are
 //!   no longer needed — something the Python original could only
 //!   best-effort approximate with `bytearray` + `ctypes` mlock, since
@@ -62,7 +71,119 @@ pub const STREAM_MAGIC: &[u8; 4] = b"UGRS";
 // non-truncated chunk counter) to eliminate a nonce-reuse risk on very
 // large files. Blob format (encrypt_blob/decrypt_blob) is unaffected by
 // this bump but shares the constant, so its on-disk layout is unchanged.
-pub const FORMAT_VERSION: u8 = 2;
+//
+// U-01 fix bumped this from 2 -> 3 ("UGR2" in the audit spec — the magic
+// bytes themselves didn't change, only this version byte): both the blob
+// and streaming containers now carry the actual KDF parameters used
+// (Argon2id memory/time/lanes, or PBKDF2 iterations) in their header, and
+// those parameters are folded into the AAD alongside kdf_id. Before this,
+// `derive_key` always re-derived using whatever the *current* build's
+// `ARGON2_MEMORY_KIB`/`ARGON2_TIME_COST`/`ARGON2_LANES`/`PBKDF2_ITERATIONS`
+// constants happened to be — so if those defaults were ever tuned
+// (upgrading the Argon2id memory cost, say), every previously-encrypted
+// file would silently start being decrypted with the *new* parameters
+// instead of the ones it was actually encrypted with, which for Argon2id
+// means a completely different derived key (decrypt failure, reported
+// confusingly as "wrong passphrase"). Storing the parameters removes that
+// implicit "current build's constants" dependency and also authenticates
+// them: an attacker can no longer get a victim's future re-encryption to
+// silently downgrade to weaker KDF parameters by tampering with a header
+// byte, since the AAD binds the params the same way it already bound
+// kdf_id.
+pub const FORMAT_VERSION: u8 = 3;
+
+/// On-disk/AAD-bound KDF parameters. Interpretation depends on `kdf_id`:
+/// - Argon2id: `p1` = memory (KiB), `p2` = time cost (iterations), `p3` = lanes.
+/// - PBKDF2-HMAC-SHA256: `p1` = iteration count, `p2`/`p3` unused (0).
+///
+/// Serialized as 12 bytes: three big-endian `u32`s (`p1 || p2 || p3`).
+/// Present in the header (and folded into the AAD) for [`FORMAT_VERSION`]
+/// >= 3 containers. Older (v1/v2) containers don't carry this — they are
+/// decrypted using the hardcoded legacy constants below, matching what a
+/// v1/v2 encryptor always used.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KdfParams {
+    pub p1: u32,
+    pub p2: u32,
+    pub p3: u32,
+}
+
+impl KdfParams {
+    pub const ENCODED_LEN: usize = 12;
+
+    fn to_bytes(self) -> [u8; Self::ENCODED_LEN] {
+        let mut out = [0u8; Self::ENCODED_LEN];
+        out[0..4].copy_from_slice(&self.p1.to_be_bytes());
+        out[4..8].copy_from_slice(&self.p2.to_be_bytes());
+        out[8..12].copy_from_slice(&self.p3.to_be_bytes());
+        out
+    }
+
+    fn from_bytes(b: &[u8]) -> Result<Self> {
+        if b.len() != Self::ENCODED_LEN {
+            bail!("Invalid KDF parameter block length");
+        }
+        Ok(Self {
+            p1: u32::from_be_bytes(b[0..4].try_into().unwrap()),
+            p2: u32::from_be_bytes(b[4..8].try_into().unwrap()),
+            p3: u32::from_be_bytes(b[8..12].try_into().unwrap()),
+        })
+    }
+
+    /// The parameters this build currently uses for *new* encryptions with
+    /// the given KDF. Always written into v3+ headers at encrypt time.
+    fn current_for_kdf(kdf_id: u8) -> Result<Self> {
+        match kdf_id {
+            KDF_ARGON2ID => Ok(Self {
+                p1: ARGON2_MEMORY_KIB,
+                p2: ARGON2_TIME_COST,
+                p3: ARGON2_LANES,
+            }),
+            KDF_PBKDF2 => Ok(Self {
+                p1: PBKDF2_ITERATIONS,
+                p2: 0,
+                p3: 0,
+            }),
+            other => bail!("Unknown KDF id: {other}"),
+        }
+    }
+
+    /// The parameters a legacy (pre-v3) container of this KDF was always
+    /// encrypted with, since v1/v2 didn't store them explicitly — they're
+    /// exactly this build's compile-time constants for that KDF at the
+    /// time v1/v2 support was written, and were never varied per-file.
+    fn legacy_for_kdf(kdf_id: u8) -> Result<Self> {
+        Self::current_for_kdf(kdf_id)
+    }
+
+    /// Sanity-bound params read off an untrusted header, before spending
+    /// CPU/memory deriving a key with them. Without this an attacker who
+    /// can hand this app a crafted "v3" file could set e.g. Argon2id
+    /// memory to a value that exhausts RAM, or a PBKDF2 iteration count
+    /// that hangs the process, before authentication ever gets checked.
+    fn validate(self, kdf_id: u8) -> Result<Self> {
+        match kdf_id {
+            KDF_ARGON2ID => {
+                if self.p1 == 0 || self.p1 > 4 * 1024 * 1024 {
+                    bail!("Argon2id memory parameter out of allowed range");
+                }
+                if self.p2 == 0 || self.p2 > 64 {
+                    bail!("Argon2id time-cost parameter out of allowed range");
+                }
+                if self.p3 == 0 || self.p3 > 64 {
+                    bail!("Argon2id lanes parameter out of allowed range");
+                }
+            }
+            KDF_PBKDF2 => {
+                if self.p1 == 0 || self.p1 > 50_000_000 {
+                    bail!("PBKDF2 iteration parameter out of allowed range");
+                }
+            }
+            other => bail!("Unknown KDF id: {other}"),
+        }
+        Ok(self)
+    }
+}
 
 pub const STREAM_CHUNK_SIZE: usize = 4 * 1024 * 1024; // 4 MiB plaintext/chunk
 pub const STREAM_SIZE_THRESHOLD: u64 = 20 * 1024 * 1024; // switch above 20 MiB
@@ -113,7 +234,12 @@ pub fn kdf_name(id: u8) -> &'static str {
 /// `derive_key`. A caller that hands in a passphrase it never zeroizes
 /// would leave that copy lingering regardless of anything this function
 /// does.
-fn derive_key(password: &str, salt: &[u8], kdf_id: u8) -> Result<Zeroizing<[u8; 32]>> {
+fn derive_key(
+    password: &str,
+    salt: &[u8],
+    kdf_id: u8,
+    params: KdfParams,
+) -> Result<Zeroizing<[u8; 32]>> {
     let char_count = password.chars().count();
     if char_count > MAX_PASSPHRASE_LEN {
         bail!(
@@ -122,20 +248,21 @@ fn derive_key(password: &str, salt: &[u8], kdf_id: u8) -> Result<Zeroizing<[u8; 
             MAX_PASSPHRASE_LEN
         );
     }
+    let params = params.validate(kdf_id)?;
     let pwd_bytes = Zeroizing::new(password.as_bytes().to_vec());
     let mut key = Zeroizing::new([0u8; 32]);
 
     match kdf_id {
         KDF_ARGON2ID => {
-            let params = Params::new(ARGON2_MEMORY_KIB, ARGON2_TIME_COST, ARGON2_LANES, Some(32))
+            let argon2_params = Params::new(params.p1, params.p2, params.p3, Some(32))
                 .map_err(|e| anyhow!("invalid Argon2id parameters: {e}"))?;
-            let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+            let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, argon2_params);
             argon2
                 .hash_password_into(&pwd_bytes, salt, key.as_mut())
                 .map_err(|e| anyhow!("Argon2id key derivation failed: {e}"))?;
         }
         KDF_PBKDF2 => {
-            pbkdf2_hmac::<Sha256>(&pwd_bytes, salt, PBKDF2_ITERATIONS, key.as_mut());
+            pbkdf2_hmac::<Sha256>(&pwd_bytes, salt, params.p1, key.as_mut());
         }
         other => bail!("Unknown KDF id: {other}"),
     }
@@ -179,6 +306,367 @@ fn blob_aad(kdf_id: u8, version: u8) -> [u8; 6] {
     aad
 }
 
+// U-01 fix: v3+ containers additionally fold the KDF params block into the
+// AAD, so an attacker can't tamper with the header's stored Argon2id/PBKDF2
+// parameters (e.g. downgrading memory/time cost, or inflating them into a
+// DoS) without the AES-GCM tag failing to verify. v1/v2 have no params
+// field at all, so they keep using the shorter `blob_aad` above unchanged.
+fn blob_aad_v3(kdf_id: u8, version: u8, params: KdfParams) -> [u8; 6 + KdfParams::ENCODED_LEN] {
+    let mut aad = [0u8; 6 + KdfParams::ENCODED_LEN];
+    aad[0..4].copy_from_slice(BLOB_MAGIC);
+    aad[4] = version;
+    aad[5] = kdf_id;
+    aad[6..].copy_from_slice(&params.to_bytes());
+    aad
+}
+
+// ---------------------------------------------------------------------
+// Envelope key hierarchy (master password -> KEK -> vault key -> per-entry)
+// ---------------------------------------------------------------------
+//
+// Everything else in this file (`encrypt_blob`/`decrypt_blob`,
+// `stream_encrypt_file`/`stream_decrypt_file`) derives one key straight
+// from the passphrase and uses it directly as the AES-256-GCM key for
+// the entire ciphertext — fine for a one-shot file, but the vault
+// (`vault.rs`, a container the app keeps re-encrypting throughout its
+// life as entries are added/edited/removed) benefits from an extra
+// layer of indirection:
+//
+//   master password --KDF--> KEK --wraps--> vault key --HKDF, per id--> entry key
+//
+// * The **KEK** (key-encryption-key) is derived from the master
+//   password exactly like every other key in this file (`derive_key`,
+//   same Argon2id/PBKDF2 choice, same tunable params) — its only job is
+//   to encrypt ("wrap") the vault key.
+// * The **vault key** is 32 random bytes, generated once
+//   (`generate_vault_key`) and never derived from anything — it *is*
+//   the vault's actual key material. It's stored on disk only in
+//   wrapped (KEK-encrypted) form.
+// * The **entry key** for one specific `VaultEntry` is derived from the
+//   vault key via a single-block HKDF-Expand keyed on that entry's own
+//   stable id (`derive_entry_key`), so no two entries in the same vault
+//   ever share a key, and an entry's key can't be computed without
+//   knowing its id.
+//
+// What this buys, that a single-derived-key design doesn't:
+// * **A leaked entry key doesn't reveal the vault key** (HKDF is a
+//   one-way function), so a future feature that needs to hand out one
+//   entry's key in isolation (e.g. a "share one credential" export)
+//   wouldn't also be handing out the means to decrypt every other entry.
+//   The reverse isn't true — a leaked vault key derives every entry
+//   key — but that's true of any single "root" key in any hierarchy;
+//   the guarantee this design adds is strictly one-directional
+//   containment, not full per-entry compartmentalization.
+// * **The primitives here support a cheap, re-wrap-only password
+//   change** — `wrap_vault_key`/`unwrap_vault_key` operate on the vault
+//   key alone, independently of any entry, so re-wrapping it under a
+//   new KEK is one Argon2id/PBKDF2 run plus one small AES-GCM call,
+//   regardless of vault size. **This is not yet exploited**, though: see
+//   the honesty note on `vault::change_master_password` below — as
+//   currently wired up, every `encrypt_vault` call (including the one
+//   `change_master_password` makes) generates a brand-new vault key via
+//   `generate_vault_key` and re-encrypts every entry, the same
+//   whole-vault-every-save cost the flat single-derived-key design
+//   this replaced always had. The format doesn't require that; the
+//   call pattern just hasn't been narrowed to take advantage of it yet.
+//   Flagged as a real, buildable follow-up, not a design flaw in what's
+//   here — see AUDIT_PROGRESS.md's envelope-key-hierarchy entry.
+//
+// See `vault.rs`'s module-level docs for the on-disk container layout
+// this supports (`VAULT_MAGIC`) and how `encrypt_vault`/`decrypt_vault`
+// use the functions below.
+
+/// Distinguishes the vault's own envelope container from the generic
+/// small-file "blob" format (`BLOB_MAGIC`) above — the two are
+/// unrelated on-disk layouts (this one has a wrapped vault key and a
+/// list of independently-encrypted entries; `encrypt_blob`'s is one
+/// AEAD call over one flat buffer), so giving the vault container its
+/// own magic means a vault file can never be mistaken for (or accepted
+/// by) the generic blob decrypt path, or vice versa, even before any
+/// cryptographic check runs.
+pub const VAULT_MAGIC: &[u8; 4] = b"UGV1";
+pub const VAULT_ENVELOPE_VERSION: u8 = 1;
+
+/// AAD for the vault-key-wrapping AEAD call: binds the wrap ciphertext
+/// to the KDF choice/params and salt used to derive the KEK that
+/// produced it, the same tamper-evidence `blob_aad_v3` gives the
+/// small-file format (see U-01) — an attacker flipping a header byte
+/// (say, downgrading the KDF params) makes the wrap ciphertext fail to
+/// authenticate rather than silently changing what key protects it.
+fn vault_wrap_aad(kdf_id: u8, params: KdfParams) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(4 + 1 + 1 + KdfParams::ENCODED_LEN);
+    aad.extend_from_slice(VAULT_MAGIC);
+    aad.push(VAULT_ENVELOPE_VERSION);
+    aad.push(kdf_id);
+    aad.extend_from_slice(&params.to_bytes());
+    aad
+}
+
+/// AAD for one entry's AEAD call: binds that entry's ciphertext to the
+/// vault envelope format and to its own id, so an entry's sealed bytes
+/// can't be silently moved to a different id (or a different vault
+/// entirely — `VAULT_MAGIC` is folded in too) without the AES-GCM tag
+/// failing to verify.
+fn vault_entry_aad(entry_id: u64) -> [u8; 4 + 1 + 8] {
+    let mut aad = [0u8; 4 + 1 + 8];
+    aad[0..4].copy_from_slice(VAULT_MAGIC);
+    aad[4] = VAULT_ENVELOPE_VERSION;
+    aad[5..13].copy_from_slice(&entry_id.to_be_bytes());
+    aad
+}
+
+/// Single-block HKDF-Expand (RFC 5869 §2.3) — valid whenever the caller
+/// only needs one hash-length (32 bytes, for SHA-256) output: `T(1) =
+/// HMAC-Hash(PRK, T(0) || info || 0x01)` with `T(0)` empty, and nothing
+/// in this app ever asks `derive_entry_key` for more than 32 bytes.
+/// Written by hand instead of pulling in the `hkdf` crate specifically
+/// because it's this small and this narrowly used — `hmac`/`sha2` are
+/// already dependencies (used by PBKDF2 above), so this adds no new
+/// dependency at all, just ~6 lines using ones already present. This
+/// deliberately does not implement the general multi-block Expand loop
+/// (`T(2) = HMAC(PRK, T(1) || info || 0x02)`, ...): that loop would be
+/// entirely untested dead code for every actual call site in this app.
+fn hkdf_expand_one_block(prk: &[u8; 32], info: &[u8]) -> [u8; 32] {
+    use hmac::{Hmac, Mac};
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(prk)
+        .expect("HMAC-SHA256 accepts any key length, including exactly 32 bytes");
+    mac.update(info);
+    mac.update(&[0x01]);
+    let digest = mac.finalize().into_bytes();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
+}
+
+/// Derive the AES-256 key for one specific `VaultEntry` from the vault
+/// key — the "vault key -> per-entry" link of the hierarchy. `entry_id`
+/// is that entry's own stable `u64` id (`VaultEntry::id`, chosen once
+/// when the entry is created and never reused — see `vault.rs`), folded
+/// into the HKDF `info` parameter so every entry in the same vault gets
+/// an independent key, and so computing one entry's key requires
+/// knowing which entry it's for.
+pub fn derive_entry_key(vault_key: &[u8; 32], entry_id: u64) -> Zeroizing<[u8; 32]> {
+    const INFO_LABEL: &[u8] = b"unigen-entry-v1:";
+    let mut info = Vec::with_capacity(INFO_LABEL.len() + 8);
+    info.extend_from_slice(INFO_LABEL);
+    info.extend_from_slice(&entry_id.to_be_bytes());
+    Zeroizing::new(hkdf_expand_one_block(vault_key, &info))
+}
+
+/// Fresh, random 32-byte vault key — call once when a vault is first
+/// created; every subsequent open/save reuses the same vault key
+/// (unwrapped via [`unwrap_vault_key`]), so entries never need
+/// re-encrypting just because the master password changes.
+pub fn generate_vault_key() -> Zeroizing<[u8; 32]> {
+    let mut key = Zeroizing::new([0u8; 32]);
+    OsRng.fill_bytes(key.as_mut());
+    key
+}
+
+/// The vault key, wrapped (AES-256-GCM-encrypted) under a KEK derived
+/// from the master password — everything needed to unwrap it again
+/// given the correct password, and nothing else. This is the on-disk
+/// representation of the "master password -> KEK -> vault key" part of
+/// the hierarchy; see [`encode`](Self::encode)/[`decode`](Self::decode)
+/// for the exact byte layout `vault.rs` writes into the container
+/// header.
+pub struct WrappedVaultKey {
+    pub kdf_id: u8,
+    pub kdf_params: KdfParams,
+    pub kek_salt: [u8; 16],
+    wrap_nonce: [u8; 12],
+    wrapped: Vec<u8>,
+}
+
+impl WrappedVaultKey {
+    /// `kdf_id || kdf_params(12) || kek_salt(16) || wrap_nonce(12) ||
+    /// wrapped_key_len(4, u32 BE) || wrapped_key_and_tag`. The length
+    /// prefix on the last field is redundant today (AES-256-GCM over a
+    /// fixed 32-byte plaintext always produces exactly 48 bytes: 32
+    /// ciphertext + 16 tag) but costs 4 bytes to make `decode` robust
+    /// against that assumption ever changing, the same defensive habit
+    /// `stream_encrypt_file`'s chunk framing already uses for its own
+    /// length-prefixed fields.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(1 + KdfParams::ENCODED_LEN + 16 + 12 + 4 + self.wrapped.len());
+        out.push(self.kdf_id);
+        out.extend_from_slice(&self.kdf_params.to_bytes());
+        out.extend_from_slice(&self.kek_salt);
+        out.extend_from_slice(&self.wrap_nonce);
+        out.extend_from_slice(&(self.wrapped.len() as u32).to_be_bytes());
+        out.extend_from_slice(&self.wrapped);
+        out
+    }
+
+    /// Parse the layout `encode` writes from the front of `data`,
+    /// returning the parsed header and how many bytes it consumed (so
+    /// the caller — `vault.rs`'s container parser — knows where the
+    /// entry list starts).
+    pub fn decode(data: &[u8]) -> Result<(Self, usize)> {
+        let fixed_len = 1 + KdfParams::ENCODED_LEN + 16 + 12 + 4;
+        if data.len() < fixed_len {
+            bail!("Invalid vault envelope header (too short)");
+        }
+        let kdf_id = data[0];
+        let kdf_params = KdfParams::from_bytes(&data[1..1 + KdfParams::ENCODED_LEN])?
+            .validate(kdf_id)?;
+        let mut off = 1 + KdfParams::ENCODED_LEN;
+        let mut kek_salt = [0u8; 16];
+        kek_salt.copy_from_slice(&data[off..off + 16]);
+        off += 16;
+        let mut wrap_nonce = [0u8; 12];
+        wrap_nonce.copy_from_slice(&data[off..off + 12]);
+        off += 12;
+        let wrapped_len =
+            u32::from_be_bytes(data[off..off + 4].try_into().unwrap()) as usize;
+        off += 4;
+        if data.len() < off + wrapped_len {
+            bail!("Invalid vault envelope header (truncated wrapped vault key)");
+        }
+        let wrapped = data[off..off + wrapped_len].to_vec();
+        off += wrapped_len;
+        Ok((
+            Self {
+                kdf_id,
+                kdf_params,
+                kek_salt,
+                wrap_nonce,
+                wrapped,
+            },
+            off,
+        ))
+    }
+}
+
+/// Wrap (encrypt) `vault_key` under a KEK derived from `master_password`.
+/// Called every time `vault::encrypt_vault` runs (currently: on every
+/// save, with a freshly-generated `vault_key` each time — see the
+/// honesty note on `vault::change_master_password` about the
+/// re-wrap-only fast path this function *could* support for password
+/// changes specifically, which isn't wired up yet).
+pub fn wrap_vault_key(
+    master_password: &str,
+    vault_key: &[u8; 32],
+    kdf_id: u8,
+) -> Result<WrappedVaultKey> {
+    require_min_passphrase_len(master_password)?;
+    let kdf_params = KdfParams::current_for_kdf(kdf_id)?;
+    let mut kek_salt = [0u8; 16];
+    let mut wrap_nonce = [0u8; 12];
+    OsRng.fill_bytes(&mut kek_salt);
+    OsRng.fill_bytes(&mut wrap_nonce);
+    let kek = derive_key(master_password, &kek_salt, kdf_id, kdf_params)?;
+    let aad = vault_wrap_aad(kdf_id, kdf_params);
+    let wrapped = aead_for_key(&kek)
+        .encrypt(
+            Nonce::from_slice(&wrap_nonce),
+            Payload {
+                msg: vault_key.as_slice(),
+                aad: &aad,
+            },
+        )
+        .map_err(|_| anyhow!("failed to wrap vault key"))?;
+    Ok(WrappedVaultKey {
+        kdf_id,
+        kdf_params,
+        kek_salt,
+        wrap_nonce,
+        wrapped,
+    })
+}
+
+/// Unwrap (decrypt) the vault key from a [`WrappedVaultKey`] using
+/// `master_password`. Fails (wrong password, or a tampered/corrupted
+/// header) exactly like every other decrypt entry point in this file —
+/// an `Err` here is `vault::decrypt_vault`'s only signal, so it's
+/// reported the same way as any other "wrong master password" case.
+pub fn unwrap_vault_key(
+    master_password: &str,
+    wrapped: &WrappedVaultKey,
+) -> Result<Zeroizing<[u8; 32]>> {
+    let kek = derive_key(
+        master_password,
+        &wrapped.kek_salt,
+        wrapped.kdf_id,
+        wrapped.kdf_params,
+    )?;
+    let aad = vault_wrap_aad(wrapped.kdf_id, wrapped.kdf_params);
+    let pt = aead_for_key(&kek)
+        .decrypt(
+            Nonce::from_slice(&wrapped.wrap_nonce),
+            Payload {
+                msg: &wrapped.wrapped,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| anyhow!("wrong master password, or vault key could not be unwrapped"))?;
+    if pt.len() != 32 {
+        bail!("unwrapped vault key has unexpected length ({} bytes)", pt.len());
+    }
+    let mut key = Zeroizing::new([0u8; 32]);
+    key.copy_from_slice(&pt);
+    Ok(key)
+}
+
+/// Encrypt one entry's already-serialized JSON payload under its own
+/// derived entry key (see [`derive_entry_key`]). Returns `nonce(12) ||
+/// ciphertext+tag` — `vault.rs` additionally length-prefixes this before
+/// writing it into the container, since ciphertext length varies per
+/// entry.
+pub fn encrypt_entry_payload(vault_key: &[u8; 32], entry_id: u64, plaintext: &[u8]) -> Vec<u8> {
+    let entry_key = derive_entry_key(vault_key, entry_id);
+    let mut nonce_bytes = [0u8; 12];
+    OsRng.fill_bytes(&mut nonce_bytes);
+    let aad = vault_entry_aad(entry_id);
+    // AES-256-GCM only fails to encrypt on a key/nonce-length mismatch,
+    // neither of which can happen here (both are fixed-size arrays) —
+    // `expect` rather than propagating a `Result` keeps every call site
+    // in `vault.rs` from having to handle an error case that can't
+    // actually occur, the same reasoning `aead_for_key`'s other callers
+    // already rely on implicitly.
+    let ct = aead_for_key(&entry_key)
+        .encrypt(
+            Nonce::from_slice(&nonce_bytes),
+            Payload {
+                msg: plaintext,
+                aad: &aad,
+            },
+        )
+        .expect("AES-256-GCM encryption with fixed-size key/nonce cannot fail");
+    let mut out = Vec::with_capacity(12 + ct.len());
+    out.extend_from_slice(&nonce_bytes);
+    out.extend_from_slice(&ct);
+    out
+}
+
+/// Decrypt one entry's sealed payload (as produced by
+/// [`encrypt_entry_payload`]) back to its serialized JSON, given the
+/// vault key and the entry's id. Fails (bad key — i.e. a corrupted or
+/// tampered vault key/entry — or a tampered/truncated `sealed` buffer)
+/// the same way every other decrypt call in this file does: an opaque
+/// `Err`, since AES-GCM authentication failure can't distinguish
+/// "wrong key" from "tampered ciphertext" and shouldn't try to.
+pub fn decrypt_entry_payload(
+    vault_key: &[u8; 32],
+    entry_id: u64,
+    sealed: &[u8],
+) -> Result<Zeroizing<Vec<u8>>> {
+    if sealed.len() < 12 {
+        bail!("Invalid vault entry (too short)");
+    }
+    let (nonce_bytes, ct) = sealed.split_at(12);
+    let entry_key = derive_entry_key(vault_key, entry_id);
+    let aad = vault_entry_aad(entry_id);
+    let pt = aead_for_key(&entry_key)
+        .decrypt(
+            Nonce::from_slice(nonce_bytes),
+            Payload { msg: ct, aad: &aad },
+        )
+        .map_err(|_| anyhow!("failed to decrypt vault entry {entry_id} (tampered or corrupted)"))?;
+    Ok(Zeroizing::new(pt))
+}
+
+
 /// Encrypt an in-memory buffer (used for the small-file / clipboard path).
 /// Returns the full container: MAGIC || VERSION || kdf_id || salt(16) ||
 /// nonce(12) || ciphertext(+tag).
@@ -197,9 +685,10 @@ pub fn encrypt_blob(password: &str, data: &[u8], kdf_id: u8) -> Result<Vec<u8>> 
     OsRng.fill_bytes(&mut salt);
     OsRng.fill_bytes(&mut nonce_bytes);
 
-    let key = derive_key(password, &salt, kdf_id)?;
+    let params = KdfParams::current_for_kdf(kdf_id)?;
+    let key = derive_key(password, &salt, kdf_id, params)?;
     let cipher = aead_for_key(&key);
-    let aad = blob_aad(kdf_id, FORMAT_VERSION);
+    let aad = blob_aad_v3(kdf_id, FORMAT_VERSION, params);
     let nonce = Nonce::from_slice(&nonce_bytes);
 
     let ct = cipher
@@ -212,10 +701,13 @@ pub fn encrypt_blob(password: &str, data: &[u8], kdf_id: u8) -> Result<Vec<u8>> 
         )
         .map_err(|_| anyhow!("encryption failed"))?;
 
-    let mut out = Vec::with_capacity(4 + 1 + 1 + 16 + 12 + ct.len());
+    let mut out = Vec::with_capacity(
+        4 + 1 + 1 + KdfParams::ENCODED_LEN + 16 + 12 + ct.len(),
+    );
     out.extend_from_slice(BLOB_MAGIC);
     out.push(FORMAT_VERSION);
     out.push(kdf_id);
+    out.extend_from_slice(&params.to_bytes());
     out.extend_from_slice(&salt);
     out.extend_from_slice(&nonce_bytes);
     out.extend_from_slice(&ct);
@@ -258,18 +750,47 @@ pub fn decrypt_blob(password: &str, combined: &[u8]) -> Result<Vec<u8>> {
     let version = combined[4];
     // v1 and v2 share the exact same blob container layout — only the
     // *streaming* format changed base_nonce size between v1 and v2 (see
-    // FORMAT_VERSION doc comment), so both are accepted here.
-    if version != 1 && version != FORMAT_VERSION {
+    // FORMAT_VERSION doc comment). v3 (U-01 fix) inserts a 12-byte KDF
+    // params block between kdf_id and salt, so it's parsed separately.
+    let kdf_id = combined[5];
+    if version == 1 || version == 2 {
+        if combined.len() < 4 + 1 + 1 + 16 + 12 {
+            bail!("Invalid file format (too short)");
+        }
+        let salt = &combined[6..22];
+        let nonce_bytes = &combined[22..34];
+        let ct = &combined[34..];
+
+        let params = KdfParams::legacy_for_kdf(kdf_id)?;
+        let key = derive_key(password, salt, kdf_id, params)?;
+        let cipher = aead_for_key(&key);
+        let aad = blob_aad(kdf_id, version);
+        let nonce = Nonce::from_slice(nonce_bytes);
+
+        return cipher
+            .decrypt(nonce, Payload { msg: ct, aad: &aad })
+            .map_err(|_| {
+                anyhow!("Decryption failed: wrong passphrase or corrupted/tampered file")
+            });
+    }
+    if version != FORMAT_VERSION {
         bail!("Unsupported format version: {version}");
     }
-    let kdf_id = combined[5];
-    let salt = &combined[6..22];
-    let nonce_bytes = &combined[22..34];
-    let ct = &combined[34..];
+    let header_len = 4 + 1 + 1 + KdfParams::ENCODED_LEN + 16 + 12;
+    if combined.len() < header_len {
+        bail!("Invalid file format (too short)");
+    }
+    let params_start = 6;
+    let params = KdfParams::from_bytes(&combined[params_start..params_start + KdfParams::ENCODED_LEN])?;
+    let salt_start = params_start + KdfParams::ENCODED_LEN;
+    let salt = &combined[salt_start..salt_start + 16];
+    let nonce_start = salt_start + 16;
+    let nonce_bytes = &combined[nonce_start..nonce_start + 12];
+    let ct = &combined[nonce_start + 12..];
 
-    let key = derive_key(password, salt, kdf_id)?;
+    let key = derive_key(password, salt, kdf_id, params)?;
     let cipher = aead_for_key(&key);
-    let aad = blob_aad(kdf_id, version);
+    let aad = blob_aad_v3(kdf_id, version, params);
     let nonce = Nonce::from_slice(nonce_bytes);
 
     cipher
@@ -303,7 +824,8 @@ fn decrypt_legacy_python_blob(password: &str, combined: &[u8]) -> Result<Vec<u8>
     let iv = &rest[16..28];
     let ct = &rest[28..];
 
-    let key = derive_key(password, salt, kdf_id)?;
+    let params = KdfParams::legacy_for_kdf(kdf_id)?;
+    let key = derive_key(password, salt, kdf_id, params)?;
     let cipher = aead_for_key(&key);
     let nonce = Nonce::from_slice(iv);
 
@@ -391,6 +913,26 @@ fn stream_chunk_aad(kdf_id: u8, version: u8, counter: u64, is_final: bool) -> [u
     aad[5] = kdf_id;
     aad[6..14].copy_from_slice(&counter.to_be_bytes());
     aad[14] = if is_final { 1 } else { 0 };
+    aad
+}
+
+// U-01 fix: v3+ streaming containers fold the KDF params block into every
+// chunk's AAD too (not just the blob format's), for the same tamper-proofing
+// reason given at `blob_aad_v3`.
+fn stream_chunk_aad_v3(
+    kdf_id: u8,
+    version: u8,
+    params: KdfParams,
+    counter: u64,
+    is_final: bool,
+) -> [u8; 15 + KdfParams::ENCODED_LEN] {
+    let mut aad = [0u8; 15 + KdfParams::ENCODED_LEN];
+    aad[0..4].copy_from_slice(STREAM_MAGIC);
+    aad[4] = version;
+    aad[5] = kdf_id;
+    aad[6..14].copy_from_slice(&counter.to_be_bytes());
+    aad[14] = if is_final { 1 } else { 0 };
+    aad[15..].copy_from_slice(&params.to_bytes());
     aad
 }
 
@@ -558,7 +1100,8 @@ pub fn stream_encrypt_file(
     OsRng.fill_bytes(&mut salt);
     OsRng.fill_bytes(&mut base_nonce);
 
-    let key = derive_key(password, &salt, kdf_id)?;
+    let params = KdfParams::current_for_kdf(kdf_id)?;
+    let key = derive_key(password, &salt, kdf_id, params)?;
     let cipher = aead_for_key(&key);
 
     let total = fs::metadata(in_path)?.len();
@@ -573,6 +1116,7 @@ pub fn stream_encrypt_file(
 
         writer.write_all(STREAM_MAGIC)?;
         writer.write_all(&[FORMAT_VERSION, kdf_id])?;
+        writer.write_all(&params.to_bytes())?;
         writer.write_all(&salt)?;
         writer.write_all(&base_nonce)?;
 
@@ -612,7 +1156,7 @@ pub fn stream_encrypt_file(
             nonce_bytes[..4].copy_from_slice(&base_nonce);
             nonce_bytes[4..].copy_from_slice(&counter.to_be_bytes());
             let nonce = Nonce::from_slice(&nonce_bytes);
-            let aad = stream_chunk_aad(kdf_id, FORMAT_VERSION, counter, is_final);
+            let aad = stream_chunk_aad_v3(kdf_id, FORMAT_VERSION, params, counter, is_final);
             let ct = cipher
                 .encrypt(
                     nonce,
@@ -698,20 +1242,31 @@ pub fn stream_decrypt_file(
     let mut header = [0u8; 2];
     reader.read_exact(&mut header)?;
     let (version, kdf_id) = (header[0], header[1]);
-    if version != 1 && version != FORMAT_VERSION {
+    if version != 1 && version != 2 && version != FORMAT_VERSION {
         bail!("Unsupported format version: {version}");
     }
     // v1 wrote an 8-byte base_nonce and truncated the per-chunk counter to
-    // u32; v2 (current) writes a 4-byte base_nonce and uses the full u64
-    // counter (see FORMAT_VERSION doc comment). Read the size matching the
-    // version so both old and new files remain decryptable.
+    // u32; v2/v3 write a 4-byte base_nonce and use the full u64 counter
+    // (see FORMAT_VERSION doc comment). Read the size matching the version
+    // so old, new, and current files all remain decryptable.
     let base_nonce_len: usize = if version == 1 { 8 } else { 4 };
+    // v3 (U-01 fix) inserts a 12-byte KDF params block right after the
+    // version/kdf_id header bytes; v1/v2 have no such field and always
+    // used this build's legacy compile-time constants for that KDF.
+    let params_len: usize = if version >= 3 { KdfParams::ENCODED_LEN } else { 0 };
+    let params = if version >= 3 {
+        let mut buf = [0u8; KdfParams::ENCODED_LEN];
+        reader.read_exact(&mut buf)?;
+        KdfParams::from_bytes(&buf)?
+    } else {
+        KdfParams::legacy_for_kdf(kdf_id)?
+    };
     let mut salt = [0u8; 16];
     reader.read_exact(&mut salt)?;
     let mut base_nonce = [0u8; 8];
     reader.read_exact(&mut base_nonce[..base_nonce_len])?;
 
-    let key = derive_key(password, &salt, kdf_id)?;
+    let key = derive_key(password, &salt, kdf_id, params)?;
     let cipher = aead_for_key(&key);
 
     let tmp_path = out_path.map(unique_tmp_path);
@@ -728,7 +1283,7 @@ pub fn stream_decrypt_file(
         // Header already consumed from `reader`: magic (4) + version/kdf (2)
         // + salt (16) + base_nonce (base_nonce_len). Count them so `done`
         // stays in the same units as `total` (encrypted file size).
-        let mut done: u64 = 4 + 2 + 16 + base_nonce_len as u64;
+        let mut done: u64 = 4 + 2 + params_len as u64 + 16 + base_nonce_len as u64;
         loop {
             let mut final_byte = [0u8; 1];
             match reader.read_exact(&mut final_byte) {
@@ -762,7 +1317,11 @@ pub fn stream_decrypt_file(
                 nonce_bytes[4..].copy_from_slice(&counter.to_be_bytes());
             }
             let nonce = Nonce::from_slice(&nonce_bytes);
-            let aad = stream_chunk_aad(kdf_id, version, counter, is_final);
+            let aad = if version >= 3 {
+                stream_chunk_aad_v3(kdf_id, version, params, counter, is_final).to_vec()
+            } else {
+                stream_chunk_aad(kdf_id, version, counter, is_final).to_vec()
+            };
 
             // MEMORY-RESIDUE fix: each decrypted chunk is plaintext file
             // content — wrap it so it's zeroized on drop at the end of
@@ -925,6 +1484,141 @@ mod tests {
 
     const PWD: &str = "correct horse battery staple";
 
+    // --- Envelope key hierarchy: master password -> KEK -> vault key -> per-entry ---
+
+    #[test]
+    fn wrap_unwrap_vault_key_round_trips() {
+        let vault_key = generate_vault_key();
+        let wrapped = wrap_vault_key(PWD, &vault_key, KDF_ARGON2ID).unwrap();
+        let recovered = unwrap_vault_key(PWD, &wrapped).unwrap();
+        assert_eq!(*recovered, *vault_key);
+    }
+
+    #[test]
+    fn wrap_unwrap_vault_key_round_trips_pbkdf2() {
+        let vault_key = generate_vault_key();
+        let wrapped = wrap_vault_key(PWD, &vault_key, KDF_PBKDF2).unwrap();
+        let recovered = unwrap_vault_key(PWD, &wrapped).unwrap();
+        assert_eq!(*recovered, *vault_key);
+    }
+
+    #[test]
+    fn unwrap_vault_key_wrong_password_fails() {
+        let vault_key = generate_vault_key();
+        let wrapped = wrap_vault_key(PWD, &vault_key, KDF_ARGON2ID).unwrap();
+        assert!(unwrap_vault_key("wrong password entirely", &wrapped).is_err());
+    }
+
+    #[test]
+    fn wrapped_vault_key_encode_decode_round_trips() {
+        let vault_key = generate_vault_key();
+        let wrapped = wrap_vault_key(PWD, &vault_key, KDF_ARGON2ID).unwrap();
+        let encoded = wrapped.encode();
+        let (decoded, consumed) = WrappedVaultKey::decode(&encoded).unwrap();
+        assert_eq!(consumed, encoded.len());
+        // Re-unwrap through the decoded copy to confirm every field
+        // survived the encode/decode trip, not just a subset.
+        let recovered = unwrap_vault_key(PWD, &decoded).unwrap();
+        assert_eq!(*recovered, *vault_key);
+    }
+
+    #[test]
+    fn wrapped_vault_key_decode_rejects_truncated_input() {
+        let vault_key = generate_vault_key();
+        let wrapped = wrap_vault_key(PWD, &vault_key, KDF_ARGON2ID).unwrap();
+        let encoded = wrapped.encode();
+        // Cut off partway through the wrapped-key field itself, not just
+        // the fixed-size header prefix.
+        assert!(WrappedVaultKey::decode(&encoded[..encoded.len() - 5]).is_err());
+        assert!(WrappedVaultKey::decode(&encoded[..4]).is_err());
+        assert!(WrappedVaultKey::decode(&[]).is_err());
+    }
+
+    #[test]
+    fn wrapped_vault_key_tampered_header_fails_to_unwrap() {
+        // Flipping a byte anywhere in the AAD-bound header (here: the
+        // KEK salt) must make unwrap fail closed — same tamper-evidence
+        // guarantee `blob_aad_v3` gives the small-file format (U-01),
+        // now extended to the vault-key-wrapping AEAD call.
+        let vault_key = generate_vault_key();
+        let mut wrapped = wrap_vault_key(PWD, &vault_key, KDF_ARGON2ID).unwrap();
+        wrapped.kek_salt[0] ^= 0xFF;
+        assert!(unwrap_vault_key(PWD, &wrapped).is_err());
+    }
+
+    #[test]
+    fn derive_entry_key_is_deterministic_and_id_dependent() {
+        let vault_key = generate_vault_key();
+        let k1a = derive_entry_key(&vault_key, 42);
+        let k1b = derive_entry_key(&vault_key, 42);
+        let k2 = derive_entry_key(&vault_key, 43);
+        assert_eq!(*k1a, *k1b, "same vault key + same id must derive the same entry key");
+        assert_ne!(*k1a, *k2, "different ids under the same vault key must derive different keys");
+    }
+
+    #[test]
+    fn derive_entry_key_differs_across_vault_keys() {
+        let vk1 = generate_vault_key();
+        let vk2 = generate_vault_key();
+        assert_ne!(
+            *derive_entry_key(&vk1, 1),
+            *derive_entry_key(&vk2, 1),
+            "the same entry id under two different vault keys must derive different entry keys"
+        );
+    }
+
+    #[test]
+    fn encrypt_decrypt_entry_payload_round_trips() {
+        let vault_key = generate_vault_key();
+        let plaintext = br#"{"id":7,"title":"example"}"#;
+        let sealed = encrypt_entry_payload(&vault_key, 7, plaintext);
+        let recovered = decrypt_entry_payload(&vault_key, 7, &sealed).unwrap();
+        assert_eq!(&recovered[..], plaintext);
+    }
+
+    #[test]
+    fn decrypt_entry_payload_wrong_entry_id_fails() {
+        // The entry id is folded into the AAD (`vault_entry_aad`), so
+        // decrypting under the *wrong* id for an otherwise-correct
+        // ciphertext must fail — this is what stops a sealed entry from
+        // being silently relabeled to a different id.
+        let vault_key = generate_vault_key();
+        let sealed = encrypt_entry_payload(&vault_key, 7, b"payload");
+        assert!(decrypt_entry_payload(&vault_key, 8, &sealed).is_err());
+    }
+
+    #[test]
+    fn decrypt_entry_payload_wrong_vault_key_fails() {
+        let vk1 = generate_vault_key();
+        let vk2 = generate_vault_key();
+        let sealed = encrypt_entry_payload(&vk1, 7, b"payload");
+        assert!(decrypt_entry_payload(&vk2, 7, &sealed).is_err());
+    }
+
+    #[test]
+    fn decrypt_entry_payload_tampered_ciphertext_fails() {
+        let vault_key = generate_vault_key();
+        let mut sealed = encrypt_entry_payload(&vault_key, 7, b"payload");
+        let last = sealed.len() - 1;
+        sealed[last] ^= 0xFF;
+        assert!(decrypt_entry_payload(&vault_key, 7, &sealed).is_err());
+    }
+
+    #[test]
+    fn encrypt_entry_payload_uses_fresh_nonce_each_call() {
+        // Same key, same id, same plaintext, called twice — ciphertexts
+        // must differ (fresh random nonce each call), the same
+        // nonce-uniqueness discipline every other AEAD call site in this
+        // file already follows.
+        let vault_key = generate_vault_key();
+        let sealed1 = encrypt_entry_payload(&vault_key, 7, b"same payload");
+        let sealed2 = encrypt_entry_payload(&vault_key, 7, b"same payload");
+        assert_ne!(sealed1, sealed2);
+        // Both still decrypt correctly despite differing on the wire.
+        assert_eq!(&*decrypt_entry_payload(&vault_key, 7, &sealed1).unwrap(), b"same payload");
+        assert_eq!(&*decrypt_entry_payload(&vault_key, 7, &sealed2).unwrap(), b"same payload");
+    }
+
     #[test]
     fn blob_round_trip_argon2id() {
         let data = b"hello world, this is a secret";
@@ -964,12 +1658,39 @@ mod tests {
 
     #[test]
     fn blob_header_layout_is_stable() {
-        // MAGIC(4) || VERSION(1) || kdf_id(1) || salt(16) || nonce(12) || ct(+tag)
+        // MAGIC(4) || VERSION(1) || kdf_id(1) || kdf_params(12) || salt(16)
+        // || nonce(12) || ct(+tag)  -- the kdf_params block is the U-01 fix.
         let combined = encrypt_blob(PWD, b"x", KDF_ARGON2ID).unwrap();
         assert_eq!(&combined[0..4], BLOB_MAGIC);
         assert_eq!(combined[4], FORMAT_VERSION);
         assert_eq!(combined[5], KDF_ARGON2ID);
-        assert!(combined.len() >= 4 + 1 + 1 + 16 + 12 + 1 + 16); // + tag
+        let params = KdfParams::from_bytes(&combined[6..18]).unwrap();
+        assert_eq!(params.p1, ARGON2_MEMORY_KIB);
+        assert_eq!(params.p2, ARGON2_TIME_COST);
+        assert_eq!(params.p3, ARGON2_LANES);
+        assert!(combined.len() >= 4 + 1 + 1 + KdfParams::ENCODED_LEN + 16 + 12 + 1 + 16); // + tag
+    }
+
+    #[test]
+    fn blob_v3_tampered_kdf_params_fails() {
+        // U-01 regression test: the KDF params block is authenticated via
+        // the AAD, so flipping a byte inside it must fail decryption
+        // (rather than silently deriving with different, attacker-chosen
+        // parameters).
+        let mut combined = encrypt_blob(PWD, b"secret", KDF_ARGON2ID).unwrap();
+        // Byte 6 is the first byte of the params block (kdf_params.p1's
+        // high byte, i.e. part of the Argon2id memory-cost parameter).
+        combined[6] ^= 0xFF;
+        assert!(decrypt_blob(PWD, &combined).is_err());
+    }
+
+    #[test]
+    fn blob_v3_roundtrips_with_pbkdf2() {
+        let combined = encrypt_blob(PWD, b"pbkdf2 secret", KDF_PBKDF2).unwrap();
+        let plain = decrypt_blob(PWD, &combined).unwrap();
+        assert_eq!(plain, b"pbkdf2 secret");
+        let params = KdfParams::from_bytes(&combined[6..18]).unwrap();
+        assert_eq!(params.p1, PBKDF2_ITERATIONS);
     }
 
     #[test]
@@ -1015,7 +1736,7 @@ mod tests {
         let mut nonce_bytes = [0u8; 12];
         OsRng.fill_bytes(&mut salt);
         OsRng.fill_bytes(&mut nonce_bytes);
-        let key = derive_key(PWD, &salt, KDF_ARGON2ID).unwrap();
+        let key = derive_key(PWD, &salt, KDF_ARGON2ID, KdfParams::legacy_for_kdf(KDF_ARGON2ID).unwrap()).unwrap();
         let cipher = aead_for_key(&key);
         let old_version: u8 = 1;
         let aad = blob_aad(KDF_ARGON2ID, old_version);
@@ -1048,7 +1769,7 @@ mod tests {
         // iv(12) || ct, no AAD.
         let salt = [7u8; 16];
         let iv = [9u8; 12];
-        let key = derive_key(PWD, &salt, KDF_PBKDF2).unwrap();
+        let key = derive_key(PWD, &salt, KDF_PBKDF2, KdfParams::legacy_for_kdf(KDF_PBKDF2).unwrap()).unwrap();
         let cipher = aead_for_key(&key);
         let nonce = Nonce::from_slice(&iv);
         let ct = cipher
@@ -1078,7 +1799,7 @@ mod tests {
         // PBKDF2, no magic byte, no AAD.
         let salt = [3u8; 16];
         let iv = [4u8; 12];
-        let key = derive_key(PWD, &salt, KDF_PBKDF2).unwrap();
+        let key = derive_key(PWD, &salt, KDF_PBKDF2, KdfParams::legacy_for_kdf(KDF_PBKDF2).unwrap()).unwrap();
         let cipher = aead_for_key(&key);
         let nonce = Nonce::from_slice(&iv);
         let ct = cipher
@@ -1157,6 +1878,36 @@ mod tests {
         stream_encrypt_file(&in_path, &enc_path, PWD, KDF_ARGON2ID, None).unwrap();
 
         let result = stream_decrypt_file(&enc_path, None, "totally wrong password", None);
+        assert!(result.is_err());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stream_v3_tampered_kdf_params_fails() {
+        // U-01 regression test, streaming-format side: same rationale as
+        // blob_v3_tampered_kdf_params_fails.
+        let dir = std::env::temp_dir().join(format!(
+            "unigen_test_kdfparams_{}_{}",
+            std::process::id(),
+            {
+                let mut n = [0u8; 8];
+                OsRng.fill_bytes(&mut n);
+                hex::encode(n)
+            }
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let in_path = dir.join("plain.bin");
+        let enc_path = dir.join("plain.enc");
+        fs::write(&in_path, b"stream kdf params tamper test").unwrap();
+        stream_encrypt_file(&in_path, &enc_path, PWD, KDF_ARGON2ID, None).unwrap();
+
+        let mut bytes = fs::read(&enc_path).unwrap();
+        // Header: MAGIC(4) + version/kdf_id(2) -> params block starts at 6.
+        bytes[6] ^= 0xFF;
+        fs::write(&enc_path, &bytes).unwrap();
+
+        let result = stream_decrypt_file(&enc_path, None, PWD, None);
         assert!(result.is_err());
 
         let _ = fs::remove_dir_all(&dir);
