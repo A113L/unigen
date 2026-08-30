@@ -537,7 +537,21 @@ struct UnigenApp {
     autoclear_enabled: bool,
     autoclear_seconds: u32,
     autoclear_deadline: Option<Instant>,
-    autoclear_expected: Option<Zeroizing<String>>,
+    // SECURITY: was `Option<Zeroizing<String>>`. `Zeroizing<String>` wipes
+    // its bytes on drop, but that's the *only* guarantee it gives — the
+    // backing `String` is a normal heap allocation with no `mlock` and no
+    // zeroize-before-realloc protection, and it sat here, holding a full
+    // plaintext copy of whatever password was last copied to the
+    // clipboard (including from the password generator), for the entire
+    // `autoclear_seconds` window (up to 300s) every single time. That's
+    // exactly the class of "stray plaintext copy of a secret parked in
+    // ordinary memory" that `secret.rs`'s `LockedSecret` exists to close
+    // for `VaultEntry::password` — this field deserves the same
+    // treatment: encrypted-at-rest in RAM (ChaCha20 keystream, key in an
+    // `mlock`ed allocation) between the moment it's copied and the moment
+    // it's cleared, decrypted only into a short-lived `SecretString` via
+    // `.reveal()` for the read-back comparison in `tick_autoclear`.
+    autoclear_expected: Option<LockedSecret>,
     clip_status: String,
 
     // ---- File Protector: Encrypt ----
@@ -797,13 +811,24 @@ impl UnigenApp {
     /// clipboard, once stored in `autoclear_expected` — and both were
     /// plain `String`s that leaked unscrubbed plaintext into freed heap
     /// memory on drop/overwrite instead of just the one unavoidable copy.
+    ///
+    /// SECURITY (follow-up fix): that `autoclear_expected` copy is now a
+    /// `LockedSecret`, not a `Zeroizing<String>` — see the field's doc
+    /// comment. It used to sit as an ordinary (if zeroize-on-drop) heap
+    /// `String` for the whole `autoclear_seconds` window, which for the
+    /// password-generator's per-row "Copy" button (the caller of this
+    /// function) meant a full plaintext copy of a just-generated
+    /// password parked in normal memory, readable by a memory dump or
+    /// swapped page, for up to 300s at a time.
     fn copy_to_clipboard_20s(&mut self, text: &str) {
         let owned = Zeroizing::new(text.to_string());
         if let Some(cb) = self.clipboard.as_mut() {
             if cb.set_text(owned.as_str().to_string()).is_ok() {
                 self.autoclear_deadline =
                     Some(Instant::now() + Duration::from_secs(self.autoclear_seconds as u64));
-                self.autoclear_expected = Some(owned);
+                // SECURITY: sealed with `LockedSecret` instead of kept as
+                // the plain `owned` — see the field doc comment.
+                self.autoclear_expected = Some(LockedSecret::from_str(owned.as_str()));
                 self.editor_status = format!(
                     "Copied line. Clipboard clears in {}s.",
                     self.autoclear_seconds
@@ -821,7 +846,8 @@ impl UnigenApp {
                 self.clip_status = if self.autoclear_enabled {
                     self.autoclear_deadline =
                         Some(Instant::now() + Duration::from_secs(self.autoclear_seconds as u64));
-                    self.autoclear_expected = Some(owned);
+                    // SECURITY: see the field doc comment on `autoclear_expected`.
+                    self.autoclear_expected = Some(LockedSecret::from_str(owned.as_str()));
                     format!("Copied. Auto-clears in {}s.", self.autoclear_seconds)
                 } else {
                     self.autoclear_deadline = None;
@@ -1104,20 +1130,32 @@ impl UnigenApp {
         // the password to something the user didn't intend, and so a
         // typo in the current-password field is caught here rather than
         // producing a vault re-encrypted under the wrong assumption.
+        //
+        // `current` is kept alive (not zeroized yet) past this check:
+        // `vault::change_master_password`'s fast path also needs the
+        // current password itself, to unwrap the existing vault key
+        // before re-wrapping it under the new one — see that function's
+        // doc comment.
         let mut current = std::mem::take(&mut self.vault_change_pwd_current);
         let verify = vault::read_vault_file(&path).and_then(|combined| {
             vault::decrypt_vault(&current, &combined)
         });
-        current.zeroize();
 
         if verify.is_err() {
+            current.zeroize();
             self.vault_change_pwd_error = "Current password is incorrect.".to_string();
             return;
         }
 
         let mut new_pwd = std::mem::take(&mut self.vault_change_pwd_new);
-        let result =
-            vault::change_master_password(&path, &self.vault_entries, &new_pwd, self.vault_kdf);
+        let result = vault::change_master_password(
+            &path,
+            &current,
+            &self.vault_entries,
+            &new_pwd,
+            self.vault_kdf,
+        );
+        current.zeroize();
         new_pwd.zeroize();
         self.vault_change_pwd_confirm.zeroize();
 
@@ -1440,7 +1478,28 @@ impl UnigenApp {
             ui.label("Title");
             ui.text_edit_singleline(&mut self.vault_edit_title);
             ui.label("Username");
-            let user_resp = ui.text_edit_singleline(&mut self.vault_edit_username);
+            // SECURITY: same rationale as `password`/`notes` below — plain
+            // `ui.text_edit_singleline` is backed by `egui::TextEdit`,
+            // whose internal undo/redo stack (`Arc<Mutex<Undoer<(...,
+            // String)>>>`, persisted in `egui::Memory`) pushes a fresh
+            // plain-`String` snapshot of the *entire* field on every
+            // keystroke and is unreachable/unzeroizable from application
+            // code (see `secure_text_edit.rs` module docs for the
+            // confirmed-in-practice core-dump finding). `username` sits in
+            // memory for the entire unlocked vault session, same as
+            // `password`, so it deserves the same "never hand text to
+            // egui's own buffer" treatment `SecurePasswordEdit`/
+            // `SecureNotesEdit` already give `password`/`notes` — hence
+            // `SecurePasswordEdit::masked(false)`: same no-undo-history
+            // guarantee, just with the real characters painted instead of
+            // bullets.
+            let user_resp = ui.add(
+                secure_text_edit::SecurePasswordEdit::new(
+                    "vault_edit_username",
+                    &mut self.vault_edit_username,
+                )
+                .masked(false),
+            );
             let mut user_copy: Option<SecretString> = None;
             user_resp.context_menu(|ui| {
                 if ui.button("Copy").clicked() {
@@ -1505,7 +1564,14 @@ impl UnigenApp {
                 }
             });
             ui.label("URL");
-            let url_resp = ui.text_edit_singleline(&mut self.vault_edit_url);
+            // SECURITY: same fix and rationale as `username` above.
+            let url_resp = ui.add(
+                secure_text_edit::SecurePasswordEdit::new(
+                    "vault_edit_url",
+                    &mut self.vault_edit_url,
+                )
+                .masked(false),
+            );
             let mut url_copy: Option<SecretString> = None;
             url_resp.context_menu(|ui| {
                 if ui.button("Copy").clicked() {
@@ -1801,7 +1867,12 @@ impl UnigenApp {
                     .as_mut()
                     .and_then(|cb| cb.get_text().ok())
                     .map(Zeroizing::new);
-                let still_ours = match (&cur, &self.autoclear_expected) {
+                // `.reveal()` decrypts into a short-lived `SecretString`
+                // just for this comparison — same "only the brief
+                // revealed copy is plaintext" guarantee `LockedSecret`
+                // gives `VaultEntry::password`'s reveal path.
+                let expected_revealed = self.autoclear_expected.as_ref().map(|e| e.reveal());
+                let still_ours = match (&cur, &expected_revealed) {
                     (Some(c), Some(e)) => c.as_str() == e.as_str(),
                     (None, _) => true,
                     (Some(_), None) => false,
@@ -3147,8 +3218,61 @@ impl UnigenApp {
                                         {
                                             to_copy = Some(Zeroizing::new(pwd.as_str().to_owned()));
                                         }
-                                        let label_resp =
-                                            ui.monospace(format!("#{}: {}", i + 1, pwd.as_str()));
+                                        // SECURITY: was `ui.monospace(format!(...))` — a
+                                        // plain `egui::Label`. That builds an ordinary,
+                                        // never-zeroized heap `String` containing the full
+                                        // plaintext password every single frame this list is
+                                        // visible, and hands it into egui's normal
+                                        // WidgetText/RichText/galley pipeline — completely
+                                        // outside this app's `SecretBytes`/`Zeroizing`
+                                        // protections. Confirmed present in a post-run core
+                                        // dump. Fixed the same way `SecurePasswordEdit`'s
+                                        // reveal mode already handles this (see
+                                        // `secure_text_edit.rs`): paint the characters
+                                        // directly instead of going through a `Label`, and
+                                        // wrap the short-lived formatting buffer in
+                                        // `Zeroizing` so at least its own backing allocation
+                                        // is wiped the moment this iteration ends.
+                                        // Residual risk, documented rather than implied
+                                        // away (same "layout_no_wrap still needs an owned
+                                        // String" gap `SecurePasswordEdit`'s own reveal-mode
+                                        // doc comment already accepts for this exact egui
+                                        // API): `layout_no_wrap` takes `text.to_string()`,
+                                        // so one more plain-`String` copy is made and handed
+                                        // to egui's font/galley cache per call — but it's a
+                                        // single, per-frame, non-accumulating allocation
+                                        // (dropped/replaced next frame), not a persistent
+                                        // undo-style trail like the removed `Label` path, and
+                                        // it matches the residual-risk boundary this app
+                                        // already accepts elsewhere for reveal-mode text
+                                        // painting.
+                                        let line = Zeroizing::new(format!(
+                                            "#{}: {}",
+                                            i + 1,
+                                            pwd.as_str()
+                                        ));
+                                        let font_id =
+                                            egui::TextStyle::Monospace.resolve(ui.style());
+                                        let text_color = ui.visuals().text_color();
+                                        let galley_size = ui.fonts(|f| {
+                                            f.layout_no_wrap(
+                                                line.to_string(),
+                                                font_id.clone(),
+                                                text_color,
+                                            )
+                                            .size()
+                                        });
+                                        let (rect, label_resp) = ui.allocate_exact_size(
+                                            galley_size,
+                                            egui::Sense::click(),
+                                        );
+                                        ui.painter().text(
+                                            rect.left_center(),
+                                            egui::Align2::LEFT_CENTER,
+                                            line.as_str(),
+                                            font_id,
+                                            text_color,
+                                        );
                                         // Right-click menu as an alternative to the "Copy"
                                         // button / Ctrl+C. Routed through the same
                                         // `to_copy` + `copy_to_clipboard_20s` path used by

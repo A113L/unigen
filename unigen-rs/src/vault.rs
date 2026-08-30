@@ -7,11 +7,10 @@
 //! here uses a three-level hierarchy: **master password -> KEK -> vault
 //! key -> per-entry key**. See `crypto.rs`'s "Envelope key hierarchy"
 //! module section for the full design rationale (one-directional key
-//! containment, and the cheap re-wrap-only password change this
-//! hierarchy *can* support but [`change_master_password`] doesn't take
-//! advantage of yet — see that function's own doc comment); this module
-//! is the consumer of those primitives and owns the on-disk container
-//! layout:
+//! containment, and the cheap, O(1)-in-entry-count re-wrap-only password
+//! change this hierarchy enables — see [`change_master_password`]'s own
+//! doc comment); this module is the consumer of those primitives and
+//! owns the on-disk container layout:
 //!
 //! ```text
 //! VAULT_MAGIC(4="UGV1")
@@ -464,17 +463,35 @@ pub fn write_vault_file(
     kdf_id: u8,
 ) -> Result<()> {
     let combined = encrypt_vault(master_password, entries, kdf_id)?;
+    write_and_verify_vault_bytes(path, combined, master_password, entries.len())
+}
 
+/// Shared "durably publish these already-encrypted vault bytes" tail end
+/// for both a normal save ([`write_vault_file`]) and the fast rewrap-only
+/// password change ([`change_master_password_fast`]): verify in memory,
+/// write to a temp file, read *that* back and verify it too, and only
+/// then atomically replace `path`. Factored out of what used to be
+/// `write_vault_file`'s own body so both callers share one copy of this
+/// crash-safety sequence instead of two copies drifting apart over time
+/// — see the extended comment that used to sit directly on
+/// `write_vault_file` (still applies verbatim here) for the full
+/// "why read back before publishing" rationale.
+fn write_and_verify_vault_bytes(
+    path: &Path,
+    combined: Vec<u8>,
+    master_password: &str,
+    expected_entry_count: usize,
+) -> Result<()> {
     // Verify in-memory first: decrypt straight from `combined` (no disk
     // round-trip yet) so a bug in encryption itself is caught before
     // anything ever touches the filesystem.
     let verify = decrypt_vault(master_password, &combined)
         .context("internal error: freshly-encrypted vault failed to decrypt in memory")?;
-    if verify.len() != entries.len() {
+    if verify.len() != expected_entry_count {
         bail!(
             "internal error: freshly-encrypted vault has {} entries, expected {}",
             verify.len(),
-            entries.len()
+            expected_entry_count
         );
     }
 
@@ -509,7 +526,7 @@ pub fn write_vault_file(
             })
         })
         .and_then(|verify| {
-            if verify.len() == entries.len() {
+            if verify.len() == expected_entry_count {
                 Ok(())
             } else {
                 bail!(
@@ -517,7 +534,7 @@ pub fn write_vault_file(
                      disk at {} has NOT been touched",
                     tmp.display(),
                     verify.len(),
-                    entries.len(),
+                    expected_entry_count,
                     path.display()
                 );
             }
@@ -560,48 +577,110 @@ pub fn open_or_create(path: &Path, master_password: &str) -> Result<Vec<Box<Vaul
     Ok(entries)
 }
 
-/// Re-encrypt an already-unlocked vault's entries under a new master
-/// password and KDF choice, writing them back to `path`.
+/// Changes the vault's master password.
 ///
-/// Callers are expected to have already verified `old_password` (e.g. the
-/// vault is currently unlocked in the UI with entries decrypted under
-/// it) — this function does not itself re-check `old_password` against
-/// the file, it just performs the write with the new password. Keeping
-/// that verification in the caller means the UI can require the user to
-/// type the *current* password once (proving they still have it) before
-/// this ever runs, rather than this module silently trusting whatever
-/// string it's handed.
+/// Callers are expected to have already verified `old_password` against
+/// the file before calling this (as `main.rs` does before invoking it)
+/// — this function itself also needs `old_password` for the fast path
+/// below, since unwrapping the existing vault key requires it, but it
+/// does not perform that verification-for-its-own-sake; a wrong
+/// `old_password` here simply surfaces as the same "wrong current
+/// master password" error [`crypto::rewrap_vault_key`] returns.
 ///
-/// HONESTY NOTE (envelope key hierarchy): this just calls
-/// [`write_vault_file`] → [`encrypt_vault`], the exact same path any
-/// other save (add/edit/delete an entry) uses — which, as currently
-/// written, always generates a **fresh** vault key
-/// (`crypto::generate_vault_key`) and re-encrypts every entry under it.
-/// The envelope hierarchy's `wrap_vault_key`/`unwrap_vault_key`
-/// primitives are designed to support a cheaper path specifically for a
-/// password change — unwrap the *existing* vault key with the old
-/// password, re-wrap that same key under the new one, and leave every
-/// entry's already-encrypted bytes completely untouched — but building
-/// that path means this function would need to stop taking `entries` at
-/// all (it doesn't need decrypted plaintext for a re-wrap-only change)
-/// and instead operate on the vault key extracted from the
-/// already-unlocked session, which in turn means threading that vault
-/// key out through `open_or_create`/the UI's unlock state — a real, but
-/// separate, follow-up change from getting the container format and its
-/// primitives right in the first place. Not doing that narrower path
-/// yet doesn't cost correctness (this function still works, it's just
-/// not the fast path the format could support) and doesn't require any
-/// future on-disk migration (the format doesn't encode "how the vault
-/// key was chosen this time" anywhere) — it costs the same "re-encrypt
-/// every entry, with fresh random nonces" work changing the password
-/// already cost before this rewrite, no better and no worse.
+/// For the current envelope container format (`crypto::VAULT_MAGIC`),
+/// this takes the fast path: unwrap the *existing* vault key with
+/// `old_password`, re-wrap that same key under `new_password`, and
+/// splice the new wrapped-key header onto the untouched entry bytes —
+/// see [`change_master_password_fast`]. No entry is ever decrypted or
+/// re-encrypted, so the cost is one Argon2id derivation plus one small
+/// AES-GCM operation on a 32-byte key, independent of how many entries
+/// the vault holds — O(1) instead of the previous O(entry count).
+///
+/// For a legacy (pre-envelope) vault there's no separable wrapped-key
+/// header to rewrap — the whole blob was encrypted under one flat
+/// KDF-derived key — so changing the password there necessarily
+/// re-encrypts everything via [`write_vault_file`], which also upgrades
+/// the file to the envelope format as a side effect, same as any other
+/// save of a legacy vault would.
+///
+/// `entries` is only used as the expected-entry-count sanity check that
+/// both paths' read-back verification compares against (see
+/// [`write_and_verify_vault_bytes`]) — the fast path never touches
+/// entry *contents*, decrypted or otherwise.
 pub fn change_master_password(
     path: &Path,
+    old_password: &str,
     entries: &[Box<VaultEntry>],
     new_password: &str,
     kdf_id: u8,
 ) -> Result<()> {
-    write_vault_file(path, new_password, entries, kdf_id)
+    let combined = read_vault_file(path)?;
+    let is_envelope_format = combined.len() >= 4 && &combined[0..4] == crypto::VAULT_MAGIC;
+
+    if is_envelope_format {
+        change_master_password_fast(
+            path,
+            &combined,
+            old_password,
+            new_password,
+            kdf_id,
+            entries.len(),
+        )
+    } else {
+        write_vault_file(path, new_password, entries, kdf_id)
+    }
+}
+
+/// Fast, O(1)-in-entry-count master password change for a vault already
+/// in the envelope container format: rewrap the vault key in place and
+/// splice it onto the existing entry bytes, byte-for-byte, without
+/// decrypting a single entry.
+///
+/// `combined` is the full on-disk container (as returned by
+/// `read_vault_file`) — reused from the caller rather than re-read here
+/// so callers that already have it in hand (or that read it for their
+/// own current-password verification, as `main.rs` does before calling
+/// [`change_master_password`]) don't pay for a second disk read.
+///
+/// Security note: the vault key itself is unchanged by this path — only
+/// the password-derived wrapping around it changes. That's safe (the
+/// AES-GCM nonce/key pairing for every entry stays exactly as unique as
+/// it already was, since neither the vault key nor any entry's nonce
+/// changes), but it does mean this specifically does *not* protect
+/// against a scenario where an attacker already recovered the old vault
+/// key itself (e.g. via a memory-disclosure attack during a past
+/// session) — changing the password afterwards wouldn't invalidate a
+/// key that was already extracted, the way a full re-encrypt under a
+/// brand-new vault key would. That's judged an acceptable, deliberate
+/// trade-off for the routine "I want a stronger/different password"
+/// case this function optimizes for, not a substitute for full
+/// re-encryption in a suspected-compromise scenario — if a vault key
+/// leak is ever suspected, use [`write_vault_file`] directly (or
+/// recreate the vault) to force a fresh vault key instead.
+fn change_master_password_fast(
+    path: &Path,
+    combined: &[u8],
+    old_password: &str,
+    new_password: &str,
+    new_kdf_id: u8,
+    expected_entry_count: usize,
+) -> Result<()> {
+    let body = &combined[4..];
+    let (old_wrapped, header_len) =
+        crypto::WrappedVaultKey::decode(body).context("invalid vault envelope header")?;
+    let new_wrapped =
+        crypto::rewrap_vault_key(old_password, &old_wrapped, new_password, new_kdf_id)?;
+    let new_header = new_wrapped.encode();
+
+    let mut out = Vec::with_capacity(4 + new_header.len() + (body.len() - header_len));
+    out.extend_from_slice(crypto::VAULT_MAGIC);
+    out.extend_from_slice(&new_header);
+    // Everything after the old header — `entry_count` and every entry's
+    // framing + ciphertext — is copied verbatim. None of it depends on
+    // the password; it's encrypted under the (unchanged) vault key.
+    out.extend_from_slice(&body[header_len..]);
+
+    write_and_verify_vault_bytes(path, out, new_password, expected_entry_count)
 }
 
 // ---------------------------------------------------------------------
@@ -1564,19 +1643,20 @@ mod tests {
     }
 
     #[test]
-    fn every_save_generates_a_fresh_vault_key_including_across_a_password_change() {
-        // Honest documentation of the current call pattern (see the
-        // "HONESTY NOTE" on `change_master_password`): even though the
-        // envelope-hierarchy primitives in `crypto.rs` are designed to
-        // support a cheap re-wrap-only password change (same vault key,
-        // just re-wrapped), `change_master_password` doesn't take that
-        // path yet — it goes through the exact same `encrypt_vault` any
-        // other save uses, which always calls `generate_vault_key`
-        // fresh. Two consecutive saves of the *same* entries (even
-        // under the *same* password) therefore produce completely
-        // different envelope bytes throughout — not just a different
-        // wrapped-key header, but different entry ciphertext too, since
-        // a new vault key means new derived entry keys as well.
+    fn every_encrypt_vault_call_generates_a_fresh_vault_key() {
+        // Honest documentation of `encrypt_vault`'s own behavior: it
+        // always calls `generate_vault_key` fresh, so two consecutive
+        // calls with the *same* entries and *same* password still
+        // produce completely different envelope bytes throughout — not
+        // just a different wrapped-key header, but different entry
+        // ciphertext too, since a new vault key means new derived entry
+        // keys as well. (This is what every ordinary save — add/edit/
+        // delete an entry — goes through. `change_master_password`
+        // specifically no longer goes through this path for an
+        // already-envelope-format vault; see
+        // `change_master_password_preserves_entry_ciphertext_and_vault_key`
+        // below for the fast path's very different, deliberate
+        // behavior.)
         let entries = vec![sample_entry(1, "only")];
         let combined1 = encrypt_vault(PWD, &entries, crypto::KDF_ARGON2ID).unwrap();
         let combined2 = encrypt_vault(PWD, &entries, crypto::KDF_ARGON2ID).unwrap();
@@ -1588,6 +1668,99 @@ mod tests {
         let d2 = decrypt_vault(PWD, &combined2).unwrap();
         assert_eq!(d1[0].title, d2[0].title);
         assert_eq!(d1[0].password.reveal(), d2[0].password.reveal());
+    }
+
+    #[test]
+    fn change_master_password_preserves_entry_ciphertext_and_vault_key() {
+        // SECURITY/PERFORMANCE REGRESSION TEST for the fast rewrap-only
+        // password change path: for an envelope-format vault,
+        // `change_master_password` must leave every entry's ciphertext
+        // byte-for-byte untouched (only the small wrapped-key header at
+        // the front changes) — this is both what makes the change O(1)
+        // in entry count instead of O(n), and a check that the fast path
+        // didn't accidentally regenerate the vault key (which would
+        // silently make it O(n) again, just via a different code path).
+        let dir = std::env::temp_dir().join(format!(
+            "unigen_vault_pwdchange_test_{}_{}",
+            std::process::id(),
+            {
+                use rand::rngs::OsRng;
+                use rand::RngCore;
+                let mut n = [0u8; 8];
+                OsRng.fill_bytes(&mut n);
+                u64::from_le_bytes(n)
+            }
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.uvault");
+
+        let entries = vec![sample_entry(1, "first"), sample_entry(2, "second")];
+        write_vault_file(&path, PWD, &entries, crypto::KDF_ARGON2ID).unwrap();
+        let before = read_vault_file(&path).unwrap();
+
+        change_master_password(&path, PWD, &entries, "a completely different password!", crypto::KDF_ARGON2ID)
+            .unwrap();
+        let after = read_vault_file(&path).unwrap();
+
+        assert_ne!(before, after, "the wrapped-key header must change");
+
+        let (_, before_header_len) = crypto::WrappedVaultKey::decode(&before[4..]).unwrap();
+        let (_, after_header_len) = crypto::WrappedVaultKey::decode(&after[4..]).unwrap();
+        assert_eq!(
+            &before[4 + before_header_len..],
+            &after[4 + after_header_len..],
+            "entry_count and every entry's bytes must be byte-for-byte identical — the fast \
+             path must never touch entry ciphertext"
+        );
+
+        // And it still decrypts correctly under the *new* password, with
+        // the same plaintext as before.
+        let decrypted = decrypt_vault("a completely different password!", &after).unwrap();
+        assert_eq!(decrypted.len(), 2);
+        assert_eq!(decrypted[0].title, "first");
+        assert_eq!(decrypted[1].title, "second");
+
+        // The *old* password must no longer work.
+        assert!(decrypt_vault(PWD, &after).is_err());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn change_master_password_fails_closed_on_wrong_old_password() {
+        let dir = std::env::temp_dir().join(format!(
+            "unigen_vault_pwdchange_wrong_test_{}_{}",
+            std::process::id(),
+            {
+                use rand::rngs::OsRng;
+                use rand::RngCore;
+                let mut n = [0u8; 8];
+                OsRng.fill_bytes(&mut n);
+                u64::from_le_bytes(n)
+            }
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.uvault");
+
+        let entries = vec![sample_entry(1, "only")];
+        write_vault_file(&path, PWD, &entries, crypto::KDF_ARGON2ID).unwrap();
+        let before = read_vault_file(&path).unwrap();
+
+        let result = change_master_password(
+            &path,
+            "definitely the wrong password",
+            &entries,
+            "new password",
+            crypto::KDF_ARGON2ID,
+        );
+        assert!(result.is_err());
+
+        // And the file on disk must be completely untouched by the
+        // failed attempt.
+        let after = read_vault_file(&path).unwrap();
+        assert_eq!(before, after);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

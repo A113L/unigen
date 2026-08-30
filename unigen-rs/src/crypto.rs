@@ -361,16 +361,16 @@ fn blob_aad_v3(kdf_id: u8, version: u8, params: KdfParams) -> [u8; 6 + KdfParams
 //   change** — `wrap_vault_key`/`unwrap_vault_key` operate on the vault
 //   key alone, independently of any entry, so re-wrapping it under a
 //   new KEK is one Argon2id/PBKDF2 run plus one small AES-GCM call,
-//   regardless of vault size. **This is not yet exploited**, though: see
-//   the honesty note on `vault::change_master_password` below — as
-//   currently wired up, every `encrypt_vault` call (including the one
-//   `change_master_password` makes) generates a brand-new vault key via
-//   `generate_vault_key` and re-encrypts every entry, the same
-//   whole-vault-every-save cost the flat single-derived-key design
-//   this replaced always had. The format doesn't require that; the
-//   call pattern just hasn't been narrowed to take advantage of it yet.
-//   Flagged as a real, buildable follow-up, not a design flaw in what's
-//   here — see AUDIT_PROGRESS.md's envelope-key-hierarchy entry.
+//   regardless of vault size. **This is exploited**: `vault::
+//   change_master_password` takes this fast path (via
+//   `rewrap_vault_key` below) whenever the vault is already in the
+//   envelope container format, leaving every entry's ciphertext
+//   untouched. An ordinary save (add/edit/delete an entry) still goes
+//   through `encrypt_vault`, which generates a brand-new vault key via
+//   `generate_vault_key` every time and re-encrypts every entry — that
+//   whole-vault cost is inherent to a normal save (entry contents
+//   actually changed), it's specifically the *password-only* change
+//   that no longer needs to pay it.
 //
 // See `vault.rs`'s module-level docs for the on-disk container layout
 // this supports (`VAULT_MAGIC`) and how `encrypt_vault`/`decrypt_vault`
@@ -539,11 +539,11 @@ impl WrappedVaultKey {
 }
 
 /// Wrap (encrypt) `vault_key` under a KEK derived from `master_password`.
-/// Called every time `vault::encrypt_vault` runs (currently: on every
-/// save, with a freshly-generated `vault_key` each time — see the
-/// honesty note on `vault::change_master_password` about the
-/// re-wrap-only fast path this function *could* support for password
-/// changes specifically, which isn't wired up yet).
+/// Called by `vault::encrypt_vault` on every ordinary save (with a
+/// freshly-generated `vault_key` each time), and also by
+/// [`rewrap_vault_key`] as the second half of the fast, re-wrap-only
+/// master password change path — there, `vault_key` is the *existing*
+/// key extracted via `unwrap_vault_key` rather than a fresh one.
 pub fn wrap_vault_key(
     master_password: &str,
     vault_key: &[u8; 32],
@@ -606,6 +606,30 @@ pub fn unwrap_vault_key(
     let mut key = Zeroizing::new([0u8; 32]);
     key.copy_from_slice(&pt);
     Ok(key)
+}
+
+/// Re-wrap an existing vault key under a *new* password, without ever
+/// exposing the vault key to the caller — the fast path for a master
+/// password change: `unwrap_vault_key(old_password)` then
+/// `wrap_vault_key(new_password)` on the same key, back to back, so the
+/// key only ever exists in this function's local `Zeroizing` binding.
+///
+/// This is what makes changing the master password O(1) in the number
+/// of vault entries instead of O(n): the vault key itself never changes,
+/// so no entry's ciphertext needs to be touched — only the small
+/// wrapped-key header at the front of the container changes. See
+/// `vault::change_master_password`'s doc comment for the container-level
+/// story (why this only applies to the current envelope format, not the
+/// legacy single-blob one).
+pub fn rewrap_vault_key(
+    old_password: &str,
+    old_wrapped: &WrappedVaultKey,
+    new_password: &str,
+    new_kdf_id: u8,
+) -> Result<WrappedVaultKey> {
+    let vault_key = unwrap_vault_key(old_password, old_wrapped)
+        .context("wrong current master password, or file is not a valid vault")?;
+    wrap_vault_key(new_password, &vault_key, new_kdf_id).context("failed to re-wrap vault key")
 }
 
 /// Encrypt one entry's already-serialized JSON payload under its own
