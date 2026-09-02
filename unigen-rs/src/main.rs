@@ -568,7 +568,14 @@ struct UnigenApp {
     // ---- File Protector: Encrypt ----
     kdf_choice: u8,
     enc_file: Option<PathBuf>,
-    enc_pwd: SecretString,
+    /// SECURITY: sealed with `LockedSecret`, not kept as a live
+    /// `SecretString`, for the entire time the Encrypt-File tab isn't
+    /// actively being typed into — see `ui_file_protector_tab` for the
+    /// reveal-render-reseal pattern. Closes the gap where this field
+    /// (unlike vault entry passwords) sat as plain readable UTF-8 in RAM
+    /// for the whole autoclear-timeout window, or for as long as the app
+    /// was simply open on a different tab.
+    enc_pwd: LockedSecret,
     enc_pwd_last_edit: Instant,
     enc_pwd_autoclear: bool,
     shred_after: bool,
@@ -726,7 +733,7 @@ impl UnigenApp {
             clip_status: String::new(),
             kdf_choice: crypto::DEFAULT_KDF, // Argon2id first / default, per updated guidance
             enc_file: None,
-            enc_pwd: SecretString::new(),
+            enc_pwd: LockedSecret::default(),
             enc_pwd_last_edit: Instant::now(),
             enc_pwd_autoclear: true,
             shred_after: true,
@@ -1906,7 +1913,7 @@ impl UnigenApp {
             && !self.enc_pwd.is_empty()
             && self.enc_pwd_last_edit.elapsed() > secs
         {
-            self.enc_pwd.clear();
+            self.enc_pwd.zeroize();
             self.enc_status = format!(
                 "Passphrase cleared from memory after {}s of inactivity.",
                 self.pwd_autoclear_seconds
@@ -1928,7 +1935,12 @@ impl UnigenApp {
         let Some(in_path) = self.enc_file.clone() else {
             return;
         };
-        if self.enc_pwd.chars().count() < crypto::MIN_PASSPHRASE_LEN {
+        // Reveal the sealed passphrase exactly once for this whole
+        // operation. `revealed` is a `SecretString` (wipe-on-drop/realloc),
+        // and `self.enc_pwd` stays sealed the entire time — this brief,
+        // local plaintext copy is the only one that exists.
+        let revealed = self.enc_pwd.reveal();
+        if revealed.chars().count() < crypto::MIN_PASSPHRASE_LEN {
             self.enc_status = format!(
                 "Passphrase must be at least {} characters.",
                 crypto::MIN_PASSPHRASE_LEN
@@ -1942,7 +1954,7 @@ impl UnigenApp {
         let size = std::fs::metadata(&in_path).map(|m| m.len()).unwrap_or(0);
         let streaming = size > crypto::STREAM_SIZE_THRESHOLD;
 
-        let pwd = Zeroizing::new(self.enc_pwd.as_str().to_string());
+        let pwd = Zeroizing::new(revealed.as_str().to_string());
         let kdf_id = self.kdf_choice;
         let shred_after = self.shred_after;
         if self.linux_try_exclusion && !try_mlock_str(&pwd) {
@@ -2937,7 +2949,7 @@ impl eframe::App for UnigenApp {
         // let the close proceed.
         if ctx.input(|i| i.viewport().close_requested()) {
             if self.busy_ops.is_empty() {
-                self.enc_pwd.clear();
+                self.enc_pwd.zeroize();
                 self.dec_pwd.clear();
                 self.editor_open_pwd.clear();
                 self.close_editor();
@@ -3061,7 +3073,7 @@ impl eframe::App for UnigenApp {
                             // next to the intended output, never a
                             // corrupted "finished" file and never someone
                             // else's unrelated `.tmp` file.
-                            self.enc_pwd.clear();
+                            self.enc_pwd.zeroize();
                             self.dec_pwd.clear();
                             self.editor_open_pwd.clear();
                             self.close_editor();
@@ -3423,22 +3435,28 @@ impl UnigenApp {
 
                 ui.add_space(6.0);
                 ui.label(format!("Passphrase (min {} characters)", crypto::MIN_PASSPHRASE_LEN));
-                let resp = ui.add(secure_text_edit::SecurePasswordEdit::new("enc_pwd", &mut self.enc_pwd));
+                // SECURITY: `self.enc_pwd` is stored sealed (`LockedSecret`
+                // — ChaCha20-obfuscated-at-rest via `mem_cipher`) except
+                // right here. It's revealed into a live `SecretString`
+                // only for this render, edited in place by the widget,
+                // and resealed immediately below (before anything else in
+                // this frame runs) — so the plaintext exists in ordinary
+                // memory only for the duration of this one `ui.add` call,
+                // not for the whole autoclear window and not while any
+                // other tab is being shown.
+                let mut live_enc_pwd = self.enc_pwd.reveal();
+                let resp = ui.add(secure_text_edit::SecurePasswordEdit::new("enc_pwd", &mut live_enc_pwd));
                 if resp.changed() {
                     self.enc_pwd_last_edit = Instant::now();
-                    // Best-effort: keep re-locking the field's *live*
-                    // buffer into physical RAM after every edit (not just
-                    // the one-off clone handed to the background job at
-                    // encrypt time — see `SecretString::mlock_best_effort`
-                    // doc comment for why the live field needs its own
-                    // lock, re-applied on each edit since growth moves
-                    // the buffer).
+                    // Best-effort: lock this frame's revealed copy into
+                    // physical RAM for as long as it's alive (see
+                    // `SecretString::mlock_best_effort`'s doc comment).
                     if self.linux_try_exclusion {
-                        self.enc_pwd.mlock_best_effort();
+                        live_enc_pwd.mlock_best_effort();
                     }
                 }
-                if !self.enc_pwd.is_empty() {
-                    let bits = estimate_passphrase_entropy(&self.enc_pwd);
+                if !live_enc_pwd.is_empty() {
+                    let bits = estimate_passphrase_entropy(&live_enc_pwd);
                     let (rating, _) = rate_entropy(bits);
                     ui.small(format!(
                         "Estimated strength: {rating} (~{bits:.0} bits — pattern-aware heuristic, not a true entropy measurement)"
@@ -3459,9 +3477,12 @@ impl UnigenApp {
                     ui.small("Best effort only — not a guarantee on every OS/kernel/filesystem configuration.");
                     // U-06 fix: live status instead of only a one-shot
                     // failure message shown at encrypt time — see
-                    // `mem_lock::status_label` doc comment.
+                    // `mem_lock::status_label` doc comment. Reflects this
+                    // frame's brief revealed copy; the field is also
+                    // ChaCha20-encrypted-at-rest the rest of the time,
+                    // independent of mlock.
                     let (text, kind) =
-                        mem_lock::status_label(self.linux_try_exclusion, self.enc_pwd.is_locked());
+                        mem_lock::status_label(self.linux_try_exclusion, live_enc_pwd.is_locked());
                     let p = self.palette();
                     let color = match kind {
                         "success" => p.success,
@@ -3473,13 +3494,22 @@ impl UnigenApp {
                         ui.small("Memory-lock status:");
                         ui.colored_label(color, text);
                     });
+                    ui.small(
+                        "Also kept encrypted at rest in RAM (ChaCha20) whenever this field \
+                         isn't the one actively being edited.",
+                    );
                 }
 
                 ui.add_space(6.0);
                 let busy = self.busy_ops.contains("encrypt");
                 let ready = self.enc_file.is_some()
-                    && self.enc_pwd.chars().count() >= crypto::MIN_PASSPHRASE_LEN
+                    && live_enc_pwd.chars().count() >= crypto::MIN_PASSPHRASE_LEN
                     && !busy;
+                // Reseal right away: nothing below this point needs the
+                // live plaintext again this frame — the Encrypt button
+                // below only triggers `start_encrypt`, which reveals its
+                // own short-lived copy from the now-sealed field.
+                self.enc_pwd = LockedSecret::seal(live_enc_pwd);
                 if ui.add_enabled(ready, egui::Button::new(if busy { "Encrypting…" } else { "Encrypt" })).clicked() {
                     self.start_encrypt();
                 }
