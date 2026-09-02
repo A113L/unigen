@@ -301,6 +301,17 @@ fn main() -> eframe::Result<()> {
         "UNIGEN — Unicode Password Utility",
         options,
         Box::new(|cc| {
+            // Lock out further dynamic-code allocation (Windows ACG) only
+            // now, after eframe has already created the GL context and
+            // egui_glow has compiled/linked its shaders. Doing this
+            // before `run_native` (as originally written) blocked the
+            // GPU driver's own startup JIT on Windows 11, which creates
+            // the GL context successfully but silently renders nothing
+            // — an empty black window with no crash and no error. See
+            // `process_isolation::lock_dynamic_code` for the full
+            // explanation. No-op on Linux/macOS.
+            process_isolation::lock_dynamic_code();
+
             theme::apply(&cc.egui_ctx, true);
             load_custom_fonts(&cc.egui_ctx);
             // Disable "feathering" — the extra partially-transparent pixels
@@ -3814,12 +3825,14 @@ impl UnigenApp {
                 .min_scrolled_height(min_editor_height)
                 .max_height(f32::INFINITY)
                 .show(ui, |ui| {
+                    let available_width = ui.available_width();
                     let r = ui.add(
-                        egui::TextEdit::multiline(&mut self.editor_content)
-                            .font(egui::TextStyle::Monospace)
-                            .desired_rows(10)
-                            .desired_width(f32::INFINITY)
-                            .min_size(egui::vec2(0.0, min_editor_height)),
+                        secure_text_edit::SecureNotesEdit::new(
+                            "editor_main_content",
+                            &mut self.editor_content,
+                        )
+                        .desired_width(available_width)
+                        .desired_rows(10),
                     );
                     editor_resp_opt = Some(r);
                 });

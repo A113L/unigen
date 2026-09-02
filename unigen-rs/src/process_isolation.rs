@@ -28,11 +28,16 @@
 //! providing a hard security boundary. Call [`init`] once, as early as
 //! possible in `main()`, before any secret ever touches memory.
 
-/// Apply every hardening measure this platform supports. Best-effort:
-/// never panics, and a failed mitigation is silently skipped (there is
-/// nothing a desktop app can usefully do about an OS refusing one of
-/// these requests other than proceed without it — same "best effort, not
-/// a guarantee" contract as `mem_lock`).
+/// Apply every hardening measure this platform supports *except* the
+/// Windows dynamic-code (ACG) restriction — see [`lock_dynamic_code`] for
+/// why that one is applied separately, later. Best-effort: never panics,
+/// and a failed mitigation is silently skipped (there is nothing a
+/// desktop app can usefully do about an OS refusing one of these
+/// requests other than proceed without it — same "best effort, not a
+/// guarantee" contract as `mem_lock`).
+///
+/// Call this once, as early as possible in `main()`, before any secret
+/// ever touches memory — same as before.
 pub fn init() {
     #[cfg(target_os = "linux")]
     linux::harden();
@@ -40,6 +45,31 @@ pub fn init() {
     macos::harden();
     #[cfg(windows)]
     windows::harden();
+}
+
+/// Lock out further dynamic-code allocation (Windows Arbitrary Code
+/// Guard). Split out from [`init`] and must be called *after* the GPU
+/// context (glow/OpenGL, via eframe) has finished initializing — the
+/// GL driver's userland component (nvoglv64.dll, Intel's OpenGL ICD,
+/// etc.) commonly JIT-compiles shaders on first use and needs to
+/// allocate fresh executable memory to do it. If ACG is already active
+/// at that point, the allocation is silently refused: the GL context
+/// still gets created (no crash, no error), but nothing ever gets
+/// rendered — an empty black window. This was reliably reproducible on
+/// Windows 11 (newer WDDM driver stacks enforce ACG more consistently
+/// than Windows 10 does) while Linux was never affected in the first
+/// place (this mitigation is Windows-only) and Windows 10 often
+/// happened not to trigger it.
+///
+/// Calling this only after `eframe::run_native`'s app-creation closure
+/// runs (i.e. after the GL context already exists and egui has done its
+/// first frame of GPU work) keeps the original security intent — no
+/// *new* dynamic code can be injected into this process from then on —
+/// without starving the driver of the one JIT pass it actually needs at
+/// startup.
+pub fn lock_dynamic_code() {
+    #[cfg(windows)]
+    windows::lock_dynamic_code();
 }
 
 // ---------------------------------------------------------------------
@@ -189,15 +219,13 @@ mod windows {
         // since a refusal (e.g. running under an already-attached
         // debugger, which some of these calls reject) must not be
         // treated as fatal, per this module's stated contract.
+        //
+        // NOTE: ProcessDynamicCodePolicy (ACG) is deliberately *not* set
+        // here anymore — see `lock_dynamic_code` below, called later
+        // once the GL context exists, and the module-level doc comment
+        // on `lock_dynamic_code` in the parent module for why.
         unsafe {
             SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
-
-            let mut dynamic_code = MitigationPolicy(PROCESS_DYNAMIC_CODE_PROHIBIT);
-            SetProcessMitigationPolicy(
-                PROCESS_MITIGATION_DYNAMIC_CODE_POLICY,
-                &mut dynamic_code as *mut _ as *mut c_void,
-                size_of::<MitigationPolicy>(),
-            );
 
             let mut ext_point = MitigationPolicy(PROCESS_EXTENSION_POINT_DISABLE);
             SetProcessMitigationPolicy(
@@ -213,6 +241,26 @@ mod windows {
             // avoids a false sense of security after a dev/debug session.
             let _ = GetCurrentProcess();
             DebugSetProcessKillOnExit(1);
+        }
+    }
+
+    /// Apply `ProcessDynamicCodePolicy` (Arbitrary Code Guard). Must be
+    /// called only after the GL context (glow/OpenGL via eframe) has
+    /// finished its startup JIT work — see the doc comment on the
+    /// wrapping `process_isolation::lock_dynamic_code`. Once this is
+    /// set, the process can no longer allocate/map executable memory
+    /// that wasn't already present, which is exactly the "no new code
+    /// after this point" contract we want, just applied at the right
+    /// time instead of before the GPU driver had a chance to do its own
+    /// one-time JIT compilation.
+    pub fn lock_dynamic_code() {
+        unsafe {
+            let mut dynamic_code = MitigationPolicy(PROCESS_DYNAMIC_CODE_PROHIBIT);
+            SetProcessMitigationPolicy(
+                PROCESS_MITIGATION_DYNAMIC_CODE_POLICY,
+                &mut dynamic_code as *mut _ as *mut c_void,
+                size_of::<MitigationPolicy>(),
+            );
         }
     }
 }
@@ -231,5 +279,16 @@ mod tests {
         // not double-fault.
         init();
         init();
+    }
+
+    #[test]
+    fn lock_dynamic_code_never_panics() {
+        // Same best-effort contract as `init_never_panics`, and calling
+        // it more than once (e.g. `init` -> GL setup -> this -> this)
+        // must stay safe, since `SetProcessMitigationPolicy` on an
+        // already-locked policy is a documented no-op/refusal, not a
+        // hard error we need to guard against here.
+        lock_dynamic_code();
+        lock_dynamic_code();
     }
 }
