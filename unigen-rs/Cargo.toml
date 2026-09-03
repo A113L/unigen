@@ -62,5 +62,10 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 [features]
-default = []
+# "gui" is default so a plain `cargo build --release` in this directory
+# produces the `unigen` GUI binary. The fuzz crate (fuzz/Cargo.toml)
+# explicitly opts out with `default-features = false` on its `unigen`
+# path-dependency, so `cargo fuzz build`/`run` still never pulls in
+# egui/eframe — the fuzzed dependency graph stays GUI-free.
+default = ["gui"]
 gui = ["dep:eframe"]
