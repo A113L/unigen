@@ -55,3 +55,23 @@ relevant module) once fixed.
 cargo +nightly fuzz cmin decrypt-blob
 cargo +nightly fuzz tmin decrypt-blob fuzz/artifacts/decrypt-blob/crash-<hash>
 ```
+
+---
+
+# UNIGEN Fuzz — 2026-09-03
+ 
+**Run:** `./run_fuzz.sh --log` · 8 targets × 10 min (`-max_total_time=600 -rss_limit_mb=512 -timeout=5`)
+**Result: ✅ 0 crashes / 0 timeouts / 0 OOMs across all 8 targets**
+ 
+## Summary
+ 
+| Target | Duration | Executions | Cov (edges) | Features | Corpus | Avg exec/s | Status |
+|---|---|---|---|---|---|---|---|
+| `decrypt-blob` | 10m09s | 2,842 | 753 | 809 | 40 / 2.4 KB | 4 | ✅ clean |
+| `decrypt-blob-compat` | 10m02s | 1,613 | 304 | 309 | 10 / 144 B | 2 | ✅ clean |
+| `stream-decrypt-file` | 10m03s | 2,815 | 458 | 500 | 23 / 544 B | 4 | ✅ clean |
+| `wrapped-vault-key-decode` | 10m02s | 176,522,524 | 99 | 103 | 15 / 635 B | 293,714 | ✅ clean |
+| `decrypt-entry-payload` | 10m00s | 36,163,834 | 379 | 524 | 46 / 11.0 KB | 60,172 | ✅ clean |
+| `parse-csv` | 10m02s | 6,043,189 | 545 | 3,251 | 992 / 188 KB | 10,055 | ✅ clean |
+| `decode-blob-text` | 10m01s | 67,886,446 | 306 | 894 | 227 / 8.0 KB | 112,955 | ✅ clean |
+| `decrypt-vault-bytes` | 10m03s | 5,399 | 327 | 332 | 13 / 192 B | 8 | ✅ clean |
