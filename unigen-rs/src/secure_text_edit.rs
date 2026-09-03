@@ -291,7 +291,7 @@ impl<'a> Widget for SecurePasswordEdit<'a> {
             let bottom = rect.bottom() - 2.0;
             ui.painter().line_segment(
                 [egui::pos2(cursor_x, top), egui::pos2(cursor_x, bottom)],
-                egui::Stroke::new(1.0, ui.visuals().text_color()),
+                egui::Stroke::new(1.0_f32, ui.visuals().text_color()),
             );
         }
 
@@ -617,7 +617,7 @@ impl<'a> Widget for SecureNotesEdit<'a> {
             let row_text = slice_chars(content, row.start, row.end);
             let cursor_x = draw_top.x + char_advance(ui, &font_id, row_text, local_col);
             let y = draw_top.y + row_height * row_i as f32;
-            painter.line_segment([egui::pos2(cursor_x, y), egui::pos2(cursor_x, y + row_height)], egui::Stroke::new(1.0, ui.visuals().text_color()));
+            painter.line_segment([egui::pos2(cursor_x, y), egui::pos2(cursor_x, y + row_height)], egui::Stroke::new(1.0_f32, ui.visuals().text_color()));
         }
         if max_scroll > 0.0 {
             ui.painter().rect_filled(
@@ -645,7 +645,7 @@ impl<'a> Widget for SecureNotesEdit<'a> {
                     egui::pos2(rect.max.x - offset - 4.0, rect.max.y - 3.0),
                     egui::pos2(rect.max.x - 3.0, rect.max.y - offset - 4.0),
                 ],
-                egui::Stroke::new(1.0, grip_color),
+                egui::Stroke::new(1.0_f32, grip_color),
             );
         }
         response
@@ -661,7 +661,12 @@ struct VisualRow { start: usize, end: usize }
 /// size a rect for secret text *before* painting it with `paint_chars`,
 /// so the measurement step itself doesn't reintroduce the same leak
 /// `paint_chars` exists to avoid.
-pub(crate) fn text_width(ui: &Ui, font_id: &egui::FontId, text: &str) -> f32 {
+// Was `pub(crate)`: fine when this module and `main.rs` were the same
+// crate, but the lib/bin split (`src/lib.rs`, for Miri/ASan/fuzz — see
+// that file's doc comment) makes `main.rs` a separate downstream crate
+// that consumes `unigen` as a dependency, so anything it calls across
+// that boundary needs to be `pub`, not `pub(crate)`.
+pub fn text_width(ui: &Ui, font_id: &egui::FontId, text: &str) -> f32 {
     ui.fonts(|f| text.chars().map(|c| f.glyph_width(font_id, c)).sum())
 }
 
@@ -693,7 +698,9 @@ pub(crate) fn text_width(ui: &Ui, font_id: &egui::FontId, text: &str) -> f32 {
 /// cached line. This is the same one-glyph-at-a-time approach
 /// `SecurePasswordEdit` already uses for its `●` bullets, generalized
 /// to real (variable-width) glyphs instead of one fixed repeated one.
-pub(crate) fn paint_chars(
+// See the doc comment on `text_width` above — same lib/bin crate-boundary
+// reason for widening this from `pub(crate)` to `pub`.
+pub fn paint_chars(
     ui: &Ui,
     painter: &egui::Painter,
     mut pos: egui::Pos2,

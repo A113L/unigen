@@ -1456,16 +1456,36 @@ pub fn parse_csv(contents: &str, source: CsvSource) -> Result<Vec<ImportedRow>> 
 /// worth keeping even though it's no longer covering a passwords-in-heap
 /// risk: it avoids the (cheap but non-zero) pointer-churn cost of growing
 /// one push at a time for a large import.
+/// # Panics
+///
+/// U-A07 fix: `next_id` is a `u64` derived from the current Unix
+/// timestamp and bumped by one per imported row (plus extra bumps to skip
+/// any collisions with existing entries). That previously relied on plain
+/// `+= 1`, which under the release-profile default (`overflow-checks =
+/// false`) would silently *wrap* back to `0` on overflow rather than
+/// panic — and a wrapped/duplicate ID is a correctness and (if it happens
+/// to collide with a differently-owned entry ID scheme in the future)
+/// potential data-integrity hazard, not just a cosmetic one. Reaching
+/// `u64::MAX` via a `now_unix()`-seeded counter is astronomically
+/// unrealistic in practice (it would require importing more than
+/// `u64::MAX - now_unix()` rows in one call), but this is
+/// security/parsing-adjacent code handling untrusted import data, so it
+/// uses `checked_add` and panics with a clear message rather than
+/// silently wrapping into a duplicate/incorrect ID.
 pub fn append_imported(entries: &mut Vec<Box<VaultEntry>>, rows: Vec<ImportedRow>) -> usize {
     let mut next_id = now_unix();
     let count = rows.len();
     entries.reserve(count);
     for row in rows {
         while entries.iter().any(|e| e.id == next_id) {
-            next_id += 1;
+            next_id = next_id
+                .checked_add(1)
+                .expect("entry ID space exhausted while skipping a collision");
         }
         entries.push(Box::new(row.into_entry(next_id)));
-        next_id += 1;
+        next_id = next_id
+            .checked_add(1)
+            .expect("entry ID space exhausted during import");
     }
     count
 }

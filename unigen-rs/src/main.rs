@@ -5,16 +5,14 @@
 //! format with AAD, unique per-run temp file names, real passphrase
 //! zeroization).
 
-mod charsets;
-mod crypto;
-mod dpapi;
-mod mem_cipher;
-mod mem_lock;
-mod process_isolation;
-mod secret;
-mod secure_text_edit;
-mod shred;
-mod vault;
+// These used to be `mod X;` declarations directly in this file; they now
+// live in `src/lib.rs` so `cargo test --lib`, Miri, ASan, and `cargo fuzz`
+// can link against them without pulling in eframe's GUI/windowing runtime
+// (see lib.rs's module doc comment). Every `foo::bar(...)` call site below
+// is unchanged — only where the module is declared moved.
+use unigen::{
+    charsets, crypto, dpapi, mem_lock, process_isolation, secret, secure_text_edit, shred, vault,
+};
 
 use charsets::{
     all_charsets, build_pool, calculate_entropy, estimate_passphrase_entropy, rate_entropy, CharSet,
