@@ -61,6 +61,7 @@ cargo +nightly fuzz tmin decrypt-blob fuzz/artifacts/decrypt-blob/crash-<hash>
 # UNIGEN Fuzz — 2026-09-03
  
 **Run:** `./run_fuzz.sh --log` · 8 targets × 10 min (`-max_total_time=600 -rss_limit_mb=512 -timeout=5`)
+
 **Result: ✅ 0 crashes / 0 timeouts / 0 OOMs across all 8 targets**
  
 ## Summary
