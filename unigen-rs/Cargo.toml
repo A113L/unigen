@@ -1,13 +1,18 @@
 [package]
 name = "unigen"
-version = "2.1.1"
+version = "2.1.2"
 edition = "2021"
 description = "UNIGEN - Unicode Password Utility"
 default-run = "unigen"
 
+[lib]
+name = "unigen"
+path = "src/lib.rs"
+
 [[bin]]
 name = "unigen"
 path = "src/main.rs"
+required-features = ["gui"]
 
 [profile.release]
 opt-level = 3
@@ -16,8 +21,8 @@ strip = true
 panic = "unwind"
 
 [dependencies]
-eframe = { version = "0.28", default-features = false, features = ["glow", "default_fonts", "persistence", "accesskit"] }
 egui = "0.28"
+eframe = { version = "0.28", default-features = false, features = ["glow", "default_fonts", "persistence", "accesskit"], optional = true }
 
 # Crypto
 aes-gcm = "0.10"
@@ -56,3 +61,6 @@ env_logger = "0.11"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
+[features]
+default = []
+gui = ["dep:eframe"]
