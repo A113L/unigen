@@ -1,0 +1,93 @@
+[package]
+name = "unigen-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+# "arbitrary" feature re-exports the `arbitrary` crate as
+# `libfuzzer_sys::arbitrary` — targets that need structured input (see
+# decrypt_entry_payload.rs) derive against that re-export rather than
+# depending on `arbitrary` directly, to avoid a version mismatch between
+# two independently-resolved copies of the trait.
+libfuzzer-sys = { version = "0.4", features = ["arbitrary-derive"] }
+# stream_decrypt_file takes a &Path (it's a streaming/chunked file format,
+# not an in-memory blob), so its fuzz target has to materialize the fuzz
+# input as a real file on disk.
+arbitrary = "1.3"
+tempfile = "3"
+
+[dependencies.unigen]
+path = ".."
+# `unigen`'s "gui" feature is now enabled by default (so a plain
+# `cargo build --release` in the main crate builds the GUI binary).
+# We opt out here so the fuzz targets keep linking against the lib
+# only — egui/eframe never enter the fuzzed dependency graph.
+default-features = false
+
+# Fuzz targets get their own opt/debug-assert profile: -O1 keeps them fast
+# enough to get real iteration throughput while still catching overflow
+# panics (debug-assertions on) and giving usable stack traces on crash.
+[profile.release]
+debug = 1
+debug-assertions = true
+overflow-checks = true
+
+[[bin]]
+name = "decrypt-blob"
+path = "fuzz_targets/decrypt_blob.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decrypt-blob-compat"
+path = "fuzz_targets/decrypt_blob_compat.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "stream-decrypt-file"
+path = "fuzz_targets/stream_decrypt_file.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wrapped-vault-key-decode"
+path = "fuzz_targets/wrapped_vault_key_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decrypt-entry-payload"
+path = "fuzz_targets/decrypt_entry_payload.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse-csv"
+path = "fuzz_targets/parse_csv.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode-blob-text"
+path = "fuzz_targets/decode_blob_text.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decrypt-vault-bytes"
+path = "fuzz_targets/decrypt_vault_bytes.rs"
+test = false
+doc = false
+bench = false
