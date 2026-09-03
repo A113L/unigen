@@ -527,7 +527,14 @@ struct UnigenApp {
     charset_enabled: Vec<bool>,
     length: u32,
     count: u32,
-    generated: Vec<Zeroizing<String>>,
+    // SECURITY: `LockedSecret`, not `Vec<Zeroizing<String>>` — a
+    // generated batch sits displayed on screen for as long as the user
+    // leaves this tab open (no natural flush point, same "long dwell
+    // time" reasoning as `editor_content`/`vault_edit_notes`), so each
+    // entry needs to stay sealed at rest and only be revealed
+    // transiently (for painting one row, or for a copy/save operation)
+    // rather than living as a permanently-plaintext `Zeroizing<String>`.
+    generated: Vec<LockedSecret>,
     gen_status: String,
     last_saved_password_path: Option<PathBuf>,
     encrypt_shred_prompt_open: bool,
@@ -541,7 +548,10 @@ struct UnigenApp {
     // it never covered the copies made *while the user was still
     // typing*, which is exactly the longest-lived, most sensitive
     // window for a passphrase.
-    encrypt_shred_pwd: SecretString,
+    // SECURITY: sealed with `LockedSecret` (ChaCha20-obfuscated-at-rest,
+    // same treatment as `enc_pwd`) rather than kept as a live
+    // `SecretString` — unified across every passphrase field in the app.
+    encrypt_shred_pwd: LockedSecret,
 
     // ---- Clipboard / auto-clear ----
     clipboard: Option<arboard::Clipboard>,
@@ -585,10 +595,22 @@ struct UnigenApp {
     /// `linux_try_exclusion` setting; same "best effort, not a guarantee"
     /// caveat applies — see crypto::try_mlock equivalents).
     linux_try_exclusion: bool,
+    /// Mirrors the live revealed copy's `is_locked()` from whichever of
+    /// the two `vault_master_pwd` UI blocks last rendered this frame —
+    /// `vault_master_pwd` itself is sealed (`LockedSecret`) the rest of
+    /// the time, so there's no live buffer to query outside those blocks.
+    /// `None` means "field is empty, nothing to lock yet" — kept
+    /// distinct from `Some(false)` ("tried to lock, OS refused") so the
+    /// status label doesn't claim a vacuous mlock success on an empty
+    /// buffer as if a real passphrase were actually pinned in RAM.
+    vault_master_pwd_mlocked: Option<bool>,
 
     // ---- File Protector: Decrypt ----
     dec_file: Option<PathBuf>,
-    dec_pwd: SecretString,
+    // SECURITY: sealed with `LockedSecret` — same rationale/pattern as
+    // `enc_pwd`, see the block that renders this field for the
+    // reveal-for-one-frame/reseal-immediately pattern.
+    dec_pwd: LockedSecret,
     dec_pwd_last_edit: Instant,
     dec_pwd_autoclear: bool,
     dec_status: String,
@@ -605,9 +627,24 @@ struct UnigenApp {
     /// content is re-encrypted, or the app exits.
     editor_open: bool,
     editor_source: Option<PathBuf>,
-    editor_content: SecretString,
-    editor_original_content: SecretString,
-    editor_pwd: SecretString,
+    // SECURITY: sealed with `LockedSecret`, not a plain `SecretString` —
+    // this is decrypted file content that can stay open (and thus live
+    // in memory) for an arbitrarily long editing session with no
+    // natural flush point, exactly the "long dwell time" risk class
+    // `LockedSecret` exists for (same reasoning as `vault_edit_notes`).
+    // Revealed into a short-lived `SecretString` only for the one frame
+    // it's being rendered/edited/searched/saved, then resealed — see
+    // the editor UI code and `save_editor`/`open_editor_decrypt`.
+    editor_content: LockedSecret,
+    /// Same sealing rationale as `editor_content` — this is compared
+    // against it every frame for the dirty-check, so it needs the same
+    // protection or it would just be a second unsealed copy of the same
+    // decrypted file sitting in memory.
+    editor_original_content: LockedSecret,
+    // SECURITY: sealed with `LockedSecret` — this sits live for the
+    // entire editor session (not just one frame), which is exactly the
+    // "just sitting in memory" window `LockedSecret` exists to close.
+    editor_pwd: LockedSecret,
     editor_kdf: u8,
     /// KDF read from the opened file's own header (`None` for legacy
     /// Python-format files, which have no discoverable KDF marker other
@@ -621,7 +658,9 @@ struct UnigenApp {
     /// Passphrase prompt shown before decrypting into the editor.
     editor_open_prompt: bool,
     editor_open_target: Option<PathBuf>,
-    editor_open_pwd: SecretString,
+    // SECURITY: sealed with `LockedSecret`, unified with every other
+    // passphrase-entry field.
+    editor_open_pwd: LockedSecret,
     editor_open_error: String,
 
     // ---- Vault (password manager) ----
@@ -637,7 +676,11 @@ struct UnigenApp {
     /// a new heap address before the manual zeroize ever runs; `Drop`
     /// guarantees the wipe even on an early-return path that forgets to
     /// call it explicitly.
-    vault_master_pwd: SecretString,
+    // SECURITY: sealed with `LockedSecret` — the master password field
+    // can sit live for as long as the unlock/change-password dialogs are
+    // open, so it gets the same ChaCha20-obfuscated-at-rest treatment as
+    // `enc_pwd`/`dec_pwd` instead of a plain `SecretString`.
+    vault_master_pwd: LockedSecret,
     /// Decrypted entries, only populated while unlocked. Wrapped so the
     /// whole list — including every entry's password/notes strings via
     /// `VaultEntry`'s manual `Zeroize` impl — is scrubbed the moment it's
@@ -662,10 +705,29 @@ struct UnigenApp {
     /// `vault_master_pwd` above — `vault_edit_password` in particular
     /// holds a plaintext credential for as long as the entry is open.
     vault_edit_title: SecretString,
-    vault_edit_username: SecretString,
+    /// Like `vault_edit_notes` below: the field can sit open on screen
+    /// for a long stretch with no natural flush point, so it's sealed
+    /// with `LockedSecret` rather than kept as a live `SecretString` —
+    /// same "long plaintext residency" concern, just for `username`
+    /// instead of `notes`. Revealed into a short-lived `SecretString`
+    /// for exactly one frame at a time to feed the edit widget, then
+    /// immediately resealed — see the username UI block below.
+    vault_edit_username: LockedSecret,
     vault_edit_password: SecretString,
     vault_edit_url: SecretString,
-    vault_edit_notes: SecretString,
+    /// Unlike the other `vault_edit_*` buffers, notes can sit open and
+    /// unedited for a long stretch (the user reading/scrolling rather
+    /// than actively typing) with no natural moment that flushes it back
+    /// to `vault_entries`. Left as a plain `SecretString` it would be
+    /// exactly the "long plaintext residency" problem `LockedSecret`
+    /// exists to close (see `secret::LockedSecret` / `mem_cipher`'s doc
+    /// comments) — same risk class as the vault-wide `password` field,
+    /// just triggered by dwell time on this screen instead of the whole
+    /// unlocked-vault lifetime. Kept sealed here; revealed into a
+    /// short-lived `SecretString` for exactly one frame at a time to
+    /// feed `SecureNotesEdit`, then immediately resealed — see the notes
+    /// UI block below.
+    vault_edit_notes: LockedSecret,
     vault_reveal_password: bool,
     vault_confirm_delete: Option<u64>,
     /// Auto-lock: mirrors the existing passphrase inactivity-clear
@@ -685,9 +747,12 @@ struct UnigenApp {
 
     // ---- Vault: change master password ----
     vault_change_pwd_open: bool,
-    vault_change_pwd_current: SecretString,
-    vault_change_pwd_new: SecretString,
-    vault_change_pwd_confirm: SecretString,
+    // SECURITY: all three change-password fields sealed with
+    // `LockedSecret`, unified with the rest of the app's passphrase
+    // fields — see `vault_master_pwd` above for the rationale.
+    vault_change_pwd_current: LockedSecret,
+    vault_change_pwd_new: LockedSecret,
+    vault_change_pwd_confirm: LockedSecret,
     vault_change_pwd_error: String,
 
     // ---- Vault: CSV import ----
@@ -724,7 +789,7 @@ impl UnigenApp {
             gen_status: String::new(),
             last_saved_password_path: None,
             encrypt_shred_prompt_open: false,
-            encrypt_shred_pwd: SecretString::new(),
+            encrypt_shred_pwd: LockedSecret::default(),
             clipboard: arboard::Clipboard::new().ok(),
             autoclear_enabled: true,
             autoclear_seconds: 20,
@@ -739,8 +804,9 @@ impl UnigenApp {
             shred_after: true,
             enc_status: String::new(),
             linux_try_exclusion: false,
+            vault_master_pwd_mlocked: None,
             dec_file: None,
-            dec_pwd: SecretString::new(),
+            dec_pwd: LockedSecret::default(),
             dec_pwd_last_edit: Instant::now(),
             dec_pwd_autoclear: true,
             dec_status: String::new(),
@@ -749,9 +815,9 @@ impl UnigenApp {
             shred_status: String::new(),
             editor_open: false,
             editor_source: None,
-            editor_content: SecretString::new(),
-            editor_original_content: SecretString::new(),
-            editor_pwd: SecretString::new(),
+            editor_content: LockedSecret::default(),
+            editor_original_content: LockedSecret::default(),
+            editor_pwd: LockedSecret::default(),
             editor_kdf: crypto::DEFAULT_KDF,
             editor_source_kdf: None,
             editor_search: String::new(),
@@ -759,11 +825,11 @@ impl UnigenApp {
             editor_confirm_close: false,
             editor_open_prompt: false,
             editor_open_target: None,
-            editor_open_pwd: SecretString::new(),
+            editor_open_pwd: LockedSecret::default(),
             editor_open_error: String::new(),
             vault_path: None,
             vault_unlocked: false,
-            vault_master_pwd: SecretString::new(),
+            vault_master_pwd: LockedSecret::default(),
             vault_entries: Zeroizing::new(Vec::new()),
             vault_kdf: crypto::DEFAULT_KDF,
             vault_status: String::new(),
@@ -771,19 +837,19 @@ impl UnigenApp {
             vault_search: String::new(),
             vault_selected: None,
             vault_edit_title: SecretString::new(),
-            vault_edit_username: SecretString::new(),
+            vault_edit_username: LockedSecret::default(),
             vault_edit_password: SecretString::new(),
             vault_edit_url: SecretString::new(),
-            vault_edit_notes: SecretString::new(),
+            vault_edit_notes: LockedSecret::default(),
             vault_reveal_password: false,
             vault_confirm_delete: None,
             vault_last_activity: Instant::now(),
             vault_autolock_seconds: 120,
             vault_session_cache: vault::SessionUnlockCache::new(),
             vault_change_pwd_open: false,
-            vault_change_pwd_current: SecretString::new(),
-            vault_change_pwd_new: SecretString::new(),
-            vault_change_pwd_confirm: SecretString::new(),
+            vault_change_pwd_current: LockedSecret::default(),
+            vault_change_pwd_new: LockedSecret::default(),
+            vault_change_pwd_confirm: LockedSecret::default(),
             vault_change_pwd_error: String::new(),
             vault_import_open: false,
             vault_import_source: vault::CsvSource::Generic,
@@ -904,7 +970,11 @@ impl UnigenApp {
             self.vault_status = "Choose a vault file first.".to_string();
             return;
         };
-        let mut pwd = std::mem::take(&mut self.vault_master_pwd);
+        // SECURITY: `self.vault_master_pwd` is sealed at rest
+        // (`LockedSecret`) until this exact moment it's needed to
+        // actually unlock the vault; revealed once into a live
+        // `SecretString` (wipe-on-drop) for that.
+        let mut pwd = std::mem::take(&mut self.vault_master_pwd).reveal();
         // Convenience path: the field was left empty (user just clicked
         // "Unlock" again after an auto-lock, or is reopening the app
         // after one under `UntilLogout`) but `vault_session_cache` has a
@@ -1031,10 +1101,16 @@ impl UnigenApp {
     fn vault_select(&mut self, id: u64) {
         if let Some(e) = self.vault_entries.iter().find(|e| e.id == id) {
             self.vault_edit_title = e.title.clone();
-            self.vault_edit_username = e.username.clone();
+            // Sealed immediately rather than kept as the plain
+            // `SecretString` clone `e.username.clone()` would give —
+            // see the field's doc comment.
+            self.vault_edit_username = LockedSecret::from_str(e.username.as_str());
             self.vault_edit_password = e.password.reveal();
             self.vault_edit_url = e.url.clone();
-            self.vault_edit_notes = e.notes.clone();
+            // Sealed immediately rather than kept as the plain
+            // `SecretString` clone `e.notes.clone()` would give —
+            // see the field's doc comment.
+            self.vault_edit_notes = LockedSecret::from_str(e.notes.as_str());
             self.vault_selected = Some(id);
             self.vault_reveal_password = false;
         }
@@ -1075,10 +1151,18 @@ impl UnigenApp {
                 // plain `String` is created as a stray unzeroized copy
                 // along the way.
                 e.title = SecretString::from_str(self.vault_edit_title.as_str());
-                e.username = SecretString::from_str(self.vault_edit_username.as_str());
+                // `.reveal()` decrypts into a short-lived `SecretString`
+                // (wipe-on-drop) just long enough to copy its bytes into
+                // `e.username`; `self.vault_edit_username` itself stays
+                // sealed throughout — same handling as `e.notes` below.
+                e.username = SecretString::from_str(self.vault_edit_username.reveal().as_str());
                 e.password = LockedSecret::from_str(self.vault_edit_password.as_str());
                 e.url = SecretString::from_str(self.vault_edit_url.as_str());
-                e.notes = SecretString::from_str(self.vault_edit_notes.as_str());
+                // `.reveal()` decrypts into a short-lived `SecretString`
+                // (wipe-on-drop) just long enough to copy its bytes into
+                // `e.notes`; `self.vault_edit_notes` itself stays sealed
+                // throughout.
+                e.notes = SecretString::from_str(self.vault_edit_notes.reveal().as_str());
                 e.updated_at = now;
             }
         } else {
@@ -1089,10 +1173,10 @@ impl UnigenApp {
             self.vault_entries.push(Box::new(VaultEntry {
                 id,
                 title: SecretString::from_str(self.vault_edit_title.as_str()),
-                username: SecretString::from_str(self.vault_edit_username.as_str()),
+                username: SecretString::from_str(self.vault_edit_username.reveal().as_str()),
                 password: LockedSecret::from_str(self.vault_edit_password.as_str()),
                 url: SecretString::from_str(self.vault_edit_url.as_str()),
-                notes: SecretString::from_str(self.vault_edit_notes.as_str()),
+                notes: SecretString::from_str(self.vault_edit_notes.reveal().as_str()),
                 created_at: now,
                 updated_at: now,
             }));
@@ -1132,12 +1216,17 @@ impl UnigenApp {
                 "Vault hasn't been saved to disk yet — save it first.".to_string();
             return;
         }
-        if self.vault_change_pwd_new.chars().count() < 8 {
+        // Reveal the two "new password" fields once, up front, purely to
+        // validate them — the fields themselves stay sealed at rest
+        // otherwise.
+        let new_pwd_check = self.vault_change_pwd_new.reveal();
+        if new_pwd_check.chars().count() < 8 {
             self.vault_change_pwd_error =
                 "New password must be at least 8 characters.".to_string();
             return;
         }
-        if self.vault_change_pwd_new != self.vault_change_pwd_confirm {
+        let confirm_check = self.vault_change_pwd_confirm.reveal();
+        if new_pwd_check.as_str() != confirm_check.as_str() {
             self.vault_change_pwd_error = "New password and confirmation don't match.".to_string();
             return;
         }
@@ -1154,7 +1243,7 @@ impl UnigenApp {
         // current password itself, to unwrap the existing vault key
         // before re-wrapping it under the new one — see that function's
         // doc comment.
-        let mut current = std::mem::take(&mut self.vault_change_pwd_current);
+        let mut current = std::mem::take(&mut self.vault_change_pwd_current).reveal();
         let verify = vault::read_vault_file(&path).and_then(|combined| {
             vault::decrypt_vault(&current, &combined)
         });
@@ -1165,7 +1254,9 @@ impl UnigenApp {
             return;
         }
 
-        let mut new_pwd = std::mem::take(&mut self.vault_change_pwd_new);
+        let mut new_pwd = std::mem::take(&mut self.vault_change_pwd_new).reveal();
+        drop(new_pwd_check);
+        drop(confirm_check);
         let result = vault::change_master_password(
             &path,
             &current,
@@ -1362,7 +1453,7 @@ impl UnigenApp {
                 "Best-effort: ask the OS to keep the master password out of swap (mlock/VirtualLock)",
             );
             let (text, kind) =
-                mem_lock::status_label(self.linux_try_exclusion, self.vault_master_pwd.is_locked());
+                mem_lock::status_label_opt(self.linux_try_exclusion, self.vault_master_pwd_mlocked);
             let p = self.palette();
             let color = match kind {
                 "success" => p.success,
@@ -1394,16 +1485,28 @@ impl UnigenApp {
 
         if !self.vault_unlocked {
             ui.label("Enter the master password to unlock (or create) this vault:");
+            // SECURITY: sealed at rest; revealed only for this render
+            // and resealed immediately after — same pattern as `enc_pwd`.
+            let mut live_master_pwd = self.vault_master_pwd.reveal();
             ui.horizontal(|ui| {
-                let resp = ui.add(secure_text_edit::SecurePasswordEdit::new("vault_master_pwd", &mut self.vault_master_pwd));
-                if resp.changed() && self.linux_try_exclusion {
-                    self.vault_master_pwd.mlock_best_effort();
+                ui.add(secure_text_edit::SecurePasswordEdit::new("vault_master_pwd", &mut live_master_pwd));
+                // Must run every frame, not just on edits — `reveal()`
+                // allocates a fresh buffer each frame, so gating this
+                // behind `resp.changed()` left it unlocked (and the
+                // status flickering) on every frame the user wasn't
+                // actively typing.
+                if self.linux_try_exclusion {
+                    live_master_pwd.mlock_best_effort();
                 }
-                let can_go = self.vault_path.is_some() && !self.vault_master_pwd.is_empty();
-                if ui
+                self.vault_master_pwd_mlocked = (!live_master_pwd.is_empty()).then(|| live_master_pwd.is_locked());
+                let can_go = self.vault_path.is_some() && !live_master_pwd.is_empty();
+                let clicked = ui
                     .add_enabled(can_go, egui::Button::new("Unlock"))
-                    .clicked()
-                {
+                    .clicked();
+                // Reseal right away: `unlock_vault()` reveals its own
+                // short-lived copy from the now-sealed field.
+                self.vault_master_pwd = LockedSecret::seal(live_master_pwd);
+                if clicked {
                     self.unlock_vault();
                 }
             });
@@ -1511,23 +1614,37 @@ impl UnigenApp {
             // `SecurePasswordEdit::masked(false)`: same no-undo-history
             // guarantee, just with the real characters painted instead of
             // bullets.
+            //
+            // SECURITY: `vault_edit_username` is itself a `LockedSecret`
+            // (sealed at rest) for the same "sits open on screen with no
+            // natural flush point" reason as `vault_edit_notes` — see
+            // that field's doc comment. `.reveal()` here decrypts it
+            // into `username_plain`, a `SecretString` that lives only
+            // for this one frame; it's sealed straight back into
+            // `self.vault_edit_username` at the end of this block, on
+            // every code path, so the plaintext window is exactly one
+            // frame wide.
+            let mut username_plain = self.vault_edit_username.reveal();
             let user_resp = ui.add(
                 secure_text_edit::SecurePasswordEdit::new(
                     "vault_edit_username",
-                    &mut self.vault_edit_username,
+                    &mut username_plain,
                 )
                 .masked(false),
             );
             let mut user_copy: Option<SecretString> = None;
             user_resp.context_menu(|ui| {
                 if ui.button("Copy").clicked() {
-                    user_copy = Some(self.vault_edit_username.clone());
+                    user_copy = Some(username_plain.clone());
                     ui.close_menu();
                 }
             });
             if let Some(v) = user_copy {
                 self.copy_to_clipboard(&v);
             }
+            // Reseal immediately, same rationale/placement as the notes
+            // block below.
+            self.vault_edit_username = LockedSecret::seal(username_plain);
             ui.label("Password");
             ui.horizontal(|ui| {
                 let pwd_field_resp = ui.add(
@@ -1601,8 +1718,21 @@ impl UnigenApp {
                 self.copy_to_clipboard(&v);
             }
             ui.label("Notes");
+            // SECURITY: `vault_edit_notes` is a `LockedSecret` (sealed
+            // at rest) precisely so it doesn't sit as long-lived
+            // plaintext while this panel is just open and not being
+            // typed into. `.reveal()` here decrypts it into `notes_plain`
+            // — a `SecretString` that lives only for this one frame —
+            // and everything below (the widget itself, copy operations)
+            // reads/writes that transient buffer. It's sealed straight
+            // back into `self.vault_edit_notes` at the end of this
+            // block, on every code path (including early edits), so the
+            // plaintext window is exactly one frame wide — the same
+            // "one frame" exposure the app already accepts elsewhere
+            // (see `secure_text_edit` module docs on `egui::Event::Text`).
+            let mut notes_plain = self.vault_edit_notes.reveal();
             let notes_resp = ui.add(
-                secure_text_edit::SecureNotesEdit::new("vault_edit_notes", &mut self.vault_edit_notes)
+                secure_text_edit::SecureNotesEdit::new("vault_edit_notes", &mut notes_plain)
                     .desired_rows(6),
             );
 
@@ -1613,8 +1743,8 @@ impl UnigenApp {
             // every other copy action in the app.
             if secure_text_edit::take_copy_request(ui, "vault_edit_notes") {
                 let to_copy = match secure_text_edit::selected_range(ui, "vault_edit_notes") {
-                    Some(range) => secure_text_edit::extract_range(&self.vault_edit_notes, range),
-                    None => Zeroizing::new(self.vault_edit_notes.as_str().to_string()),
+                    Some(range) => secure_text_edit::extract_range(&notes_plain, range),
+                    None => Zeroizing::new(notes_plain.as_str().to_string()),
                 };
                 self.copy_to_clipboard(&to_copy);
             }
@@ -1623,10 +1753,16 @@ impl UnigenApp {
                 secure_text_edit::selected_range(ui, "vault_edit_notes").is_some();
             let mut notes_copy: Option<Zeroizing<String>> = None;
             notes_resp.context_menu(|ui| {
-                if ui.button("Copy all").clicked() {
-                    notes_copy = Some(Zeroizing::new(self.vault_edit_notes.as_str().to_string()));
-                    ui.close_menu();
-                }
+                // SECURITY: only "Copy selection" is exposed here.
+                // "Copy all" and "Copy line" each built their payload by
+                // cloning the *entire* revealed `notes_plain` (or a
+                // line-scan over it) into a fresh, separately-allocated
+                // `String`/`Zeroizing<String>` — a second plaintext copy
+                // of the whole note sitting in RAM, on top of the one
+                // `notes_plain` already holds, for as long as that
+                // button's closure lived. "Copy selection" is the only
+                // action whose leaked footprint is bounded by what the
+                // user actually selected, so it's the only one kept.
                 if ui
                     .add_enabled(has_selection, egui::Button::new("Copy selection"))
                     .clicked()
@@ -1634,23 +1770,20 @@ impl UnigenApp {
                     if let Some(range) =
                         secure_text_edit::selected_range(ui, "vault_edit_notes")
                     {
-                        notes_copy = Some(secure_text_edit::extract_range(&self.vault_edit_notes, range));
+                        notes_copy = Some(secure_text_edit::extract_range(&notes_plain, range));
                     }
-                    ui.close_menu();
-                }
-                if ui.button("Copy line").clicked() {
-                    let range = secure_text_edit::current_line_range(
-                        ui,
-                        "vault_edit_notes",
-                        &self.vault_edit_notes,
-                    );
-                    notes_copy = Some(secure_text_edit::extract_range(&self.vault_edit_notes, range));
                     ui.close_menu();
                 }
             });
             if let Some(v) = notes_copy {
                 self.copy_to_clipboard(&v);
             }
+
+            // Reseal immediately: `notes_plain` (and its heap buffer)
+            // is consumed here rather than dropped-then-recreated, so
+            // this frame's edits never exist as an unsealed `SecretString`
+            // any longer than the widget call above needed them to.
+            self.vault_edit_notes = LockedSecret::seal(notes_plain);
 
             ui.horizontal(|ui| {
                 let has_title = !self.vault_edit_title.trim().is_empty();
@@ -1671,18 +1804,25 @@ impl UnigenApp {
 
         if self.vault_dirty {
             ui.separator();
+            // SECURITY: sealed at rest; revealed only for this render
+            // and resealed immediately after.
+            let mut live_master_pwd = self.vault_master_pwd.reveal();
             ui.horizontal(|ui| {
                 ui.label("Master password to save:");
-                let resp = ui.add(secure_text_edit::SecurePasswordEdit::new("vault_master_pwd", &mut self.vault_master_pwd));
-                if resp.changed() && self.linux_try_exclusion {
-                    self.vault_master_pwd.mlock_best_effort();
+                ui.add(secure_text_edit::SecurePasswordEdit::new("vault_master_pwd", &mut live_master_pwd));
+                // Must run every frame — see the matching comment on the
+                // unlock-screen block above for why gating this behind
+                // `resp.changed()` caused the status to flicker.
+                if self.linux_try_exclusion {
+                    live_master_pwd.mlock_best_effort();
                 }
+                self.vault_master_pwd_mlocked = (!live_master_pwd.is_empty()).then(|| live_master_pwd.is_locked());
                 if ui.button("Save vault").clicked() {
-                    let mut pwd = std::mem::take(&mut self.vault_master_pwd);
-                    self.save_vault_with(&pwd);
-                    pwd.zeroize();
+                    self.save_vault_with(&live_master_pwd);
+                    live_master_pwd.clear();
                 }
             });
+            self.vault_master_pwd = LockedSecret::seal(live_master_pwd);
         }
 
         if let Some(id) = self.vault_confirm_delete {
@@ -1709,43 +1849,63 @@ impl UnigenApp {
                 .resizable(false)
                 .show(ui.ctx(), |ui| {
                     ui.label("Current master password:");
+                    // SECURITY: all three fields sealed at rest
+                    // (`LockedSecret`); revealed only for this render and
+                    // resealed immediately after — same pattern used for
+                    // every other passphrase field in this app.
+                    let mut live_current = self.vault_change_pwd_current.reveal();
+                    let mut live_new = self.vault_change_pwd_new.reveal();
+                    let mut live_confirm = self.vault_change_pwd_confirm.reveal();
                     ui.add(
                         secure_text_edit::SecurePasswordEdit::new(
                             "vault_change_pwd_current",
-                            &mut self.vault_change_pwd_current,
+                            &mut live_current,
                         ),
                     );
                     ui.label("New master password (min 8 characters):");
                     ui.add(
                         secure_text_edit::SecurePasswordEdit::new(
                             "vault_change_pwd_new",
-                            &mut self.vault_change_pwd_new,
+                            &mut live_new,
                         ),
                     );
                     ui.label("Confirm new master password:");
                     ui.add(
                         secure_text_edit::SecurePasswordEdit::new(
                             "vault_change_pwd_confirm",
-                            &mut self.vault_change_pwd_confirm,
+                            &mut live_confirm,
                         ),
                     );
                     if !self.vault_change_pwd_error.is_empty() {
                         ui.colored_label(pal.danger, &self.vault_change_pwd_error);
                     }
+                    let mut cancelled = false;
+                    let mut go = false;
                     ui.horizontal(|ui| {
                         if ui.button("Cancel").clicked() {
-                            self.close_change_pwd_dialog();
+                            cancelled = true;
                         }
-                        let can_go = !self.vault_change_pwd_current.is_empty()
-                            && self.vault_change_pwd_new.chars().count() >= 8
-                            && !self.vault_change_pwd_confirm.is_empty();
+                        let can_go = !live_current.is_empty()
+                            && live_new.chars().count() >= 8
+                            && !live_confirm.is_empty();
                         if ui
                             .add_enabled(can_go, egui::Button::new("Change password"))
                             .clicked()
                         {
-                            self.change_master_password();
+                            go = true;
                         }
                     });
+                    // Reseal right away: `change_master_password()`
+                    // reveals its own short-lived copies from the
+                    // now-sealed fields.
+                    self.vault_change_pwd_current = LockedSecret::seal(live_current);
+                    self.vault_change_pwd_new = LockedSecret::seal(live_new);
+                    self.vault_change_pwd_confirm = LockedSecret::seal(live_confirm);
+                    if cancelled {
+                        self.close_change_pwd_dialog();
+                    } else if go {
+                        self.change_master_password();
+                    }
                 });
         }
 
@@ -1807,12 +1967,16 @@ impl UnigenApp {
             _ => {
                 self.gen_status =
                     "No saved password file to encrypt — save the list first.".to_string();
-                self.encrypt_shred_pwd.clear();
+                self.encrypt_shred_pwd.zeroize();
                 return;
             }
         };
 
-        let pwd = Zeroizing::new(self.encrypt_shred_pwd.as_str().to_string());
+        // Reveal the sealed passphrase exactly once for this operation;
+        // `revealed` is a `SecretString` (wipe-on-drop/realloc) and the
+        // field itself stays sealed the whole time otherwise.
+        let revealed = self.encrypt_shred_pwd.reveal();
+        let pwd = Zeroizing::new(revealed.as_str().to_string());
         let result = (|| -> anyhow::Result<String> {
             crypto::check_blob_file_size(&path)?;
             let original_identity = shred::file_identity(&path)?;
@@ -1849,7 +2013,7 @@ impl UnigenApp {
             }
         })();
 
-        self.encrypt_shred_pwd.clear();
+        self.encrypt_shred_pwd.zeroize();
         match result {
             Ok(msg) => {
                 self.gen_status = msg;
@@ -1923,7 +2087,7 @@ impl UnigenApp {
             && !self.dec_pwd.is_empty()
             && self.dec_pwd_last_edit.elapsed() > secs
         {
-            self.dec_pwd.clear();
+            self.dec_pwd.zeroize();
             self.dec_status = format!(
                 "Passphrase cleared from memory after {}s of inactivity.",
                 self.pwd_autoclear_seconds
@@ -2036,7 +2200,9 @@ impl UnigenApp {
             .file_stem()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "decrypted".to_string());
-        let pwd = Zeroizing::new(self.dec_pwd.as_str().to_string());
+        // Reveal the sealed passphrase exactly once for this operation.
+        let revealed = self.dec_pwd.reveal();
+        let pwd = Zeroizing::new(revealed.as_str().to_string());
         self.spawn_dialog(
             PendingPick::DecryptSaveOutput {
                 in_path,
@@ -2106,12 +2272,19 @@ impl UnigenApp {
             Ok((text, source_kdf, legacy_no_aad)) => {
                 self.editor_source = Some(path);
                 // `SecretString::from(String)` copies into the controlled
-                // buffer and zeroizes the source `String` afterward, so
-                // neither the `.clone()` below nor `text` itself is left
-                // as a stray unzeroized plaintext copy on the heap.
-                self.editor_content = SecretString::from(text.clone());
-                self.editor_original_content = SecretString::from(text);
-                self.editor_pwd = pwd;
+                // buffer and zeroizes the source `String` afterward. Both
+                // `LockedSecret`s are then derived from that one
+                // zeroize-on-drop `SecretString` (`plain`) rather than
+                // from `text` a second time, so there's still only ever
+                // one transient plaintext copy of the freshly-decrypted
+                // file, and it's gone (zeroized) as soon as `plain` goes
+                // out of scope at the end of this block.
+                let plain = SecretString::from(text);
+                self.editor_content = LockedSecret::from_str(plain.as_str());
+                self.editor_original_content = LockedSecret::from_str(plain.as_str());
+                // SECURITY: sealed for the whole editing session — see
+                // the field's doc comment.
+                self.editor_pwd = LockedSecret::seal(pwd);
                 self.editor_source_kdf = source_kdf;
                 // Default the "will save as" KDF to whatever the file was
                 // already using, so hitting Save without touching the KDF
@@ -2132,11 +2305,11 @@ impl UnigenApp {
                 };
                 self.editor_open_prompt = false;
                 self.editor_open_target = None;
-                self.editor_open_pwd.clear();
+                self.editor_open_pwd.zeroize();
                 self.editor_open_error.clear();
             }
             Err(e) => {
-                self.editor_open_pwd.clear();
+                self.editor_open_pwd.zeroize();
                 self.editor_open_error = format!("Error: {e}");
             }
         }
@@ -2153,16 +2326,22 @@ impl UnigenApp {
         let Some(path) = self.editor_source.clone() else {
             return;
         };
-        let expected = self.editor_content.clone();
+        // Revealed only for the duration of this save (encrypt + verify)
+        // operation — same transient-reveal, resealed-after pattern used
+        // everywhere else `LockedSecret` is read. `editor_content` itself
+        // is untouched/still sealed throughout.
+        let expected = self.editor_content.reveal();
+        // Reveal the sealed passphrase once for this save operation.
+        let revealed_pwd = self.editor_pwd.reveal();
         let result = (|| -> anyhow::Result<()> {
             let combined =
-                crypto::encrypt_blob(&self.editor_pwd, expected.as_bytes(), self.editor_kdf)?;
+                crypto::encrypt_blob(&revealed_pwd, expected.as_bytes(), self.editor_kdf)?;
 
             // Verify round-trip BEFORE touching the real file: decrypt the
             // freshly-produced ciphertext with the same passphrase and
             // confirm it matches exactly what we intended to save.
             let verify = Zeroizing::new(
-                crypto::decrypt_blob(&self.editor_pwd, &combined).map_err(|e| {
+                crypto::decrypt_blob(&revealed_pwd, &combined).map_err(|e| {
                     anyhow::anyhow!(
                         "Verification failed after encrypting — original file left untouched: {e}"
                     )
@@ -2187,7 +2366,7 @@ impl UnigenApp {
         })();
         match result {
             Ok(()) => {
-                self.editor_original_content = self.editor_content.clone();
+                self.editor_original_content = LockedSecret::from_str(expected.as_str());
                 self.editor_source_kdf = Some(self.editor_kdf);
                 self.editor_status = format!(
                     "Saved & re-encrypted ({}): {path:?}",
@@ -2203,9 +2382,9 @@ impl UnigenApp {
     /// calls this too) so decrypted plaintext never lingers in memory
     /// longer than the editor stays open.
     fn close_editor(&mut self) {
-        self.editor_content.clear();
-        self.editor_original_content.clear();
-        self.editor_pwd.clear();
+        self.editor_content.zeroize();
+        self.editor_original_content.zeroize();
+        self.editor_pwd.zeroize();
         self.editor_search.clear();
         self.editor_status.clear();
         self.editor_source = None;
@@ -2450,8 +2629,12 @@ impl UnigenApp {
                 let Some(path) = path else {
                     return;
                 };
+                // Revealed only for this write-to-file operation — each
+                // entry stays sealed in `self.generated` otherwise.
+                let revealed: Vec<SecretString> =
+                    self.generated.iter().map(|p| p.reveal()).collect();
                 let content = Zeroizing::new(
-                    self.generated
+                    revealed
                         .iter()
                         .map(|p| p.as_str())
                         .collect::<Vec<_>>()
@@ -2950,8 +3133,8 @@ impl eframe::App for UnigenApp {
         if ctx.input(|i| i.viewport().close_requested()) {
             if self.busy_ops.is_empty() {
                 self.enc_pwd.zeroize();
-                self.dec_pwd.clear();
-                self.editor_open_pwd.clear();
+                self.dec_pwd.zeroize();
+                self.editor_open_pwd.zeroize();
                 self.close_editor();
                 self.clear_clipboard();
                 self.lock_vault(false);
@@ -2969,24 +3152,41 @@ impl eframe::App for UnigenApp {
                     ui.label(
                         "Enter a passphrase (min 8 characters) to protect this password file:",
                     );
-                    ui.add(secure_text_edit::SecurePasswordEdit::new("encrypt_shred_pwd", &mut self.encrypt_shred_pwd));
+                    // SECURITY: sealed at rest (`LockedSecret`); revealed
+                    // into a live `SecretString` only for this render and
+                    // resealed immediately after — same pattern as
+                    // `enc_pwd` in the Encrypt tab.
+                    let mut live_pwd = self.encrypt_shred_pwd.reveal();
+                    ui.add(secure_text_edit::SecurePasswordEdit::new("encrypt_shred_pwd", &mut live_pwd));
+                    let mut cancelled = false;
+                    let mut go = false;
                     ui.horizontal(|ui| {
                         if ui.button("Cancel").clicked() {
-                            self.encrypt_shred_pwd.clear();
+                            cancelled = true;
                             self.encrypt_shred_prompt_open = false;
                         }
-                        let can_go = self.encrypt_shred_pwd.chars().count() >= 8;
+                        let can_go = live_pwd.chars().count() >= 8;
                         if ui
                             .add_enabled(can_go, egui::Button::new("Encrypt & Shred"))
                             .clicked()
                         {
                             self.encrypt_shred_prompt_open = false;
-                            self.run_encrypt_and_shred_password_file();
+                            go = true;
                         }
                     });
-                    if !self.encrypt_shred_pwd.is_empty()
-                        && self.encrypt_shred_pwd.chars().count() < 8
-                    {
+                    let show_too_short = !live_pwd.is_empty() && live_pwd.chars().count() < 8;
+                    // Reseal right away: the field is only ever live for
+                    // this one render.
+                    if cancelled {
+                        live_pwd.clear();
+                        self.encrypt_shred_pwd = LockedSecret::seal(live_pwd);
+                    } else {
+                        self.encrypt_shred_pwd = LockedSecret::seal(live_pwd);
+                        if go {
+                            self.run_encrypt_and_shred_password_file();
+                        }
+                    }
+                    if show_too_short {
                         ui.colored_label(
                             self.palette().danger,
                             "Passphrase must be at least 8 characters.",
@@ -3004,27 +3204,41 @@ impl eframe::App for UnigenApp {
                     if let Some(p) = &self.editor_open_target {
                         ui.small(p.display().to_string());
                     }
-                    ui.add(secure_text_edit::SecurePasswordEdit::new("editor_open_pwd", &mut self.editor_open_pwd));
+                    // SECURITY: sealed at rest; revealed only for this
+                    // render and resealed immediately after — same
+                    // pattern as `enc_pwd`.
+                    let mut live_pwd = self.editor_open_pwd.reveal();
+                    ui.add(secure_text_edit::SecurePasswordEdit::new("editor_open_pwd", &mut live_pwd));
                     if !self.editor_open_error.is_empty() {
                         ui.colored_label(self.palette().danger, &self.editor_open_error);
                     }
+                    let mut cancelled = false;
+                    let mut go = false;
                     ui.horizontal(|ui| {
                         if ui.button("Cancel").clicked() {
-                            self.editor_open_pwd.clear();
+                            cancelled = true;
                             self.editor_open_error.clear();
                             self.editor_open_prompt = false;
                             self.editor_open_target = None;
                         }
-                        let can_go = !self.editor_open_pwd.is_empty();
+                        let can_go = !live_pwd.is_empty();
                         if ui
                             .add_enabled(can_go, egui::Button::new("Decrypt"))
                             .clicked()
                         {
-                            let path = self.editor_open_target.clone().unwrap();
-                            let pwd = std::mem::take(&mut self.editor_open_pwd);
-                            self.open_editor_decrypt(path, pwd);
+                            go = true;
                         }
                     });
+                    if cancelled {
+                        live_pwd.clear();
+                        self.editor_open_pwd = LockedSecret::default();
+                    } else if go {
+                        let path = self.editor_open_target.clone().unwrap();
+                        self.editor_open_pwd = LockedSecret::default();
+                        self.open_editor_decrypt(path, live_pwd);
+                    } else {
+                        self.editor_open_pwd = LockedSecret::seal(live_pwd);
+                    }
                 });
         }
 
@@ -3074,8 +3288,8 @@ impl eframe::App for UnigenApp {
                             // corrupted "finished" file and never someone
                             // else's unrelated `.tmp` file.
                             self.enc_pwd.zeroize();
-                            self.dec_pwd.clear();
-                            self.editor_open_pwd.clear();
+                            self.dec_pwd.zeroize();
+                            self.editor_open_pwd.zeroize();
                             self.close_editor();
                             self.clear_clipboard();
                             std::process::exit(0);
@@ -3209,7 +3423,11 @@ impl UnigenApp {
                     .clicked()
                 {
                     self.generated = (0..self.count)
-                        .map(|_| generate_password(self.length as usize, &pool))
+                        .map(|_| {
+                            LockedSecret::from_str(
+                                generate_password(self.length as usize, &pool).as_str(),
+                            )
+                        })
                         .collect();
                     self.gen_status.clear();
                 }
@@ -3233,6 +3451,9 @@ impl UnigenApp {
                             } else {
                                 let mut to_copy: Option<Zeroizing<String>> = None;
                                 for (i, pwd) in self.generated.iter().enumerate() {
+                                    // Revealed only for this row's paint/copy —
+                                    // `pwd` itself stays sealed in `self.generated`.
+                                    let pwd = pwd.reveal();
                                     ui.horizontal(|ui| {
                                         if ui
                                             .button("Copy")
@@ -3242,33 +3463,18 @@ impl UnigenApp {
                                             to_copy = Some(Zeroizing::new(pwd.as_str().to_owned()));
                                         }
                                         // SECURITY: was `ui.monospace(format!(...))` — a
-                                        // plain `egui::Label`. That builds an ordinary,
-                                        // never-zeroized heap `String` containing the full
-                                        // plaintext password every single frame this list is
-                                        // visible, and hands it into egui's normal
-                                        // WidgetText/RichText/galley pipeline — completely
-                                        // outside this app's `SecretBytes`/`Zeroizing`
-                                        // protections. Confirmed present in a post-run core
-                                        // dump. Fixed the same way `SecurePasswordEdit`'s
-                                        // reveal mode already handles this (see
-                                        // `secure_text_edit.rs`): paint the characters
-                                        // directly instead of going through a `Label`, and
-                                        // wrap the short-lived formatting buffer in
-                                        // `Zeroizing` so at least its own backing allocation
-                                        // is wiped the moment this iteration ends.
-                                        // Residual risk, documented rather than implied
-                                        // away (same "layout_no_wrap still needs an owned
-                                        // String" gap `SecurePasswordEdit`'s own reveal-mode
-                                        // doc comment already accepts for this exact egui
-                                        // API): `layout_no_wrap` takes `text.to_string()`,
-                                        // so one more plain-`String` copy is made and handed
-                                        // to egui's font/galley cache per call — but it's a
-                                        // single, per-frame, non-accumulating allocation
-                                        // (dropped/replaced next frame), not a persistent
-                                        // undo-style trail like the removed `Label` path, and
-                                        // it matches the residual-risk boundary this app
-                                        // already accepts elsewhere for reveal-mode text
-                                        // painting.
+                                        // plain `egui::Label`, then (in an earlier fix) a
+                                        // single `painter.text(line, ...)` call built via
+                                        // `layout_no_wrap`. Both build/cache a whole-string
+                                        // `Galley` owning a full plaintext copy of this row
+                                        // (`#N: password`) in egui's private font cache.
+                                        // Confirmed present in a post-run core dump. Now
+                                        // measured with `text_width` (per-glyph widths, no
+                                        // Galley) and painted one character at a time with
+                                        // `paint_chars` — see that function's doc comment in
+                                        // `secure_text_edit.rs`. No residual whole-line
+                                        // Galley exposure left here: the font cache only
+                                        // ever retains single, UI-wide-shared glyphs.
                                         let line = Zeroizing::new(format!(
                                             "#{}: {}",
                                             i + 1,
@@ -3277,23 +3483,21 @@ impl UnigenApp {
                                         let font_id =
                                             egui::TextStyle::Monospace.resolve(ui.style());
                                         let text_color = ui.visuals().text_color();
-                                        let galley_size = ui.fonts(|f| {
-                                            f.layout_no_wrap(
-                                                line.to_string(),
-                                                font_id.clone(),
-                                                text_color,
-                                            )
-                                            .size()
-                                        });
+                                        let row_height = ui.fonts(|f| f.row_height(&font_id));
+                                        let size = egui::vec2(
+                                            secure_text_edit::text_width(ui, &font_id, line.as_str()),
+                                            row_height,
+                                        );
                                         let (rect, label_resp) = ui.allocate_exact_size(
-                                            galley_size,
+                                            size,
                                             egui::Sense::click(),
                                         );
-                                        ui.painter().text(
-                                            rect.left_center(),
-                                            egui::Align2::LEFT_CENTER,
+                                        secure_text_edit::paint_chars(
+                                            ui,
+                                            ui.painter(),
+                                            rect.left_top(),
                                             line.as_str(),
-                                            font_id,
+                                            &font_id,
                                             text_color,
                                         );
                                         // Right-click menu as an alternative to the "Copy"
@@ -3320,7 +3524,24 @@ impl UnigenApp {
 
                 ui.horizontal(|ui| {
                     if ui.add_enabled(!self.generated.is_empty(), egui::Button::new("Copy All")).clicked() {
-                        let text = Zeroizing::new(self.generated.iter().map(|p| p.as_str()).collect::<Vec<_>>().join("\n"));
+                        // Revealed only for this join+copy operation —
+                        // each entry stays sealed in `self.generated`
+                        // otherwise. The joined result is a `Zeroizing`
+                        // that's dropped (and wiped) at the end of this
+                        // block; the clipboard write itself still goes
+                        // through `copy_to_clipboard`'s own `LockedSecret`
+                        // staging (`autoclear_expected`), same as every
+                        // other copy in the app.
+                        let text = Zeroizing::new(
+                            self.generated
+                                .iter()
+                                .map(|p| p.reveal())
+                                .collect::<Vec<_>>()
+                                .iter()
+                                .map(|p| p.as_str())
+                                .collect::<Vec<_>>()
+                                .join("\n"),
+                        );
                         self.copy_to_clipboard(&text);
                     }
                     if ui
@@ -3348,7 +3569,7 @@ impl UnigenApp {
                         )
                         .clicked()
                     {
-                        self.encrypt_shred_pwd.clear();
+                        self.encrypt_shred_pwd.zeroize();
                         self.encrypt_shred_prompt_open = true;
                     }
                 });
@@ -3448,12 +3669,18 @@ impl UnigenApp {
                 let resp = ui.add(secure_text_edit::SecurePasswordEdit::new("enc_pwd", &mut live_enc_pwd));
                 if resp.changed() {
                     self.enc_pwd_last_edit = Instant::now();
-                    // Best-effort: lock this frame's revealed copy into
-                    // physical RAM for as long as it's alive (see
-                    // `SecretString::mlock_best_effort`'s doc comment).
-                    if self.linux_try_exclusion {
-                        live_enc_pwd.mlock_best_effort();
-                    }
+                }
+                // Best-effort: lock *this frame's* revealed copy into
+                // physical RAM. Must run every frame, not just on edits —
+                // `reveal()` allocates a fresh buffer each frame (the
+                // previous frame's copy was already zeroized/resealed),
+                // so gating this behind `resp.changed()` left it
+                // unlocked on every frame the user wasn't actively
+                // typing, which showed up as the status flickering
+                // between "locked" and "not locked" instead of holding
+                // steady.
+                if self.linux_try_exclusion {
+                    live_enc_pwd.mlock_best_effort();
                 }
                 if !live_enc_pwd.is_empty() {
                     let bits = estimate_passphrase_entropy(&live_enc_pwd);
@@ -3481,8 +3708,10 @@ impl UnigenApp {
                     // frame's brief revealed copy; the field is also
                     // ChaCha20-encrypted-at-rest the rest of the time,
                     // independent of mlock.
-                    let (text, kind) =
-                        mem_lock::status_label(self.linux_try_exclusion, live_enc_pwd.is_locked());
+                    let (text, kind) = mem_lock::status_label_opt(
+                        self.linux_try_exclusion,
+                        (!live_enc_pwd.is_empty()).then(|| live_enc_pwd.is_locked()),
+                    );
                     let p = self.palette();
                     let color = match kind {
                         "success" => p.success,
@@ -3551,12 +3780,21 @@ impl UnigenApp {
                 });
 
                 ui.label("Passphrase");
-                let resp = ui.add(secure_text_edit::SecurePasswordEdit::new("dec_pwd", &mut self.dec_pwd));
+                // SECURITY: `self.dec_pwd` is stored sealed (`LockedSecret`
+                // — ChaCha20-obfuscated-at-rest) except right here — same
+                // reveal-for-one-frame/reseal-immediately pattern as
+                // `enc_pwd` on the Encrypt tab.
+                let mut live_dec_pwd = self.dec_pwd.reveal();
+                let resp = ui.add(secure_text_edit::SecurePasswordEdit::new("dec_pwd", &mut live_dec_pwd));
                 if resp.changed() {
                     self.dec_pwd_last_edit = Instant::now();
-                    if self.linux_try_exclusion {
-                        self.dec_pwd.mlock_best_effort();
-                    }
+                }
+                // Must run every frame, not just on edits — see the
+                // matching comment on the Encrypt tab's `enc_pwd` block
+                // for why gating this behind `resp.changed()` caused the
+                // status to flicker.
+                if self.linux_try_exclusion {
+                    live_dec_pwd.mlock_best_effort();
                 }
                 // U-06 fix: same live status as the Encrypt tab. No
                 // separate checkbox here — `linux_try_exclusion` is one
@@ -3564,8 +3802,10 @@ impl UnigenApp {
                 // settings panel), so this just reflects its effect on
                 // *this* field.
                 if mem_lock::SUPPORTED {
-                    let (text, kind) =
-                        mem_lock::status_label(self.linux_try_exclusion, self.dec_pwd.is_locked());
+                    let (text, kind) = mem_lock::status_label_opt(
+                        self.linux_try_exclusion,
+                        (!live_dec_pwd.is_empty()).then(|| live_dec_pwd.is_locked()),
+                    );
                     let p = self.palette();
                     let color = match kind {
                         "success" => p.success,
@@ -3577,6 +3817,10 @@ impl UnigenApp {
                         ui.small("Memory-lock status:");
                         ui.colored_label(color, text);
                     });
+                    ui.small(
+                        "Also kept encrypted at rest in RAM (ChaCha20) whenever this field \
+                         isn't the one actively being edited.",
+                    );
                 }
                 ui.checkbox(
                     &mut self.dec_pwd_autoclear,
@@ -3585,7 +3829,10 @@ impl UnigenApp {
 
                 ui.add_space(6.0);
                 let busy = self.busy_ops.contains("decrypt");
-                let ready = self.dec_file.is_some() && !self.dec_pwd.is_empty() && !busy;
+                let ready = self.dec_file.is_some() && !live_dec_pwd.is_empty() && !busy;
+                // Reseal right away: nothing below needs the live
+                // plaintext again this frame.
+                self.dec_pwd = LockedSecret::seal(live_dec_pwd);
                 if ui.add_enabled(ready, egui::Button::new(if busy { "Decrypting…" } else { "Decrypt & Save" })).clicked() {
                     self.start_decrypt();
                 }
@@ -3705,7 +3952,17 @@ impl UnigenApp {
             if let Some(p) = &self.editor_source {
                 ui.label(format!("Editing: {}", p.display()));
             }
-            let dirty = self.editor_content != self.editor_original_content;
+            // `LockedSecret` deliberately has no `PartialEq` — two seals
+            // of the identical plaintext still differ (different random
+            // nonce each time), so a ciphertext compare would be
+            // meaningless. Revealing both to compare means this dirty
+            // check briefly holds two plaintext copies of the file once
+            // per frame while the editor's open; accepted the same way
+            // the search box below already re-derives plaintext every
+            // frame it's non-empty — both are short-lived (dropped at
+            // end of frame) rather than a persistent unsealed copy.
+            let dirty = self.editor_content.reveal().as_str()
+                != self.editor_original_content.reveal().as_str();
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("Close").clicked() {
                     if dirty {
@@ -3785,12 +4042,24 @@ impl UnigenApp {
             // be fed back into a plain edit buffer 1:1); clear the search
             // to go back to the full editable text.
             let needle = self.editor_search.to_lowercase();
-            let matches: Vec<(usize, String)> = self
-                .editor_content
+            // Revealed once per frame while searching — same transient,
+            // resealed-after pattern as everywhere else `editor_content`'s
+            // plaintext is needed now that it's a `LockedSecret`.
+            let content_plain = self.editor_content.reveal();
+            // SECURITY: this recomputes on every render frame the search
+            // box is non-empty (not just when "Copy" is clicked), so
+            // every matching line — each one a decrypted password —
+            // previously got copied into a plain, never-zeroized
+            // `String` many times per second while this view was simply
+            // open. `Zeroizing<String>` wipes each of those copies (the
+            // per-line lowercase temporary included) the moment it's
+            // dropped at the end of the frame, instead of leaving it
+            // sitting in freed-but-unwiped heap memory.
+            let matches: Vec<(usize, Zeroizing<String>)> = content_plain
                 .lines()
                 .enumerate()
-                .filter(|(_, l)| l.to_lowercase().contains(&needle))
-                .map(|(i, l)| (i, l.to_string()))
+                .filter(|(_, l)| Zeroizing::new(l.to_lowercase()).contains(&needle))
+                .map(|(i, l)| (i, Zeroizing::new(l.to_string())))
                 .collect();
             ui.small(format!(
                 "{} matching line(s) — clear search to edit the full file. Copied lines clear from the clipboard after {}s.",
@@ -3810,33 +4079,51 @@ impl UnigenApp {
                         for (line_no, line) in &matches {
                                 ui.horizontal(|ui| {
                                     if ui.button("Copy").on_hover_text(format!("Copy just the password (the first word on the line); auto-clears from the clipboard in {}s.", self.autoclear_seconds)).clicked() {
-                                        to_copy = Some(password_part(line));
+                                        to_copy = Some(password_part(line.as_str()));
                                     }
-                                    let line_resp = ui.add(
-                                        egui::Label::new(
-                                            egui::RichText::new(format!("{:>4}: {line}", line_no + 1))
-                                                .font(egui::FontId::monospace(13.0)),
-                                        )
-                                        .selectable(true),
+                                    // SECURITY: was `egui::Label::new(RichText::new(...))`.
+                                    // `Label` goes through egui's normal
+                                    // WidgetText/Galley pipeline, which builds
+                                    // and caches a `Galley` owning a full
+                                    // plaintext `String` of the whole
+                                    // formatted line — and this line *is* a
+                                    // decrypted password (plus whatever
+                                    // comment follows it), the most sensitive
+                                    // text this view ever shows. Confirmed via
+                                    // a post-search core dump. Fixed the same
+                                    // way `SecureNotesEdit`'s row painting was
+                                    // (see `secure_text_edit::paint_chars`):
+                                    // measure with per-glyph widths
+                                    // (`text_width`, no Galley involved) and
+                                    // paint one character at a time, so
+                                    // whatever egui's font cache retains is
+                                    // only ever single, UI-wide-shared glyphs
+                                    // rather than a contiguous secret
+                                    // substring.
+                                    let font_id = egui::FontId::monospace(13.0);
+                                    let line_text =
+                                        Zeroizing::new(format!("{:>4}: {}", line_no + 1, line.as_str()));
+                                    let text_color = ui.visuals().text_color();
+                                    let size = egui::vec2(
+                                        secure_text_edit::text_width(ui, &font_id, line_text.as_str()),
+                                        ui.fonts(|f| f.row_height(&font_id)),
                                     );
-                                    // Right-click menu mirroring the "Copy" button above:
-                                    // "Copy password" copies just the first word (via the
-                                    // same auto-clearing path as the button), "Copy line"
-                                    // copies the whole displayed line (label + password) for
-                                    // when the surrounding comment/label is also wanted —
-                                    // that one still auto-clears too, since anything copied
-                                    // out of a decrypted password file is sensitive.
-                                    let full_line = line.clone();
-                                    line_resp.context_menu(|ui| {
-                                        if ui.button("Copy password").clicked() {
-                                            to_copy = Some(password_part(&full_line));
-                                            ui.close_menu();
-                                        }
-                                        if ui.button("Copy line").clicked() {
-                                            to_copy = Some(Zeroizing::new(full_line.clone()));
-                                            ui.close_menu();
-                                        }
-                                    });
+                                    let (rect, line_resp) =
+                                        ui.allocate_exact_size(size, egui::Sense::click());
+                                    secure_text_edit::paint_chars(
+                                        ui,
+                                        ui.painter(),
+                                        rect.left_top(),
+                                        line_text.as_str(),
+                                        &font_id,
+                                        text_color,
+                                    );
+                                    // Right-click menu removed: the "Copy"
+                                    // button above already covers copying the
+                                    // password, and `line_resp` (from
+                                    // `allocate_exact_size`) is unused now
+                                    // that nothing hooks a context menu to it.
+                                    let _ = line_resp;
                                 });
                         }
                     }
@@ -3849,43 +4136,60 @@ impl UnigenApp {
             // it's the dominant element on screen rather than a cramped
             // fixed-size box.
             let min_editor_height = ui.ctx().screen_rect().height() * 0.75;
-            let mut editor_resp_opt = None;
+            // SECURITY: revealed into `content_plain` for exactly this
+            // frame's widget call (edit + paint), then resealed back into
+            // `self.editor_content` at the very end of this branch — same
+            // reveal-per-frame/reseal-immediately pattern used for
+            // `vault_edit_notes`. Keeps this large decrypted buffer from
+            // sitting as long-lived plaintext for the whole time the
+            // editor's open.
+            let mut content_plain = self.editor_content.reveal();
             egui::ScrollArea::vertical()
                 .id_source("editor_main_scroll")
                 .min_scrolled_height(min_editor_height)
                 .max_height(f32::INFINITY)
                 .show(ui, |ui| {
                     let available_width = ui.available_width();
-                    let r = ui.add(
+                    ui.add(
                         secure_text_edit::SecureNotesEdit::new(
                             "editor_main_content",
-                            &mut self.editor_content,
+                            &mut content_plain,
                         )
                         .desired_width(available_width)
                         .desired_rows(10),
                     );
-                    editor_resp_opt = Some(r);
                 });
-            // Selecting text inside the box and using the built-in
-            // Ctrl+C/right-click-select already works via egui's own
-            // TextEdit handling. This adds a plain right-click "Copy all"
-            // for grabbing the whole decrypted buffer without having to
-            // select-all first — routed through the same auto-clearing
-            // `copy_to_clipboard_20s` as the rest of the editor's copy
-            // actions, since this is decrypted file content.
-            if let Some(r) = editor_resp_opt {
-                let mut copy_all = false;
-                r.context_menu(|ui| {
-                    if ui.button("Copy all").clicked() {
-                        copy_all = true;
-                        ui.close_menu();
-                    }
-                });
-                if copy_all {
-                    let text = Zeroizing::new(self.editor_content.as_str().to_owned());
-                    self.copy_to_clipboard_20s(&text);
+            // SECURITY fix: the comment this replaced claimed Ctrl+C
+            // "already works via egui's own TextEdit handling" — that
+            // was wrong. `SecureNotesEdit` (see its module docs)
+            // deliberately intercepts Ctrl+C itself and never hands
+            // anything to the OS clipboard directly; it only flags the
+            // request via `take_copy_request` for the caller to act on.
+            //
+            // SECURITY (follow-up): this used to fall back to copying
+            // the *entire* decrypted file when Ctrl+C was pressed with
+            // no selection, and there was a "Copy all" context-menu item
+            // doing the same thing. Both are removed: this file's whole
+            // point is a list of passwords, and "grab everything at
+            // once" is exactly the operation that put a full plaintext
+            // copy of the decrypted content on the clipboard (and
+            // through `copy_to_clipboard_20s`'s own buffer) in one shot,
+            // as opposed to `Copy password`/`Copy line` in the search
+            // view above, which only ever copy one already-selected
+            // line. Ctrl+C with no selection is now simply a no-op; an
+            // explicit selection is required to copy anything from this
+            // view.
+            if secure_text_edit::take_copy_request(ui, "editor_main_content") {
+                if let Some(range) = secure_text_edit::selected_range(ui, "editor_main_content") {
+                    let to_copy = secure_text_edit::extract_range(&content_plain, range);
+                    self.copy_to_clipboard_20s(&to_copy);
                 }
             }
+            // Reseal immediately: `content_plain`'s buffer is consumed
+            // here (not dropped-then-recreated), so this frame's edits
+            // never exist as an unsealed `SecretString` any longer than
+            // the widget call above needed them to.
+            self.editor_content = LockedSecret::seal(content_plain);
         }
 
         if !self.editor_status.is_empty() {
