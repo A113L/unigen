@@ -138,6 +138,24 @@ pub fn status_label(enabled: bool, locked: bool) -> (&'static str, &'static str)
     }
 }
 
+/// Same as [`status_label`], but for fields where "nothing typed yet"
+/// needs to be distinguished from "tried to lock, OS refused it".
+///
+/// `SecretString::mlock_best_effort` reports a vacuous success on an
+/// empty buffer (there's nothing to actually lock), so naively feeding
+/// that into `status_label` shows "Locked in RAM" — green — before the
+/// user has typed a single character, which reads as a real guarantee
+/// that isn't there yet. `locked: None` here means exactly that "empty,
+/// nothing attempted" case and gets its own neutral label instead.
+pub fn status_label_opt(enabled: bool, locked: Option<bool>) -> (&'static str, &'static str) {
+    match locked {
+        Some(locked) => status_label(enabled, locked),
+        None if !SUPPORTED => status_label(enabled, false),
+        None if !enabled => status_label(enabled, false),
+        None => ("Nothing to lock yet — type a passphrase", "neutral"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

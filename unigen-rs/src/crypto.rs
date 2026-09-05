@@ -183,7 +183,103 @@ impl KdfParams {
         }
         Ok(self)
     }
+
+    /// U-A01 fix: `validate()` above only enforces the *format's* outer
+    /// bound (what a well-formed header can technically contain) — it does
+    /// NOT bound what this application is willing to actually spend CPU/RAM
+    /// computing before AES-GCM has verified the AAD (which includes these
+    /// very parameters). Since the KDF must run *before* authentication can
+    /// be checked, an attacker who has a copy of a vault (no password
+    /// needed) can flip a handful of header bytes to request e.g. 4 GiB /
+    /// 64 lanes of Argon2id, or 50M PBKDF2 rounds, and hand the file back to
+    /// the victim: opening it alone burns gigabytes of RAM / tens of
+    /// seconds of CPU before the app can even report "wrong password". This
+    /// is a pre-auth resource-exhaustion DoS, distinct from (and not fixed
+    /// by) AAD authentication.
+    ///
+    /// This second, application-level policy ceiling is checked separately
+    /// from (and is stricter than) the format ceiling, so the two concerns
+    /// stay distinct: "what the container format can express" vs. "what
+    /// this build is willing to compute for an unauthenticated header".
+    /// Params exceeding this budget are rejected with a distinct error so
+    /// callers/UI can surface a clear message rather than a generic
+    /// decrypt failure.
+    fn validate_runtime_budget(self, kdf_id: u8) -> Result<Self> {
+        match kdf_id {
+            KDF_ARGON2ID => {
+                if self.p1 > MAX_ARGON2_MEMORY_KIB {
+                    bail!(
+                        "This vault requests Argon2id memory of {} MiB, which exceeds this \
+                         application's limit of {} MiB. Refusing to derive the key to avoid \
+                         excessive memory/CPU use.",
+                        self.p1 / 1024,
+                        MAX_ARGON2_MEMORY_KIB / 1024
+                    );
+                }
+                if self.p2 > MAX_ARGON2_TIME_COST {
+                    bail!(
+                        "This vault requests an Argon2id time cost of {}, which exceeds this \
+                         application's limit of {}. Refusing to derive the key.",
+                        self.p2,
+                        MAX_ARGON2_TIME_COST
+                    );
+                }
+                if self.p3 > MAX_ARGON2_LANES {
+                    bail!(
+                        "This vault requests {} Argon2id lanes, which exceeds this \
+                         application's limit of {}. Refusing to derive the key.",
+                        self.p3,
+                        MAX_ARGON2_LANES
+                    );
+                }
+                // Bound total work (memory * time), not just each factor
+                // independently — two parameters individually inside their
+                // own ceilings can still multiply to something expensive.
+                let cost = (self.p1 as u64) * (self.p2 as u64);
+                if cost > MAX_ARGON2_MEMORY_TIME_PRODUCT {
+                    bail!(
+                        "This vault's combined Argon2id memory * time cost ({} MiB * {} \
+                         passes) exceeds this application's budget. Refusing to derive the key.",
+                        self.p1 / 1024,
+                        self.p2
+                    );
+                }
+            }
+            KDF_PBKDF2 => {
+                if self.p1 > MAX_PBKDF2_ITERATIONS {
+                    bail!(
+                        "This vault requests {} PBKDF2 iterations, which exceeds this \
+                         application's limit of {}. Refusing to derive the key.",
+                        self.p1,
+                        MAX_PBKDF2_ITERATIONS
+                    );
+                }
+            }
+            other => bail!("Unknown KDF id: {other}"),
+        }
+        Ok(self)
+    }
 }
+
+// ---- U-A01 fix: application-level KDF resource ceilings ----------------
+//
+// These are intentionally much stricter than `validate()`'s format-level
+// bounds. They bound what THIS application will spend deriving a key from
+// an as-yet-unauthenticated header, regardless of what the container
+// format could technically express. Chosen to comfortably exceed this
+// app's own defaults (64 MiB / 3 passes / 4 lanes, 600k PBKDF2 rounds)
+// while remaining well short of "attacker can hand me a vault that eats
+// gigabytes of RAM or hangs for tens of seconds before I can even tell the
+// user their password was wrong".
+pub const MAX_ARGON2_MEMORY_KIB: u32 = 256 * 1024; // 256 MiB
+pub const MAX_ARGON2_TIME_COST: u32 = 10;
+pub const MAX_ARGON2_LANES: u32 = 8;
+// Caps combined memory*time cost so e.g. 256 MiB * 10 passes (a legal but
+// very expensive combination under the individual ceilings above) is still
+// rejected; a single pass at the memory ceiling, or several passes at a
+// modest memory size, remain fine.
+pub const MAX_ARGON2_MEMORY_TIME_PRODUCT: u64 = 256 * 1024 * 4; // 256 MiB * 4 passes
+pub const MAX_PBKDF2_ITERATIONS: u32 = 2_000_000;
 
 pub const STREAM_CHUNK_SIZE: usize = 4 * 1024 * 1024; // 4 MiB plaintext/chunk
 pub const STREAM_SIZE_THRESHOLD: u64 = 20 * 1024 * 1024; // switch above 20 MiB
@@ -248,7 +344,11 @@ fn derive_key(
             MAX_PASSPHRASE_LEN
         );
     }
-    let params = params.validate(kdf_id)?;
+    // Format-level bound first (what a well-formed header can express),
+    // then U-A01's stricter application-level runtime budget (what we're
+    // actually willing to compute before AES-GCM can authenticate these
+    // very parameters). Both run before any Argon2/PBKDF2 work starts.
+    let params = params.validate(kdf_id)?.validate_runtime_budget(kdf_id)?;
     let pwd_bytes = Zeroizing::new(password.as_bytes().to_vec());
     let mut key = Zeroizing::new([0u8; 32]);
 
@@ -1317,7 +1417,17 @@ pub fn stream_decrypt_file(
                 }
                 Err(e) => return Err(e.into()),
             }
-            let is_final = final_byte[0] == 1;
+            // U-A03 fix: canonical two-value parsing instead of `== 1`
+            // (which silently treats every non-1 byte, including 2/0x7F/0xFF,
+            // as `false`). The AAD folds this flag in, so a tampered byte
+            // was already going to fail authentication rather than leak
+            // plaintext — but a strict parser should never even accept a
+            // malformed field as if it were a valid `false`.
+            let is_final = match final_byte[0] {
+                0 => false,
+                1 => true,
+                other => bail!("Invalid final-chunk flag byte: {other}"),
+            };
 
             let mut len_bytes = [0u8; 4];
             reader.read_exact(&mut len_bytes)?;

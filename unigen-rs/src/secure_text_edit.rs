@@ -291,7 +291,7 @@ impl<'a> Widget for SecurePasswordEdit<'a> {
             let bottom = rect.bottom() - 2.0;
             ui.painter().line_segment(
                 [egui::pos2(cursor_x, top), egui::pos2(cursor_x, bottom)],
-                egui::Stroke::new(1.0, ui.visuals().text_color()),
+                egui::Stroke::new(1.0_f32, ui.visuals().text_color()),
             );
         }
 
@@ -591,9 +591,23 @@ impl<'a> Widget for SecureNotesEdit<'a> {
         if content.is_empty() {
             if let Some(hint) = &hint_text { painter.text(draw_top, egui::Align2::LEFT_TOP, hint, font_id.clone(), ui.visuals().weak_text_color()); }
         } else {
+            // SECURITY: painted one character at a time via
+            // `paint_chars` rather than one `painter.text(row_text, ...)`
+            // call per row — see that function's doc comment for why:
+            // the whole-row version leaves the actual secret text
+            // sitting as a plain `String` inside egui's private Galley
+            // cache, outside every `SecretString`/`LockedSecret`
+            // guarantee this app otherwise relies on.
             for (i, row) in visual_rows.iter().enumerate() {
                 let row_text = slice_chars(content, row.start, row.end);
-                painter.text(draw_top + Vec2::new(0.0, row_height * i as f32), egui::Align2::LEFT_TOP, row_text, font_id.clone(), ui.visuals().text_color());
+                paint_chars(
+                    ui,
+                    &painter,
+                    draw_top + Vec2::new(0.0, row_height * i as f32),
+                    row_text,
+                    &font_id,
+                    ui.visuals().text_color(),
+                );
             }
         }
         if has_focus {
@@ -603,7 +617,7 @@ impl<'a> Widget for SecureNotesEdit<'a> {
             let row_text = slice_chars(content, row.start, row.end);
             let cursor_x = draw_top.x + char_advance(ui, &font_id, row_text, local_col);
             let y = draw_top.y + row_height * row_i as f32;
-            painter.line_segment([egui::pos2(cursor_x, y), egui::pos2(cursor_x, y + row_height)], egui::Stroke::new(1.0, ui.visuals().text_color()));
+            painter.line_segment([egui::pos2(cursor_x, y), egui::pos2(cursor_x, y + row_height)], egui::Stroke::new(1.0_f32, ui.visuals().text_color()));
         }
         if max_scroll > 0.0 {
             ui.painter().rect_filled(
@@ -631,7 +645,7 @@ impl<'a> Widget for SecureNotesEdit<'a> {
                     egui::pos2(rect.max.x - offset - 4.0, rect.max.y - 3.0),
                     egui::pos2(rect.max.x - 3.0, rect.max.y - offset - 4.0),
                 ],
-                egui::Stroke::new(1.0, grip_color),
+                egui::Stroke::new(1.0_f32, grip_color),
             );
         }
         response
@@ -640,6 +654,66 @@ impl<'a> Widget for SecureNotesEdit<'a> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct VisualRow { start: usize, end: usize }
+
+/// Sums per-glyph advance widths for `text` instead of measuring via
+/// `Fonts::layout_no_wrap` (which — see `paint_chars` below — builds and
+/// caches a `Galley` owning a full plaintext copy of `text`). Used to
+/// size a rect for secret text *before* painting it with `paint_chars`,
+/// so the measurement step itself doesn't reintroduce the same leak
+/// `paint_chars` exists to avoid.
+// Was `pub(crate)`: fine when this module and `main.rs` were the same
+// crate, but the lib/bin split (`src/lib.rs`, for Miri/ASan/fuzz — see
+// that file's doc comment) makes `main.rs` a separate downstream crate
+// that consumes `unigen` as a dependency, so anything it calls across
+// that boundary needs to be `pub`, not `pub(crate)`.
+pub fn text_width(ui: &Ui, font_id: &egui::FontId, text: &str) -> f32 {
+    ui.fonts(|f| text.chars().map(|c| f.glyph_width(font_id, c)).sum())
+}
+
+/// Paints `text` one character at a time instead of via
+/// `egui::Painter::text(..., text, ...)` on the whole string.
+///
+/// SECURITY: `Painter::text` (and `Fonts::layout_no_wrap`, which it
+/// calls internally) builds an `egui::Galley` — a struct that owns a
+/// plain, un-zeroized `String` copy of whatever text was laid out — and
+/// caches it in `egui::Fonts`' internal LRU cache, keyed by the text
+/// itself, for reuse across frames. That cache is private to `egui`;
+/// this app has no handle into it and cannot zeroize or evict entries.
+/// Painting a whole line/row of notes that way means the *actual
+/// secret content* sits as a plaintext `String` inside that cache,
+/// outside `SecretString`/`LockedSecret`'s reach, for however many
+/// frames `egui` chooses to keep it — this was confirmed in practice:
+/// it's what turned up in a post-edit core dump even after
+/// `vault_edit_notes` itself was sealed as a `LockedSecret`.
+///
+/// Painting one `char` at a time instead means every Galley `egui`
+/// caches contains a single character — 'a', 'b', '3', etc. Those are
+/// shared across the *entire* UI (every label, button, and field in
+/// the app reuses the same handful of per-character cache entries), so
+/// the cache never holds a contiguous run of secret text as a
+/// substring. A memory scan can still tell that the letters composing
+/// "test" have been painted somewhere, exactly as it could for any
+/// text the app has ever displayed — but it can no longer read the
+/// word "test" back out of the cache the way it could read a whole
+/// cached line. This is the same one-glyph-at-a-time approach
+/// `SecurePasswordEdit` already uses for its `●` bullets, generalized
+/// to real (variable-width) glyphs instead of one fixed repeated one.
+// See the doc comment on `text_width` above — same lib/bin crate-boundary
+// reason for widening this from `pub(crate)` to `pub`.
+pub fn paint_chars(
+    ui: &Ui,
+    painter: &egui::Painter,
+    mut pos: egui::Pos2,
+    text: &str,
+    font_id: &egui::FontId,
+    color: egui::Color32,
+) {
+    for ch in text.chars() {
+        let w = ui.fonts(|f| f.glyph_width(font_id, ch));
+        painter.text(pos, egui::Align2::LEFT_TOP, ch, font_id.clone(), color);
+        pos.x += w;
+    }
+}
 
 fn slice_chars(content: &str, start: usize, end: usize) -> &str {
     let start_b = content.char_indices().nth(start).map(|(b, _)| b).unwrap_or(content.len());
@@ -848,6 +922,14 @@ pub fn selected_range(ui: &Ui, id_source: impl std::hash::Hash) -> Option<Range<
 /// `SecureNotesEdit` with the given `id_source` (not including the
 /// trailing newline). Lets a caller offer a "Copy line" action without
 /// requiring the user to manually select the line first.
+///
+/// SECURITY: no longer called from `main.rs` — the Notes context menu's
+/// "Copy line" action was removed because it cloned the whole scanned
+/// line into a fresh, separately-allocated `String`, an extra plaintext
+/// copy in RAM beyond the already-revealed `notes_plain`. Kept here
+/// (rather than deleted) since it's still exercised by the unit test
+/// below and may be reintroduced behind a tighter memory contract later.
+#[allow(dead_code)]
 pub fn current_line_range(ui: &Ui, id_source: impl std::hash::Hash, text: &SecretString) -> Range<usize> {
     // Important: this intentionally uses logical newline-delimited lines,
     // not `VisualRow`s. Wrapping is presentation-only and must never change
